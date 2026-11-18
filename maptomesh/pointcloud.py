@@ -37,6 +37,7 @@ from pyproj import CRS, Transformer
 
 from . import config
 from .geo import AOI, Grid
+from .httpcache import RANGE_CACHE, install_laspy_cache
 from .lidar_index import Tile, TileIndex
 from .raster import fill_polygon
 
@@ -134,12 +135,15 @@ def _file_crs(reader: CopcReader) -> CRS | None:
         return crs
 
 
+install_laspy_cache()  # every COPC byte read from NRCan is kept in the on-disk range cache
+
+
 def _process_tile(tile: Tile, aoi: AOI, grid: Grid, resolution: float, cancel: threading.Event):
     if cancel.is_set():
         raise Cancelled()
     sel = (DecompressionSelection.base() | DecompressionSelection.Z
            | DecompressionSelection.CLASSIFICATION | DecompressionSelection.FLAGS)
-    with CopcReader.open(tile.url, http_num_threads=16, decompression_selection=sel) as r:
+    with CopcReader.open(tile.url, http_num_threads=8, decompression_selection=sel) as r:
         crs = _file_crs(r)
         if crs is None:
             return tile, None, "no CRS"
@@ -271,6 +275,7 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex, progress: ProgressFn,
                            "Pick a smaller area or use the HRDEM source.")
     # COPC octree LOD giving ~1 point per (step/2)^2 at most
     resolution = max(grid.step * 0.7, 0.25)
+    hit0, miss0, req0 = RANGE_CACHE.counters()
     shape = grid.vshape
     accs: dict[str, _Acc] = defaultdict(lambda: _Acc(shape))
     years: dict[str, int] = {}
@@ -347,5 +352,9 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex, progress: ProgressFn,
         "coverage": float(cov.mean()),
         "query_resolution_m": resolution,
     }
+    hit1, miss1, req1 = RANGE_CACHE.counters()
+    info["downloaded_mb"] = round((miss1 - miss0) / 1e6, 1)
+    info["from_cache_mb"] = round((hit1 - hit0) / 1e6, 1)
+    info["http_requests"] = req1 - req0
     return LidarResult(rs(ground), rs(water), rs(bld), rs(brd), rs(veg), rs(unc), rs(bcls), rs(vcls),
                        rs(dens), cov, info)

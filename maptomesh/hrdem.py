@@ -7,8 +7,11 @@ No classification is available: buildings and trees are both "DSM - DTM".
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import threading
+import time
 from typing import Callable
 
 import numpy as np
@@ -30,13 +33,30 @@ COLLECTIONS = ("hrdem-mosaic-1m", "hrdem-mosaic-2m")
 
 
 def stac_items(bbox: tuple[float, float, float, float], collection: str) -> list[dict]:
+    key = hashlib.sha1(f"{collection}|{bbox}".encode()).hexdigest()[:16]
+    cache = config.CACHE_DIR / "stac" / f"{key}.json"
+    if cache.exists() and time.time() - cache.stat().st_mtime < 86400:
+        return json.loads(cache.read_text())
     r = requests.get(
         f"{config.STAC_API}/search",
         params={"collections": collection, "bbox": ",".join(f"{v:.6f}" for v in bbox), "limit": 50},
         headers={"User-Agent": config.USER_AGENT}, timeout=60,
     )
     r.raise_for_status()
-    return r.json().get("features", [])
+    feats = r.json().get("features", [])
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(feats))
+    return feats
+
+
+def _open(url: str, **kw):
+    """Open a remote COG with reads served from the persistent NRCan range cache."""
+    import rasterio
+    from .httpcache import CachedHttpFile
+    try:
+        return rasterio.open(url, opener=lambda path, mode="rb": CachedHttpFile(url), **kw)
+    except (TypeError, ValueError):  # rasterio without opener support: direct (uncached) read
+        return rasterio.open(url, **kw)
 
 
 def _read_to_grid(url: str, aoi: AOI, grid: Grid) -> np.ndarray:
@@ -50,7 +70,7 @@ def _read_to_grid(url: str, aoi: AOI, grid: Grid) -> np.ndarray:
     # pixel centres on vertices; raster rows run north -> south
     dst_transform = Affine(grid.step, 0, grid.x0 - grid.step / 2, 0, -grid.step, grid.y0 + grid.ny * grid.step + grid.step / 2)
     dst = np.full((H, W), np.nan, dtype=np.float32)
-    with rasterio.open(url) as src0:
+    with _open(url) as src0:
         res = abs(src0.res[0])
         ovr = src0.overviews(1)
         level = -1
@@ -58,7 +78,7 @@ def _read_to_grid(url: str, aoi: AOI, grid: Grid) -> np.ndarray:
             if res * f <= grid.step / 2:
                 level = k
     kw = {"overview_level": level} if level >= 0 else {}
-    with rasterio.open(url, **kw) as src:
+    with _open(url, **kw) as src:
         reproject(
             source=rasterio.band(src, 1), destination=dst,
             src_nodata=src.nodata, dst_nodata=np.nan,
