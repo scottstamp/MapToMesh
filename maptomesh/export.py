@@ -54,7 +54,7 @@ def write_3mf(path: Path, parts: list[Part], filaments: list[dict], title: str,
     for i, p in enumerate(parts):
         tiles.setdefault(p.tile, []).append(i)
 
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=5) as zf:
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
         if thumbnail:
             zf.writestr("[Content_Types].xml", CONTENT_TYPES.replace(
                 "</Types>", ' <Default Extension="png" ContentType="image/png"/>\n</Types>'))
@@ -178,7 +178,7 @@ def _stl_bytes(name: str, v: np.ndarray, t: np.ndarray) -> bytes:
 
 
 def write_stl_zip(path: Path, parts: list[Part]) -> Path:
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=5) as zf:
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
         used = set()
         for p in parts:
             base = "".join(ch if ch.isalnum() or ch in "-_ " else "_" for ch in p.name).strip().replace(" ", "_")
