@@ -44,6 +44,7 @@ class Job:
     error: str | None = None
     result: dict | None = None
     parts: list | None = None
+    base_parts: list | None = None
     created: float = field(default_factory=time.time)
     cancel: threading.Event = field(default_factory=threading.Event)
 
@@ -109,7 +110,8 @@ def _run_job(job: Job) -> None:
                     data = fetch_osm(aoi, g, o.osm_roads if want_roads else "none", want_water, want_bld,
                                      progress=stage(0.66, 0.72))
                     osm = rasterize_osm(data, aoi, g, mm_per_m, o.road_min_width_mm, o.road_width_scale,
-                                        o.osm_roads)
+                                        o.osm_roads, o.osm_streams if o.osm_water else "none",
+                                        o.river_min_width_mm)
                     job.set(0.72, f"OpenStreetMap: {len(data['features']):,} features from {data['tiles']} tiles")
                 except Exception as e:  # noqa: BLE001 - OSM is optional
                     job.log.append(f"Warning: OpenStreetMap unavailable ({e}); continuing without it")
@@ -130,9 +132,19 @@ def _run_job(job: Job) -> None:
                       description=f"{o.lat:.5f}, {o.lon:.5f} - {o.width_m:.0f} x {o.height_m:.0f} m - {res.stats['scale']}",
                       thumbnail=thumb)
             size = (outdir / fname).stat().st_size
+            base_file = base_size = None
+            if res.base_parts:
+                base_file = _slug(o.name) + "_base.3mf"
+                base_color = res.base_parts[0].color
+                write_3mf(outdir / base_file, res.base_parts,
+                          [{"slot": 1, "color": base_color, "used_by": ["Base plate"]}], o.name + " - base plate",
+                          o.layout, description="Base plate for " + o.name)
+                base_size = (outdir / base_file).stat().st_size
             job.parts = res.parts
+            job.base_parts = res.base_parts
             job.result = {
-                "file": fname, "file_size": size, "stats": res.stats, "filaments": res.filaments,
+                "file": fname, "file_size": size, "base_file": base_file, "base_file_size": base_size,
+                "stats": res.stats, "filaments": res.filaments,
                 "color_changes": res.color_changes, "notes": res.notes,
                 "data": {k: v for k, v in elev.info.items() if k in ("tiles", "points", "projects", "coverage",
                                                                        "items", "failed_tiles", "errors")},
@@ -150,6 +162,7 @@ def _run_job(job: Job) -> None:
             done = [j for j in JOBS.values() if j.parts is not None]
             for j in done[:-3]:
                 j.parts = None
+                j.base_parts = None
 
 
 # ---------------------------------------------------------------- API
@@ -243,6 +256,15 @@ def job_3mf(jid: str):
     return FileResponse(path, media_type="model/3mf", filename=j.result["file"])
 
 
+@app.get("/api/jobs/{jid}/base.3mf")
+def job_base_3mf(jid: str):
+    j = _job(jid)
+    if j.state != "done" or not j.result.get("base_file"):
+        raise HTTPException(404, "No separate base plate for this job")
+    return FileResponse(config.OUTPUT_DIR / jid / j.result["base_file"], media_type="model/3mf",
+                        filename=j.result["base_file"])
+
+
 @app.get("/api/jobs/{jid}/thumbnail.png")
 def job_thumb(jid: str):
     path = config.OUTPUT_DIR / jid / "thumbnail.png"
@@ -262,7 +284,7 @@ def job_stl(jid: str):
     if not path.exists():
         if j.parts is None:
             raise HTTPException(410, "Model evicted from memory; regenerate to export STL")
-        write_stl_zip(path, j.parts)
+        write_stl_zip(path, j.parts + (j.base_parts or []))
     return FileResponse(path, media_type="application/zip", filename=name)
 
 

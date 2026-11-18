@@ -37,7 +37,7 @@ CHUNK = 200_000
 def _write_mesh(f, v: np.ndarray, t: np.ndarray) -> None:
     f.write(b"   <mesh>\n    <vertices>\n")
     for s in range(0, len(v), CHUNK):
-        f.write("".join(f'     <vertex x="{x:.3f}" y="{y:.3f}" z="{z:.3f}"/>\n'
+        f.write("".join(f'     <vertex x="{x:.4f}" y="{y:.4f}" z="{z:.4f}"/>\n'
                         for x, y, z in v[s:s + CHUNK].tolist()).encode())
     f.write(b"    </vertices>\n    <triangles>\n")
     for s in range(0, len(t), CHUNK):

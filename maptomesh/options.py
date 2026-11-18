@@ -18,7 +18,7 @@ class Colors(BaseModel):
     buildings: str = Field("#C8553D", pattern=HEX)
     roads: str = Field("#FAFAFA", pattern=HEX)
     vegetation: str = Field("#4F8A3C", pattern=HEX)
-    bands: list[str] = Field(default_factory=lambda: ["#2F8FD8", "#6FA35A", "#C9B26B", "#8B5A2B", "#F4F4F4"])
+    bands: list[str] = Field(default_factory=lambda: ["#6FA35A", "#C9B26B", "#B07A3E", "#7A4E2A", "#F4F4F4"])
     band_thresholds_m: list[float] | None = None
     band_mode: Literal["equal", "quantile"] = "equal"
 
@@ -48,10 +48,12 @@ class Options(BaseModel):
     surface: Literal["terrain", "buildings", "full"] = "buildings"
     grid_cells: int = Field(600, ge=50, le=2400)
     smoothing: float = Field(0.0, ge=0, le=10)
+    cliff_smoothing: float = Field(1.0, ge=0, le=4)  # extra smoothing on steep slopes (cells)
 
     # print geometry
     size_mm: float = Field(200.0, gt=10, le=2000)
     base_mm: float = Field(3.0, ge=0.4, le=50)
+    base_separate: bool = False  # base plate as its own print (frees a filament slot)
     floor_mm: float = Field(1.5, ge=0.2, le=50)
     z_exaggeration: float = Field(1.0, gt=0, le=50)
     max_height_mm: float | None = Field(None, gt=0, le=500)
@@ -67,6 +69,8 @@ class Options(BaseModel):
     water_recess_mm: float = Field(0.6, ge=0, le=20)
     voids_as_water: bool = True
     osm_water: bool = True
+    osm_streams: Literal["none", "rivers", "all"] = "all"  # OSM river/stream centrelines as water
+    river_min_width_mm: float = Field(0.8, ge=0.2, le=10)
 
     # roads
     osm_roads: Literal["none", "major", "medium", "all"] = "none"
@@ -77,11 +81,16 @@ class Options(BaseModel):
     # colour
     color_mode: Literal["single", "landcover", "elevation"] = "landcover"
     colors: Colors = Field(default_factory=Colors)
-    min_region_mm2: float = Field(0.4, ge=0, le=100)
+    min_region_mm2: float = Field(1.0, ge=0, le=100)
+    # colours are thin skins of this depth on a ground-coloured body (0 = full-height colour columns)
+    color_depth_mm: float = Field(1.0, ge=0, le=50)
+    # recolour small patches that alone force their colour into extra layers (total mm2, 0 = off)
+    swap_patch_budget_mm2: float = Field(50.0, ge=0, le=5000)
+    elevation_water: bool = True  # elevation-band mode: flat water in its own colour
 
     # output
     layout: Literal["parts", "objects"] = "parts"
     name: str = Field("MapToMesh", max_length=80)
 
     def elevation_key(self) -> str:
-        return f"v3|{self.source}|{self.lat:.6f}|{self.lon:.6f}|{self.width_m:.1f}|{self.height_m:.1f}|{self.grid_cells}"
+        return f"v4|{self.source}|{self.lat:.6f}|{self.lon:.6f}|{self.width_m:.1f}|{self.height_m:.1f}|{self.grid_cells}"
