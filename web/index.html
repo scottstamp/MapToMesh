@@ -91,6 +91,15 @@
     </div>
     <label class="check" title="The model starts on top of the base and the base plate becomes its own single-colour file, freeing a filament slot. Glue them together after printing.">
       <input id="baseSeparate" type="checkbox"> Print base plate separately (separate file)</label>
+    <div id="lipOpts">
+      <label class="check" title="A raised lip around the separate base locates the model (like a tray)">
+        <input id="baseLip" type="checkbox" checked> Locating lip on the base plate</label>
+      <div class="row">
+        <label>Lip height (mm)<input id="lipH" type="number" min="0.2" step="0.2" value="1.2"></label>
+        <label>Lip width (mm)<input id="lipW" type="number" min="0.4" step="0.2" value="1.6"></label>
+        <label>Clearance (mm)<input id="lipC" type="number" min="0" step="0.05" value="0.2"></label>
+      </div>
+    </div>
     <label>Vertical exaggeration: <b id="zExOut"></b>×
       <input id="zEx" type="range" min="0.5" max="10" step="0.1" value="1">
     </label>
@@ -102,6 +111,28 @@
     <div class="row" id="frameOpts">
       <label>Width (mm)<input id="frameW" type="number" min="1" step="0.5" value="6"></label>
       <label>Height above base (mm)<input id="frameH" type="number" min="0" step="0.5" value="2"></label>
+    </div>
+    <div id="labelOpts">
+      <label class="check"><input id="label" type="checkbox"> Label on the frame (name, scale bar, north arrow)</label>
+      <div id="labelMore">
+        <label>Label text<input id="labelText" type="text" placeholder="model name"></label>
+        <div class="row">
+          <label class="check"><input id="labelScale" type="checkbox" checked> Scale bar</label>
+          <label class="check"><input id="labelNorth" type="checkbox" checked> North arrow</label>
+        </div>
+      </div>
+    </div>
+    <h2 style="margin-top:14px">Printer</h2>
+    <div class="row">
+      <label title="Colour boundaries, water surfaces and band heights are aligned to this layer grid">
+        Layer height (mm)<input id="layerH" type="number" min="0.04" step="0.02" value="0.2"></label>
+      <label>First layer (mm)<input id="firstLayer" type="number" min="0.04" step="0.02" value="0.2"></label>
+    </div>
+    <div class="row">
+      <label title="Buildings smaller than this are enlarged, gaps narrower than this are closed, thinner tree slivers dropped (about your nozzle width)">
+        Min feature (mm)<input id="minFeature" type="number" min="0" step="0.05" value="0.5"></label>
+      <label title="Near-flat surfaces are merged into larger triangles as long as they stay within this distance of the terrain">
+        Simplify (mm)<input id="simplify" type="number" min="0" step="0.01" value="0.05"></label>
     </div>
     <div class="row">
       <label>Split into tiles: X<input id="tilesX" type="number" min="1" max="8" value="1"></label>

@@ -46,6 +46,7 @@ function buildColorInputs() {
   for (const [k, label] of LANDCOVER_KEYS) colorInput($('colorsLandcover'), k, label, lc[k]);
   colorInput($('colorsCommon'), 'base', 'Base', lc.base);
   colorInput($('colorsCommon'), 'frame', 'Frame', lc.frame);
+  colorInput($('colorsCommon'), 'label', 'Label', '#FAFAFA');
   renderBandInputs(PRESETS.elevation.Topographic);
 }
 
@@ -282,6 +283,9 @@ function updateDerived() {
   const pw = size * (w >= h ? 1 : w / h), ph = size * (h >= w ? 1 : h / w);
   $('tileInfo').textContent = tx * ty > 1 ? `${tx * ty} tiles of ≈ ${(pw / tx).toFixed(0)} × ${(ph / ty).toFixed(0)} mm` : '';
   $('frameOpts').hidden = !$('frame').checked;
+  $('labelOpts').hidden = !$('frame').checked;
+  $('labelMore').hidden = !$('label').checked;
+  $('lipOpts').hidden = !$('baseSeparate').checked;
   $('cornerWrap').style.visibility = $('shape').value === 'rounded' ? 'visible' : 'hidden';
   const mode = $('colorMode').value;
   $('colorsSingle').hidden = mode !== 'single';
@@ -370,7 +374,9 @@ $('search').addEventListener('input', () => {
 });
 
 // ------------------------------------------------------------------ settings
-const FIELDS = ['shape', 'widthKm', 'heightKm', 'source', 'surface', 'gridCells', 'smoothing', 'cliffSmoothing', 'baseSeparate', 'sizeMm', 'baseMm', 'floorMm',
+const FIELDS = ['shape', 'widthKm', 'heightKm', 'source', 'surface', 'gridCells', 'smoothing', 'cliffSmoothing', 'baseSeparate',
+  'baseLip', 'lipH', 'lipW', 'lipC', 'label', 'labelText', 'labelScale', 'labelNorth', 'layerH', 'firstLayer',
+  'minFeature', 'simplify', 'sizeMm', 'baseMm', 'floorMm',
   'zEx', 'maxHeight', 'cornerMm', 'frame', 'frameW', 'frameH', 'tilesX', 'tilesY', 'flattenWater', 'voidsWater', 'osmWater',
   'waterRecess', 'osmStreams', 'riverMin', 'osmRoads', 'roadMin', 'roadEmboss', 'colorMode', 'bandCount', 'bandMode', 'bandThresholds', 'minRegion',
   'colorDepth', 'swapBudget', 'elevWater',
@@ -415,7 +421,11 @@ function buildOptions() {
     grid_cells: parseInt($('gridCells').value), smoothing: num('smoothing', 0),
     cliff_smoothing: num('cliffSmoothing', 1),
     size_mm: num('sizeMm', 200), base_mm: num('baseMm', 3), floor_mm: num('floorMm', 1.5),
-    base_separate: $('baseSeparate').checked,
+    base_separate: $('baseSeparate').checked, base_lip: $('baseLip').checked,
+    lip_height_mm: num('lipH', 1.2), lip_width_mm: num('lipW', 1.6), lip_clearance_mm: num('lipC', 0.2),
+    label: $('label').checked, label_text: $('labelText').value, label_scale_bar: $('labelScale').checked,
+    label_north: $('labelNorth').checked, layer_height_mm: num('layerH', 0.2), first_layer_mm: num('firstLayer', 0.2),
+    min_feature_mm: num('minFeature', 0.5), simplify_mm: num('simplify', 0.05),
     z_exaggeration: num('zEx', 1), max_height_mm: $('maxHeight').value ? num('maxHeight', null) : null,
     frame: $('frame').checked, frame_width_mm: num('frameW', 6), frame_height_mm: num('frameH', 2),
     tiles_x: parseInt($('tilesX').value) || 1, tiles_y: parseInt($('tilesY').value) || 1,
@@ -427,7 +437,7 @@ function buildOptions() {
     colors: {
       single: colorVal('single'), base: colorVal('base'), frame: colorVal('frame'),
       ground: colorVal('ground'), water: colorVal('water'), buildings: colorVal('buildings'),
-      roads: colorVal('roads'), vegetation: colorVal('vegetation'),
+      roads: colorVal('roads'), vegetation: colorVal('vegetation'), label: colorVal('label'),
       bands, band_mode: $('bandMode').value,
       band_thresholds_m: th.length === bands.length - 1 ? th : null,
     },
@@ -446,7 +456,10 @@ function applyOptions(o) {
   };
   state.center = { lat: o.lat, lon: o.lon };
   const fields = { shape: 'shape', corner_radius_mm: 'cornerMm', source: 'source', surface: 'surface', grid_cells: 'gridCells',
-    smoothing: 'smoothing', cliff_smoothing: 'cliffSmoothing', base_separate: 'baseSeparate', size_mm: 'sizeMm', base_mm: 'baseMm', floor_mm: 'floorMm', z_exaggeration: 'zEx',
+    smoothing: 'smoothing', cliff_smoothing: 'cliffSmoothing', base_separate: 'baseSeparate', base_lip: 'baseLip',
+    lip_height_mm: 'lipH', lip_width_mm: 'lipW', lip_clearance_mm: 'lipC', label: 'label', label_text: 'labelText',
+    label_scale_bar: 'labelScale', label_north: 'labelNorth', layer_height_mm: 'layerH', first_layer_mm: 'firstLayer',
+    min_feature_mm: 'minFeature', simplify_mm: 'simplify', size_mm: 'sizeMm', base_mm: 'baseMm', floor_mm: 'floorMm', z_exaggeration: 'zEx',
     max_height_mm: 'maxHeight', frame: 'frame', frame_width_mm: 'frameW', frame_height_mm: 'frameH', tiles_x: 'tilesX',
     tiles_y: 'tilesY', flatten_water: 'flattenWater', water_recess_mm: 'waterRecess', voids_as_water: 'voidsWater',
     osm_water: 'osmWater', osm_streams: 'osmStreams', river_min_width_mm: 'riverMin', osm_roads: 'osmRoads', road_min_width_mm: 'roadMin', road_emboss_mm: 'roadEmboss',
@@ -455,7 +468,7 @@ function applyOptions(o) {
   $('widthKm').value = +(o.width_m / 1000).toFixed(3);
   $('heightKm').value = +(o.height_m / 1000).toFixed(3);
   const c = o.colors || {};
-  for (const k of ['single', 'base', 'frame', 'ground', 'water', 'buildings', 'roads', 'vegetation']) {
+  for (const k of ['single', 'base', 'frame', 'label', 'ground', 'water', 'buildings', 'roads', 'vegetation']) {
     const el = document.querySelector(`[data-color="${k}"]`);
     if (el && c[k]) el.value = c[k];
   }
@@ -547,6 +560,7 @@ function showResult(j) {
     </dl>
     <h2>Filaments</h2><ul class="filaments">${fil}</ul>
     ${cc}
+    ${(r.tips || []).length ? `<h2>Print tips</h2><ul class="tips">${r.tips.map((t) => `<li>${t}</li>`).join('')}</ul>` : ''}
     ${notes.length ? `<div class="info warn">${notes.join('<br>')}</div>` : ''}`;
   $('result').hidden = false;
   $('topImg').src = `/api/jobs/${id}/thumbnail.png?${Date.now()}`;
@@ -671,7 +685,7 @@ $('showCoverage').onchange = () => {
 };
 $('generateBtn').onclick = generate;
 $('cancelBtn').onclick = () => state.jobId && fetch(`/api/jobs/${state.jobId}/cancel`, { method: 'POST' });
-for (const id of ['gridCells', 'smoothing', 'cliffSmoothing', 'sizeMm', 'zEx', 'tilesX', 'tilesY', 'frame', 'cornerMm', 'elevWater']) {
+for (const id of ['baseSeparate', 'label', 'gridCells', 'smoothing', 'cliffSmoothing', 'sizeMm', 'zEx', 'tilesX', 'tilesY', 'frame', 'cornerMm', 'elevWater']) {
   $(id).addEventListener('input', () => { if (id === 'sizeMm' || id === 'cornerMm') redrawSelection(); else updateDerived(); });
 }
 $('gridCells').addEventListener('change', scheduleCoverage);
