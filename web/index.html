@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MapToMesh — Canadian LiDAR to 3MF</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script type="importmap">
+    {"imports": {
+      "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+    }}
+  </script>
+</head>
+<body>
+<aside id="sidebar">
+  <header>
+    <h1>MapToMesh</h1>
+    <p class="sub">NRCan CanElevation LiDAR → 3D-printable 3MF</p>
+    <div id="indexStatus" class="status"></div>
+  </header>
+
+  <section>
+    <h2>1 · Area</h2>
+    <div class="search">
+      <input id="search" type="search" placeholder="Search a place in Canada…" autocomplete="off">
+      <ul id="searchResults"></ul>
+    </div>
+    <label>Shape
+      <select id="shape">
+        <option value="rectangle">Rectangle</option>
+        <option value="rounded">Rounded rectangle</option>
+        <option value="circle">Circle</option>
+        <option value="hexagon">Hexagon</option>
+      </select>
+    </label>
+    <div class="row">
+      <label>Width (km)<input id="widthKm" type="number" step="0.05" min="0.05" value="1.5"></label>
+      <label>Height (km)<input id="heightKm" type="number" step="0.05" min="0.05" value="1.5"></label>
+    </div>
+    <div class="row">
+      <button id="drawBtn" class="secondary" title="Drag on the map to draw the area">✎ Draw on map</button>
+      <button id="centerBtn" class="secondary" title="Centre the area on the current map view">⌖ Centre on view</button>
+    </div>
+    <label class="check"><input id="showCoverage" type="checkbox" checked> Show LiDAR coverage</label>
+    <div id="coverageInfo" class="info"></div>
+  </section>
+
+  <section>
+    <h2>2 · Elevation data</h2>
+    <label>Source
+      <select id="source">
+        <option value="lidar">LiDAR point clouds (COPC, classified)</option>
+        <option value="hrdem">HRDEM 1 m mosaic (faster for big areas)</option>
+      </select>
+    </label>
+    <label>Surface
+      <select id="surface">
+        <option value="terrain">Bare terrain</option>
+        <option value="buildings" selected>Terrain + buildings &amp; bridges</option>
+        <option value="full">Full surface (incl. trees)</option>
+      </select>
+    </label>
+    <label>Detail: <b id="gridCellsOut"></b> cells on long side
+      <input id="gridCells" type="range" min="150" max="2000" step="50" value="600">
+    </label>
+    <div id="detailInfo" class="hint"></div>
+    <label>Terrain smoothing <b id="smoothingOut"></b>
+      <input id="smoothing" type="range" min="0" max="4" step="0.25" value="0">
+    </label>
+  </section>
+
+  <section>
+    <h2>3 · Print</h2>
+    <div class="row">
+      <label>Size, long side (mm)<input id="sizeMm" type="number" min="20" max="2000" step="5" value="200"></label>
+      <label>Scale<input id="scaleOut" type="text" readonly></label>
+    </div>
+    <div class="row">
+      <label>Base (mm)<input id="baseMm" type="number" min="0.4" step="0.2" value="3"></label>
+      <label>Min. terrain (mm)<input id="floorMm" type="number" min="0.2" step="0.1" value="1.5"
+              title="Thickness of the lowest terrain above the base"></label>
+    </div>
+    <label>Vertical exaggeration: <b id="zExOut"></b>×
+      <input id="zEx" type="range" min="0.5" max="10" step="0.1" value="1">
+    </label>
+    <div class="row">
+      <label>Max height (mm)<input id="maxHeight" type="number" min="1" step="1" placeholder="none"></label>
+      <label id="cornerWrap">Corner radius (mm)<input id="cornerMm" type="number" min="0" step="1" value="12"></label>
+    </div>
+    <label class="check"><input id="frame" type="checkbox"> Frame / border</label>
+    <div class="row" id="frameOpts">
+      <label>Width (mm)<input id="frameW" type="number" min="1" step="0.5" value="6"></label>
+      <label>Height above base (mm)<input id="frameH" type="number" min="0" step="0.5" value="2"></label>
+    </div>
+    <div class="row">
+      <label>Split into tiles: X<input id="tilesX" type="number" min="1" max="8" value="1"></label>
+      <label>Y<input id="tilesY" type="number" min="1" max="8" value="1"></label>
+    </div>
+    <div id="tileInfo" class="hint"></div>
+  </section>
+
+  <section>
+    <h2>4 · Water &amp; roads</h2>
+    <label class="check"><input id="flattenWater" type="checkbox" checked> Flatten water bodies</label>
+    <label class="check"><input id="voidsWater" type="checkbox" checked> Treat LiDAR voids as water</label>
+    <label class="check"><input id="osmWater" type="checkbox" checked> Use OpenStreetMap water</label>
+    <label>Water recess (mm)<input id="waterRecess" type="number" min="0" step="0.1" value="0.6"></label>
+    <label>OpenStreetMap roads
+      <select id="osmRoads">
+        <option value="none">None</option>
+        <option value="major">Major roads</option>
+        <option value="medium" selected>Major + residential</option>
+        <option value="all">All incl. paths</option>
+      </select>
+    </label>
+    <div class="row">
+      <label>Min road width (mm)<input id="roadMin" type="number" min="0.1" step="0.1" value="0.6"></label>
+      <label>Road emboss (mm)<input id="roadEmboss" type="number" step="0.1" value="0"></label>
+    </div>
+  </section>
+
+  <section>
+    <h2>5 · Colours</h2>
+    <label>Mode
+      <select id="colorMode">
+        <option value="single">Single colour</option>
+        <option value="landcover" selected>Land cover (water / buildings / roads / trees)</option>
+        <option value="elevation">Elevation bands</option>
+      </select>
+    </label>
+    <div id="presetRow" class="row">
+      <label>Preset<select id="preset"></select></label>
+    </div>
+    <div id="colorsSingle" class="colors"></div>
+    <div id="colorsLandcover" class="colors"></div>
+    <div id="colorsElevation">
+      <div class="row">
+        <label>Bands<input id="bandCount" type="number" min="2" max="10" value="5"></label>
+        <label>Split
+          <select id="bandMode"><option value="equal">Equal height</option><option value="quantile">Equal area</option></select>
+        </label>
+      </div>
+      <div id="bandColors" class="colors"></div>
+      <label>Custom thresholds (m, comma-separated)<input id="bandThresholds" type="text" placeholder="auto"></label>
+    </div>
+    <div id="colorsCommon" class="colors"></div>
+    <label>Merge colour islands smaller than (mm²)<input id="minRegion" type="number" min="0" step="0.1" value="0.4"></label>
+  </section>
+
+  <section>
+    <h2>6 · Output</h2>
+    <label>Name<input id="name" type="text" value="MapToMesh"></label>
+    <label>3MF layout
+      <select id="layout">
+        <option value="parts">One object, one part per colour (Bambu/Orca/Prusa)</option>
+        <option value="objects">Separate objects</option>
+      </select>
+    </label>
+  </section>
+
+  <div id="actions">
+    <button id="generateBtn" class="primary">Generate 3MF</button>
+    <button id="cancelBtn" class="secondary" hidden>Cancel</button>
+    <div id="progress" hidden><div id="bar"></div></div>
+    <div id="progressMsg" class="hint"></div>
+    <pre id="log" hidden></pre>
+  </div>
+  <section id="result" hidden></section>
+</aside>
+
+<main>
+  <div id="tabs">
+    <button data-tab="map" class="active">Map</button>
+    <button data-tab="view">3D preview</button>
+    <button data-tab="top">Top view</button>
+  </div>
+  <div id="map"></div>
+  <div id="viewer" hidden><div id="viewerMsg">Generate a model to preview it here.</div></div>
+  <div id="topview" hidden><img id="topImg" alt=""></div>
+</main>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
