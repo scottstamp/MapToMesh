@@ -39,10 +39,15 @@ On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and co
    number of grid cells along the long side; the hint shows metres and millimetres per cell.
    *Cliff smoothing* only affects steep slopes; raise it if sea cliffs or bluffs still look rough.
 3. **Print** – long-side size in mm (scale is shown), base thickness, minimum terrain thickness,
-   vertical exaggeration, optional frame and tiling. *Print base plate separately*: the model starts on top of the
-   base (z = 0 on the bed) without the base colour, freeing a filament slot; the base plate (same
-   footprint, incl. the frame ring if enabled) is a separate single-colour 3MF download and is also
-   in the STL zip. Glue the two together after printing.
+   vertical exaggeration, optional frame (with an embossed label: name, scale bar, north arrow)
+   and tiling. *Printer* settings: layer / first-layer height (colour boundaries, flat water and
+   band heights are aligned to that layer grid, so no half-layer colour slivers), minimum feature
+   width (smaller buildings are enlarged, narrower gaps closed, thinner tree slivers dropped) and a
+   simplification tolerance for near-flat surfaces. *Print base plate separately*: the model starts on top of the
+   base (z = 0 on the bed) without the base colour, freeing a filament slot; the base plate is a
+   separate single-colour 3MF download (also in the STL zip) with a raised locating lip around
+   the model (a tray: drop the model in, glue). With tiling, base tiles are split half a tile off
+   the model tiles so every model seam is bridged by a base tile.
 4. **Water & roads** – every lake / sea / harbour is printed as a perfectly flat, slightly
    recessed surface with a crisp shoreline; roads come from OpenStreetMap with a minimum
    printable width. Rivers and streams use the OpenStreetMap centrelines (LiDAR only sees
@@ -70,6 +75,12 @@ On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and co
   parts, answer *yes*. With the *Separate objects* layout every colour is its own object.
 - **Single extruder, elevation bands**: print as one colour and insert filament changes at the
   listed Z heights (round to your layer height).
+
+### Filament changes and purge
+
+The result shows an estimated number of filament changes. Slots are ordered light to dark (slicers
+that change in slot order then flush light into dark, which needs the least purge) and the result
+lists slicer tips (layer heights to use, flushing into infill/objects).
 
 ## How it works
 
@@ -113,7 +124,15 @@ web/ (Leaflet + three.js)  ──HTTP──>  maptomesh/server.py (FastAPI, back
   bridge decks), giving crisp vertical shorelines and building walls in the ground colour; water
   colour only ever appears on the flat water itself.
 - **Meshes**: every part is a closed, consistently oriented 2-manifold (checked in tests). Flat
-  areas (bases, frames, water, band tops) are strip-triangulated without T-junctions.
+  areas (bases, frames, water, band tops) are strip-triangulated, and near-flat terrain is merged
+  into larger triangles (quadtree, within the simplification tolerance) - both without
+  T-junctions. Most remaining triangles sit along colour boundaries.
+- **Caching NRCan data**: CanElevation is a free public service, so every byte read from it -
+  COPC point-cloud nodes and HRDEM COG tiles - is kept in an on-disk block cache
+  (`cache/nrcan_range_cache.sqlite`, 64 KiB blocks, LRU, default 10 GB via
+  `MAPTOMESH_DATA_CACHE_GB`, ETags re-checked after 30 days). Overlapping areas, other detail
+  levels and re-generations only download blocks never seen before; the job log reports MB
+  downloaded vs. served from cache. STAC searches are cached for a day, OSM tiles for 30 days.
 
 ## Tests
 
@@ -137,6 +156,7 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 |---|---|
 | `MAPTOMESH_CACHE` | `./cache` (tile index, elevation/OSM caches, outputs) |
 | `MAPTOMESH_VECTOR_TILES` | `https://tiles.openfreemap.org/planet` (any OpenMapTiles TileJSON) |
+| `MAPTOMESH_DATA_CACHE_GB` | `10` (size limit of the NRCan range cache) |
 
 ## Limits and known behaviour
 
