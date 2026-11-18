@@ -13,6 +13,9 @@ from maptomesh.mesh import check_manifold  # noqa: E402
 from maptomesh.partition import DROPPED, FieldSpec, Partition, shape_field  # noqa: E402
 
 
+SIMPLIFY_STATS = []
+
+
 def check(mesh, name):
     st = check_manifold(mesh)
     ok = st["open_edges"] == 0 and st["dup_directed_edges"] == 0 and st["degenerate"] == 0 and st["volume"] > 0
@@ -77,6 +80,11 @@ def run(seed: int, R: int, C: int, shape: str, frame: bool) -> bool:
                 ok_all &= ok
                 if win == (0, R, 0, C):
                     vols.append(st["volume"])
+                # simplified (quadtree-merged) surfaces must stay closed and close in volume
+                ms = p.build_part(labels, top, bot, win, 0.3, 0.0, 0.0, simplify=0.05)
+                ok2, st2 = check(ms, f"{seed} {shape} {mode} {sorted(labels)} {win} simplified")
+                ok_all &= ok2
+                SIMPLIFY_STATS.append((len(mesh.triangles), len(ms.triangles), st["volume"], st2["volume"]))
         if mode == "bands" and not frame and shape == "rectangle":
             # slabs + base must add up to the volume under the terrain surface
             ref = Partition(R, C, np.abs(a00 - a11) <= np.abs(a01 - a10))
@@ -95,5 +103,8 @@ if __name__ == "__main__":
     for i, (shape, frame) in enumerate([("rectangle", False), ("circle", False), ("hexagon", True),
                                         ("rounded", True), ("rectangle", True), ("circle", True)]):
         ok &= run(i, 60 + 7 * i, 80 + 5 * i, shape, frame)
+    a = np.array(SIMPLIFY_STATS, float)
+    print(f"simplify: {a[:, 1].sum() / a[:, 0].sum():.0%} of triangles kept, max volume change "
+          f"{np.max(np.abs(a[:, 3] - a[:, 2]) / a[:, 2]):.2%}")
     print("partition tests", "PASS" if ok else "FAIL", f"{time.time() - t:.1f}s")
     sys.exit(0 if ok else 1)

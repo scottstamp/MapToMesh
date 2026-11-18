@@ -262,7 +262,7 @@ class Partition:
 
     # ------------------------------------------------------------ solids
     def build_part(self, labels, top: FieldSpec, bottom: FieldSpec, window: tuple[int, int, int, int],
-                   scale: float, ox: float, oy: float) -> Mesh | None:
+                   scale: float, ox: float, oy: float, simplify: float = 0.0) -> Mesh | None:
         r0, r1, c0, c1 = window
         labels = np.asarray(list(labels), dtype=np.int16)
         cell_of = np.arange(len(self.tris)) // 2
@@ -344,7 +344,13 @@ class Partition:
             cv = vals[li]
             flat = (cv[:, 0] == cv[:, 1]) & (cv[:, 0] == cv[:, 2]) & (cv[:, 0] == cv[:, 3])
             flat_cells = fc[flat]
-            tri_sel = ~np.isin(cells_t, flat_cells)
+            merged_cells = np.zeros(0, np.int64)
+            if simplify > 0 and (~flat).any():
+                qt, merged_cells = self._quadtree(vals, ids, uk, fc, flat, cells_t, ft, pkeys, bnd,
+                                                  (r0, r1, c0, c1), simplify)
+                if len(qt):
+                    out.append(qt)
+            tri_sel = ~np.isin(cells_t, np.concatenate([flat_cells, merged_cells]))
             tris = ids[inv_full[tri_sel]]
             out.append(tris)
             if len(flat_cells):
@@ -388,6 +394,146 @@ class Partition:
         V[:, 0] = V[:, 0] * scale + ox
         V[:, 1] = V[:, 1] * scale + oy
         return Mesh(V.astype(np.float32), T.astype(np.int32))
+
+
+    # ------------------------------------------------------------ simplification
+    _fan_cache: dict = {}
+
+    @classmethod
+    def _fan_weights(cls, s: int) -> np.ndarray:
+        """Weights mapping (z00, zs0, z0s, zss, zc) to the 4-triangle fan surface at every
+        vertex (u, v) of an s x s block (row-major over v, u)."""
+        if s in cls._fan_cache:
+            return cls._fan_cache[s]
+        h = s / 2.0
+        Wt = np.zeros(((s + 1) * (s + 1), 5))
+        k = 0
+        for v in range(s + 1):          # row (y)
+            for u in range(s + 1):      # col (x)
+                dx, dy = u - h, v - h
+                if abs(dy) >= abs(dx):
+                    a, b = (0, 1) if dy < 0 else (3, 2)       # bottom: (0,0),(s,0) / top: (s,s),(0,s)
+                    pa, pb = ((0, 0), (s, 0)) if dy < 0 else ((s, s), (0, s))
+                else:
+                    a, b = (1, 3) if dx > 0 else (2, 0)       # right: (s,0),(s,s) / left: (0,s),(0,0)
+                    pa, pb = ((s, 0), (s, s)) if dx > 0 else ((0, s), (0, 0))
+                # barycentric in triangle (pa, pb, centre)
+                x1, y1 = pa; x2, y2 = pb; x3, y3 = h, h
+                det = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+                l1 = ((y2 - y3) * (u - x3) + (x3 - x2) * (v - y3)) / det
+                l2 = ((y3 - y1) * (u - x3) + (x1 - x3) * (v - y3)) / det
+                Wt[k, a] += l1; Wt[k, b] += l2; Wt[k, 4] += 1 - l1 - l2
+                k += 1
+        cls._fan_cache[s] = Wt
+        return Wt
+
+    def _quadtree(self, vals, ids, uk, fc, flat, cells_t, ft, pkeys, bnd, window, tol, max_level=5):
+        """Merge non-flat full cells into 2^k blocks whose surface is within ``tol`` of a fan
+        from the block centre; each block is fanned to every perimeter vertex any neighbour
+        uses, so the result has no T-junctions. Returns (triangles, merged cell ids)."""
+        r0, r1, c0, c1 = window
+        H, Wd = r1 - r0, c1 - c0
+        W1 = self.W1
+        cr, cc = fc // self.C - r0, fc % self.C - c0
+        nf = np.zeros((H, Wd), bool)
+        nf[cr[~flat], cc[~flat]] = True
+        # vertex values on the window grid (only needed where non-flat full cells are)
+        Z = np.full((H + 1, Wd + 1), np.nan)
+        for dr in (0, 1):
+            for dc in (0, 1):
+                gid = (cr + r0 + dr) * W1 + (cc + c0 + dc)
+                Z[cr + dr, cc + dc] = vals[np.searchsorted(uk, gid)]
+        merged = [nf.copy()]  # level 0: cells
+        blocks_by_level = {}
+        half_tol = tol / 2.0
+        for k in range(1, max_level + 1):
+            s = 1 << k
+            ph, pw = H // s, Wd // s
+            if ph == 0 or pw == 0:
+                break
+            prev = merged[-1]
+            hp, wp = prev.shape
+            # all four children merged at the previous level
+            ch = prev[:2 * ph, :2 * pw].reshape(ph, 2, pw, 2).all(axis=(1, 3)) if k > 1 else \
+                nf[:2 * ph, :2 * pw].reshape(ph, 2, pw, 2).all(axis=(1, 3))
+            bi, bj = np.nonzero(ch)
+            ok = np.zeros((ph, pw), bool)
+            if len(bi):
+                us = np.arange(s + 1)
+                rows = (bi[:, None, None] * s + us[None, :, None])
+                cols = (bj[:, None, None] * s + us[None, None, :])
+                Zb = Z[rows, cols].reshape(len(bi), -1)                 # row-major (v, u)
+                corners = np.column_stack([Zb[:, 0], Zb[:, s], Zb[:, s * (s + 1)], Zb[:, -1],
+                                           Zb[:, (s // 2) * (s + 1) + s // 2]])
+                fan = corners @ self._fan_weights(s).T
+                err = np.nanmax(np.abs(Zb - fan), axis=1)
+                good = err <= half_tol
+                ok[bi[good], bj[good]] = True
+            merged.append(ok)
+            blocks_by_level[k] = ok
+            if not ok.any():
+                break
+        # leaves: merged at level k but parent not merged
+        leaves = []
+        covered = np.zeros((H, Wd), bool)
+        levels = sorted(blocks_by_level, reverse=True)
+        for k in levels:
+            s = 1 << k
+            ok = blocks_by_level[k].copy()
+            bi, bj = np.nonzero(ok)
+            if not len(bi):
+                continue
+            keep = ~covered[bi * s, bj * s]
+            bi, bj = bi[keep], bj[keep]
+            for a, b in zip(bi, bj):
+                covered[a * s:(a + 1) * s, b * s:(b + 1) * s] = True
+            leaves.append((k, bi, bj))
+        if not leaves:
+            return np.zeros((0, 3), np.int64), np.zeros(0, np.int64)
+        # vertices every leaf must include on its perimeter
+        need = np.zeros((H + 1, Wd + 1), bool)
+        unmerged = nf & ~covered
+        others = np.zeros((H, Wd), bool)
+        others[cr[flat], cc[flat]] = True
+        cell_need = unmerged | others
+        need[:-1, :-1] |= cell_need; need[:-1, 1:] |= cell_need; need[1:, :-1] |= cell_need; need[1:, 1:] |= cell_need
+        lone = ft[~np.isin(cells_t, fc)]          # full triangles whose sibling is a cut piece
+        gv = np.concatenate([self.tris[lone].ravel(), pkeys[(pkeys >= 0) & (pkeys < self.NV)],
+                             uk[np.unique(bnd)][uk[np.unique(bnd)] < self.NV]])
+        gr, gc = gv // W1 - r0, gv % W1 - c0
+        inw = (gr >= 0) & (gr <= H) & (gc >= 0) & (gc <= Wd)
+        need[gr[inw], gc[inw]] = True
+        for k, bi, bj in leaves:
+            s = 1 << k
+            for dr in (0, s):
+                for dc in (0, s):
+                    need[bi * s + dr, bj * s + dc] = True
+        tris = []
+        for k, bi, bj in leaves:
+            s = 1 << k
+            t = np.arange(s)
+            # CCW perimeter (u = col, v = row): bottom, right, top, left (corners once each)
+            pu = np.concatenate([t, np.full(s, s), s - t, np.zeros(s, int)])
+            pv = np.concatenate([np.zeros(s, int), t, np.full(s, s), s - t])
+            R_ = bi[:, None] * s + pv[None, :]
+            C_ = bj[:, None] * s + pu[None, :]
+            nd = need[R_, C_]
+            gid = (R_ + r0) * W1 + (C_ + c0)
+            lid = ids[np.searchsorted(uk, gid)]
+            centre = ids[np.searchsorted(uk, (bi * s + s // 2 + r0) * W1 + (bj * s + s // 2 + c0))]
+            n, m = nd.shape
+            pos = np.nonzero(nd)
+            row, col = pos
+            # next needed perimeter position within the same leaf (cyclic)
+            start = np.searchsorted(row, np.arange(n))
+            cnt = np.bincount(row, minlength=n)
+            nxt = np.arange(len(row)) + 1
+            last = start + cnt - 1
+            nxt[last] = start
+            tris.append(np.column_stack([centre[row], lid[row, col], lid[row[nxt], col[nxt]]]))
+        cov_r, cov_c = np.nonzero(covered)
+        merged_cells = (cov_r + r0) * self.C + (cov_c + c0)
+        return np.concatenate(tris), merged_cells
 
 
 # ---------------------------------------------------------------- shapes
