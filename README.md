@@ -31,17 +31,32 @@ On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and co
 ## Using it
 
 1. **Area** – search a place, then *Draw on map* (drag a box; for circle/hexagon drag from the
-   centre) or type the width/height. Drag the red outline to move it. The info box lists how many
+   centre) or type the width/height. Drag the red outline to move it, or the white handles on its
+   corners/edges to resize it (the opposite side stays put). The info box lists how many
    LiDAR tiles / which acquisition projects cover the area.
 2. **Elevation data** – *LiDAR point clouds* (default) or *HRDEM 1 m mosaic*. Surface:
    bare terrain, terrain + buildings & bridges, or full surface including trees. *Detail* is the
    number of grid cells along the long side; the hint shows metres and millimetres per cell.
+   *Cliff smoothing* only affects steep slopes; raise it if sea cliffs or bluffs still look rough.
 3. **Print** – long-side size in mm (scale is shown), base thickness, minimum terrain thickness,
-   vertical exaggeration, optional frame and tiling.
-4. **Water & roads** – lakes/sea are flattened (and optionally recessed); roads come from
-   OpenStreetMap with a minimum printable width.
+   vertical exaggeration, optional frame and tiling. *Print base plate separately*: the model starts on top of the
+   base (z = 0 on the bed) without the base colour, freeing a filament slot; the base plate (same
+   footprint, incl. the frame ring if enabled) is a separate single-colour 3MF download and is also
+   in the STL zip. Glue the two together after printing.
+4. **Water & roads** – every lake / sea / harbour is printed as a perfectly flat, slightly
+   recessed surface with a crisp shoreline; roads come from OpenStreetMap with a minimum
+   printable width. Rivers and streams use the OpenStreetMap centrelines (LiDAR only sees
+   scattered water returns on narrow streams), widened to at least *Min river width* so they
+   stay continuous; their surface follows the channel downhill and roads stay on top where they
+   cross. They are a separate "Rivers" part in the water colour.
 5. **Colours** – presets or individual colour pickers. Islands smaller than the given area are
-   merged into their surroundings to avoid pointless filament swaps.
+   merged into their surroundings to avoid pointless filament swaps. *Colour depth*: water, roads,
+   trees and buildings are thin colour skins on one ground-coloured body, so a layer only carries
+   the colours whose visible surface is at that height (plus building walls) - nothing is coloured
+   through the model's full height. *Drop swap-only patches*: small patches that alone force their
+   colour into extra layers (a lone pond or hilltop house) are recoloured to ground, best savings
+   first, within an area budget. The result panel shows the estimated number of colour changes. In elevation-band mode water can get its own colour
+   (needs a multi-material printer) or stay part of the lowest band (single-extruder friendly).
 6. **Generate** – progress and log stream in the sidebar. A finished job can be reopened with
    `?job=<id>` while the server is running.
 
@@ -74,23 +89,37 @@ web/ (Leaflet + three.js)  ──HTTP──>  maptomesh/server.py (FastAPI, back
   XYZ + classification + flags. Points are re-projected from each tile's CRS (UTM zone + CGVD2013
   etc.) into a local transverse Mercator grid centred on the area. Projects are merged oldest to
   newest.
+- **Ground on steep terrain**: each grid vertex's ground height is a weighted least-squares
+  plane fitted through the ground points of its cell and neighbours, evaluated at the vertex. A
+  plain average depends on where in the cell the points happen to fall, which on a 60 m sea cliff
+  produces saw-tooth faces. Slopes steeper than ~20 degrees are additionally despiked and smoothed
+  (*Cliff smoothing*, 0 = off); gentler terrain keeps full detail. Shorelines are clean vertical
+  walls whose height follows the real cliff foot.
 - **Inconsistent classification across projects** is handled explicitly: per project the app
   detects whether buildings (6) and vegetation (3–5) are classified (remembered in
   `cache/project_classes.json`) and routes class 1 accordingly – e.g. Ottawa 2020 leaves
   buildings in class 1, Hamilton 2021 and St. John's 2020 leave trees in class 1. Where buildings
   are not classified, OpenStreetMap footprints (or a roof-flatness heuristic) separate them from
   trees.
-- **Water**: LiDAR water class, large voids in the point cloud and OSM water polygons. Near-level
-  water is flattened per water body; sloped rivers keep their profile; open sea outside the LiDAR
-  tiles is filled with the sea level.
-- **Meshes**: every colour region becomes its own closed, consistently oriented 2-manifold
-  (checked in tests). Flat areas (bases, frames, water, clamped band tops) are strip-triangulated
-  without T-junctions, which keeps files small.
+- **Water**: LiDAR water class, large voids in the point cloud and OSM water polygons. Each water
+  body gets one constant level (median of the LiDAR water returns), so noisy scans over the sea
+  print perfectly flat; only rivers whose measured surface drops more than 3 m keep a (smoothed)
+  profile. Open sea outside the LiDAR tiles takes the sea level.
+- **Smooth, exact region outlines**: the terrain grid is triangulated and every triangle is cut
+  exactly along iso-lines – the shape outline (true circles/hexagons), smoothed class boundaries
+  and elevation contours – instead of assigning whole grid cells, so colour edges and band
+  contours are smooth lines rather than pixel staircases (`maptomesh/partition.py`).
+- **Per-colour surfaces**: each colour part has its own top surface (flat water, roofs, terrain,
+  bridge decks), giving crisp vertical shorelines and building walls in the ground colour; water
+  colour only ever appears on the flat water itself.
+- **Meshes**: every part is a closed, consistently oriented 2-manifold (checked in tests). Flat
+  areas (bases, frames, water, band tops) are strip-triangulated without T-junctions.
 
 ## Tests
 
 ```bash
 .venv/Scripts/python tests/test_mesh_unit.py                    # offline mesh/raster checks
+.venv/Scripts/python tests/test_partition.py                    # offline iso-line partition checks
 .venv/Scripts/python run.py --no-browser --port 8765            # in another terminal
 .venv/Scripts/python tests/integration.py                       # end-to-end, needs internet
 .venv/Scripts/python tests/validate_3mf.py some_model.3mf       # independent 3MF checker
@@ -114,7 +143,9 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 - Up to 2,500 LiDAR tiles per request (≈ 2,500 km²); use HRDEM for anything larger.
 - Areas outside LiDAR coverage are interpolated and reported in the result notes.
 - HRDEM has no classification: buildings come from OSM footprints, other raised objects count as trees.
-- Multi-colour parts are full-height columns above the base, so colours show on the side walls.
+- On hilly terrain with trees/roads/buildings at every elevation, most layers still need every
+  colour: a colour must be printed wherever its surface is visible. Fewer colours (e.g. trees in
+  the ground colour) is the main lever there; the estimate in the result panel shows the effect.
 
 ## Data and licences
 
