@@ -5,7 +5,10 @@ nodes intersecting the AOI and only down to the level of detail needed for the
 grid spacing, so a 1 km tile at 2 m spacing is ~1-3 MB of transfer.
 
 Per vertex we accumulate (ASPRS classes):
-  ground   mean z of 2 ground, 8 key-point, 9 water, 11 road surface
+  ground   local plane fit (cell + weighted neighbours) through ground points of classes
+           2 ground, 8 key-point, 9 water, 11 road surface, evaluated at the vertex - unlike a
+           plain mean this does not depend on where inside a cell the points fall, which
+           matters on cliffs where one 5 m cell can span tens of metres of height
   water    count of 9
   building max z of 6
   bridge   max z of 17
@@ -53,6 +56,7 @@ class _Acc:
     shape: tuple[int, int]
     gsum: np.ndarray = field(init=False)
     gcnt: np.ndarray = field(init=False)
+    gmom: np.ndarray = field(init=False)  # ground moments: dx, dy, dx2, dxdy, dy2, dxz, dyz
     wcnt: np.ndarray = field(init=False)
     bmax: np.ndarray = field(init=False)
     brmax: np.ndarray = field(init=False)
@@ -69,6 +73,7 @@ class _Acc:
         n = self.shape[0] * self.shape[1]
         self.gsum = np.zeros(n, np.float64)
         self.gcnt = np.zeros(n, np.int32)
+        self.gmom = np.zeros((7, n), np.float64)
         self.wcnt = np.zeros(n, np.int32)
         self.bmax = np.full(n, -np.inf, np.float32)
         self.brmax = np.full(n, -np.inf, np.float32)
@@ -78,13 +83,17 @@ class _Acc:
         self.total = np.zeros(n, np.int32)
         self.covered = np.zeros(self.shape, bool)
 
-    def add(self, idx: np.ndarray, z: np.ndarray, cls: np.ndarray) -> None:
+    def add(self, idx: np.ndarray, z: np.ndarray, cls: np.ndarray, dx: np.ndarray, dy: np.ndarray) -> None:
         n = self.gsum.size
         self.total += np.bincount(idx, minlength=n).astype(np.int32)
         np.minimum.at(self.lowest, idx, z)
         g = np.isin(cls, GROUND)
-        self.gsum += np.bincount(idx[g], weights=z[g], minlength=n)
-        self.gcnt += np.bincount(idx[g], minlength=n).astype(np.int32)
+        gi, gz = idx[g], z[g].astype(np.float64)
+        gx, gy = dx[g].astype(np.float64), dy[g].astype(np.float64)
+        self.gsum += np.bincount(gi, weights=gz, minlength=n)
+        self.gcnt += np.bincount(gi, minlength=n).astype(np.int32)
+        for k, wgt in enumerate((gx, gy, gx * gx, gx * gy, gy * gy, gx * gz, gy * gz)):
+            self.gmom[k] += np.bincount(gi, weights=wgt, minlength=n)
         w = cls == 9
         self.wcnt += np.bincount(idx[w], minlength=n).astype(np.int32)
         vsel = np.isin(cls, (3, 4, 5))
@@ -164,11 +173,15 @@ def _process_tile(tile: Tile, aoi: AOI, grid: Grid, resolution: float, cancel: t
         z = np.asarray(pts.z, dtype=np.float32)[keep]
         cls = cls[keep]
     lx, ly = to_local.transform(x, y)
-    j = np.rint((lx - grid.x0) / grid.step).astype(np.int64)
-    i = np.rint((ly - grid.y0) / grid.step).astype(np.int64)
+    fx = (lx - grid.x0) / grid.step
+    fy = (ly - grid.y0) / grid.step
+    j = np.rint(fx).astype(np.int64)
+    i = np.rint(fy).astype(np.int64)
     ok = (j >= 0) & (j <= grid.nx) & (i >= 0) & (i <= grid.ny)
     idx = (i[ok] * (grid.nx + 1) + j[ok]).astype(np.int64)
-    return tile, (footprint, (idx, z[ok], cls[ok])), "ok"
+    dx = ((fx - j) * grid.step)[ok].astype(np.float32)  # offset from the vertex, metres
+    dy = ((fy - i) * grid.step)[ok].astype(np.float32)
+    return tile, (footprint, (idx, z[ok], cls[ok], dx, dy)), "ok"
 
 
 _FLAGS_PATH = config.CACHE_DIR / "project_classes.json"
@@ -193,6 +206,55 @@ def _project_flags(name: str, n_bld: int, n_veg: int) -> tuple[bool, bool]:
             known[name] = {"buildings": has_b, "vegetation": has_v}
             _FLAGS_PATH.write_text(json.dumps(known, indent=1, sort_keys=True))
     return has_b, has_v
+
+
+def _plane_fit_ground(a: _Acc, shape: tuple[int, int], step: float) -> np.ndarray:
+    """Weighted least-squares plane z = h + b*x + c*y through the ground points of each
+    vertex bin and its 8 neighbours (weights 1 / 0.3 / 0.1), evaluated at the vertex.
+    Falls back to the bin mean where the fit is ill-conditioned; NaN where the bin itself
+    has no ground points."""
+    H, W = shape
+    n = a.gcnt.astype(np.float64).reshape(H, W)
+    sz = a.gsum.reshape(H, W)
+    mx, my, mxx, mxy, myy, mxz, myz = (m.reshape(H, W) for m in a.gmom)
+    S = {k: np.zeros((H, W)) for k in ("n", "x", "y", "z", "xx", "xy", "yy", "xz", "yz")}
+
+    def sh(arr, di, dj):  # neighbour (i+di, j+dj) aligned onto (i, j)
+        p = np.pad(arr, 1)
+        return p[1 + di:1 + di + H, 1 + dj:1 + dj + W]
+
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            w = (1.0, 0.3, 0.1)[abs(di) + abs(dj)]
+            ox, oy = dj * step, di * step
+            nn, sx, sy, s_z = sh(n, di, dj), sh(mx, di, dj), sh(my, di, dj), sh(sz, di, dj)
+            S["n"] += w * nn
+            S["x"] += w * (sx + nn * ox)
+            S["y"] += w * (sy + nn * oy)
+            S["z"] += w * s_z
+            S["xx"] += w * (sh(mxx, di, dj) + 2 * ox * sx + nn * ox * ox)
+            S["yy"] += w * (sh(myy, di, dj) + 2 * oy * sy + nn * oy * oy)
+            S["xy"] += w * (sh(mxy, di, dj) + ox * sy + oy * sx + nn * ox * oy)
+            S["xz"] += w * (sh(mxz, di, dj) + ox * s_z)
+            S["yz"] += w * (sh(myz, di, dj) + oy * s_z)
+    mean = np.where(n > 0, sz / np.maximum(n, 1), np.nan)
+    out = mean.copy()
+    ok = (n > 0) & (S["n"] >= 3)
+    if ok.any():
+        N = S["n"][ok]
+        zc = S["z"][ok] / N                     # centre z for conditioning
+        ridge = 1e-3 * N * step * step          # keeps near-collinear sets solvable
+        A = np.empty((ok.sum(), 3, 3))
+        A[:, 0, 0] = N; A[:, 0, 1] = A[:, 1, 0] = S["x"][ok]; A[:, 0, 2] = A[:, 2, 0] = S["y"][ok]
+        A[:, 1, 1] = S["xx"][ok] + ridge; A[:, 1, 2] = A[:, 2, 1] = S["xy"][ok]; A[:, 2, 2] = S["yy"][ok] + ridge
+        rhs = np.column_stack([np.zeros_like(N), S["xz"][ok] - zc * S["x"][ok], S["yz"][ok] - zc * S["y"][ok]])
+        cond_ok = np.abs(np.linalg.det(A)) > 1e-9 * N ** 3 * step ** 4
+        sol = np.zeros((len(N), 3))
+        if cond_ok.any():
+            sol[cond_ok] = np.linalg.solve(A[cond_ok], rhs[cond_ok][..., None])[..., 0]
+        h = np.where(cond_ok, zc + sol[:, 0], mean[ok])
+        out[ok] = h
+    return out.ravel()
 
 
 def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex, progress: ProgressFn,
@@ -236,8 +298,8 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex, progress: ProgressFn,
                     footprint, data = payload
                     acc.covered |= fill_polygon([footprint], shape)
                     if data is not None:
-                        idx, z, cls = data
-                        acc.add(idx, z, cls)
+                        idx, z, cls, dx, dy = data
+                        acc.add(idx, z, cls, dx, dy)
                         npts += len(idx)
                 progress(done / len(tiles), f"LiDAR tiles {done}/{len(tiles)} - {npts / 1e6:.1f} M points")
         except BaseException:
@@ -260,7 +322,7 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex, progress: ProgressFn,
         has = a.total > 0
         has_ground_class = a.gcnt.sum() > 0.02 * max(a.total.sum(), 1)
         if has_ground_class:
-            g = np.where(a.gcnt > 0, a.gsum / np.maximum(a.gcnt, 1), np.nan)
+            g = _plane_fit_ground(a, shape, grid.step)
         else:  # project without ground classification: lowest return
             g = np.where(np.isfinite(a.lowest), a.lowest, np.nan)
         ground[has] = g[has]
