@@ -145,7 +145,7 @@ def _run_job(job: Job) -> None:
             job.result = {
                 "file": fname, "file_size": size, "base_file": base_file, "base_file_size": base_size,
                 "stats": res.stats, "filaments": res.filaments,
-                "color_changes": res.color_changes, "notes": res.notes,
+                "color_changes": res.color_changes, "notes": res.notes, "tips": res.tips or [],
                 "data": {k: v for k, v in elev.info.items() if k in ("tiles", "points", "projects", "coverage",
                                                                        "items", "failed_tiles", "errors")},
             }

@@ -18,6 +18,7 @@ class Colors(BaseModel):
     buildings: str = Field("#C8553D", pattern=HEX)
     roads: str = Field("#FAFAFA", pattern=HEX)
     vegetation: str = Field("#4F8A3C", pattern=HEX)
+    label: str = Field("#FAFAFA", pattern=HEX)
     bands: list[str] = Field(default_factory=lambda: ["#6FA35A", "#C9B26B", "#B07A3E", "#7A4E2A", "#F4F4F4"])
     band_thresholds_m: list[float] | None = None
     band_mode: Literal["equal", "quantile"] = "equal"
@@ -54,6 +55,21 @@ class Options(BaseModel):
     size_mm: float = Field(200.0, gt=10, le=2000)
     base_mm: float = Field(3.0, ge=0.4, le=50)
     base_separate: bool = False  # base plate as its own print (frees a filament slot)
+    base_lip: bool = True        # separate base: raised lip that locates the model (tray)
+    lip_height_mm: float = Field(1.2, ge=0.2, le=10)
+    lip_width_mm: float = Field(1.6, ge=0.4, le=10)
+    lip_clearance_mm: float = Field(0.2, ge=0, le=2)
+    # printer: colour boundaries / flat tops are aligned to this layer grid
+    layer_height_mm: float = Field(0.2, ge=0.04, le=1.0)
+    first_layer_mm: float = Field(0.2, ge=0.04, le=1.0)
+    min_feature_mm: float = Field(0.5, ge=0, le=5)   # smallest printable building / patch width
+    simplify_mm: float = Field(0.05, ge=0, le=0.5)   # max surface error when merging flat-ish cells
+    # labels on the frame
+    label: bool = False
+    label_text: str = Field("", max_length=60)
+    label_scale_bar: bool = True
+    label_north: bool = True
+    label_emboss_mm: float = Field(0.6, ge=0.2, le=5)
     floor_mm: float = Field(1.5, ge=0.2, le=50)
     z_exaggeration: float = Field(1.0, gt=0, le=50)
     max_height_mm: float | None = Field(None, gt=0, le=500)

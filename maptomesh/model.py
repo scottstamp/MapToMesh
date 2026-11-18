@@ -18,6 +18,7 @@ from .geo import AOI, Grid
 from .mesh import Mesh
 from .options import Options
 from .partition import DROPPED, FieldSpec, Partition, shape_field
+from . import labels as lbl
 from .raster import despike, fill_nan, remove_small, smooth
 
 ProgressFn = Callable[[float, str], None]
@@ -25,6 +26,7 @@ ProgressFn = Callable[[float, str], None]
 # region labels
 FRAME, GROUND, VEG, WATER, ROAD, BUILDING = 0, 1, 2, 3, 4, 5
 RIVER = 7  # rivers / streams: water colour, but sloped (lakes and sea are flat WATER)
+LABEL, LIP = 8, 9
 LABEL_NAMES = {GROUND: "ground", VEG: "vegetation", WATER: "water", ROAD: "roads", BUILDING: "buildings"}
 
 
@@ -401,6 +403,7 @@ class BuildResult:
     notes: list[str]
     cell_rgb: np.ndarray | None = None   # (R, C, 3) uint8 colour per cell, for thumbnails
     base_parts: list | None = None       # base plate printed separately (own file)
+    tips: list | None = None             # slicer / printing advice for this model
     z_mm: np.ndarray | None = None       # (R+1, C+1) top heights
 
 
@@ -515,11 +518,67 @@ def _layer_color_stats(parts: list, zmax: float, layer: float = 0.2) -> tuple[in
     return int(np.maximum(counts - 1, 0).sum()), int(counts.max())
 
 
-def _terraced(top: np.ndarray, depth: float, base: float, q: float = 0.5) -> np.ndarray:
-    """Colour-skin interface: ``top - depth`` rounded down to ``q`` mm terraces (flat where the
-    surface is flat, so it triangulates cheaply), kept between the base and just under ``top``."""
-    t = base + np.floor((top - depth - base) / q) * q
-    return np.round(np.minimum(np.maximum(t, base + 0.2), top - 0.1), 3)
+class LayerGrid:
+    """The printer's layer boundaries: origin + first layer + k * layer height."""
+
+    def __init__(self, origin: float, first: float, height: float):
+        self.o, self.f, self.h = origin, first, height
+
+    def snap(self, z, how=np.round):
+        k = how((np.asarray(z, dtype=np.float64) - self.o - self.f) / self.h)
+        return np.round(self.o + self.f + np.maximum(k, 0) * self.h, 4)
+
+
+def _terraced(top: np.ndarray, depth: float, base: float, grid: LayerGrid | None = None) -> np.ndarray:
+    """Colour-skin interface: ``top - depth`` rounded down to terraces on the layer grid (about
+    0.5 mm apart; flat where the surface is flat, so it triangulates cheaply), kept between the
+    base and just under ``top``. On the layer grid, every colour change falls on a layer boundary
+    (no half-layer colour slivers)."""
+    if grid is None:
+        grid = LayerGrid(0.0, 0.0, 0.5)
+    q = grid.h * max(1, round(0.5 / grid.h))
+    t = grid.o + grid.f + np.floor((top - depth - grid.o - grid.f) / q) * q
+    floor = float(grid.snap(base + 1e-6, np.ceil))
+    return np.round(np.minimum(np.maximum(t, floor), top - 0.1), 4)
+
+
+def _disk(r: float) -> np.ndarray:
+    k = int(np.ceil(r))
+    y, x = np.mgrid[-k:k + 1, -k:k + 1]
+    return x * x + y * y <= r * r + 1e-9
+
+
+def _min_features(cm: dict[int, np.ndarray], r: float) -> dict[int, np.ndarray]:
+    """Make colour regions printable at a nozzle width of 2r cells: grow buildings smaller than
+    that, merge buildings separated by narrower gaps, and drop tree slivers thinner than it."""
+    if r < 0.5:
+        return cm
+    out = dict(cm)
+    disk = _disk(r)
+    B = cm.get(BUILDING)
+    if B is not None and B.any():
+        lab, n = ndimage.label(B, structure=np.ones((3, 3)))
+        idx = np.arange(1, n + 1)
+        rad = np.asarray(ndimage.maximum(ndimage.distance_transform_edt(B), lab, idx))
+        small = idx[rad < r]
+        if len(small):
+            B = B | ndimage.binary_dilation(np.isin(lab, small), structure=disk)
+        out[BUILDING] = ndimage.binary_closing(B, structure=disk) | B
+    V = cm.get(VEG)
+    if V is not None and V.any():
+        out[VEG] = ndimage.binary_opening(V, structure=disk)
+    return out
+
+
+def _extent(parts: list) -> list[float]:
+    lo = np.min([p.mesh.vertices.min(axis=0) for p in parts], axis=0)
+    hi = np.max([p.mesh.vertices.max(axis=0) for p in parts], axis=0)
+    return [round(float(v), 1) for v in hi - lo]
+
+
+def _luminance(c: str) -> float:
+    r, g, b = _hex_rgb(c)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
 def _flat_interface(mask: np.ndarray, top: np.ndarray, depth: float, floor: float) -> np.ndarray:
@@ -534,6 +593,66 @@ def _flat_interface(mask: np.ndarray, top: np.ndarray, depth: float, floor: floa
     return np.round(out, 3)
 
 
+def _label_field(opts: Options, nx: int, ny: int, pad: int, frame_cells: float, cell_mm: float,
+                 mm_per_m: float, R: int, C: int, notes: list) -> np.ndarray | None:
+    """Name (south side), scale bar and north arrow (north side) on the frame, as a signed
+    stroke-distance field in cells."""
+    if opts.shape == "circle":
+        notes.append("Labels need a straight frame edge; not available for circles.")
+        return None
+    fw = opts.frame_width_mm
+    sw = max(opts.min_feature_mm, 0.45)                 # stroke width
+    h = min(fw - sw - 0.8, 0.62 * fw, 7.0)              # cap height inside the ring
+    if h < 2.0:
+        notes.append("Frame too narrow for labels (needs about 4 mm).")
+        return None
+    width_mm = nx * cell_mm
+    if opts.shape == "hexagon":
+        usable = width_mm / 2 - 2 * sw                    # flat bottom edge of the hexagon
+    elif opts.shape == "rounded":
+        usable = width_mm - 2 * opts.corner_radius_mm - 2 * sw
+    else:
+        usable = width_mm - 2 * sw
+    cx = C * cell_mm / 2
+    y_s = (pad - frame_cells / 2) * cell_mm - h / 2        # baseline of the south band
+    y_n = (pad + ny + frame_cells / 2) * cell_mm           # centre of the north band
+    segs = []
+    text = lbl.normalize(opts.label_text or opts.name)
+    bar = None
+    if opts.label_scale_bar:
+        L = lbl.nice_length(0.18 * width_mm / mm_per_m)
+        if L > 0:
+            bar = (L * mm_per_m, L)
+    # fit: [scale bar]  gap  [text] centred on the south side
+    th = h
+    for _ in range(20):
+        tw = lbl.text_width(text, th) if text else 0.0
+        bw = 0.0
+        if bar:
+            bw = bar[0] + th * 0.6 + lbl.text_width(lbl.length_text(bar[1]), th * 0.8)
+        need = tw + (bw + 2 * th if bar else 0.0)
+        if need <= usable or th < 2.0:
+            break
+        th *= 0.9
+    if need > usable:
+        notes.append("Label text is too long for the frame; shortened to fit.")
+        while text and lbl.text_width(text, th) + (bw + 2 * th if bar else 0.0) > usable:
+            text = text[:-1].rstrip()
+    total = tw + (bw + 2 * th if bar else 0.0)
+    x = cx - total / 2
+    if bar:
+        bsegs, bw = lbl.scale_bar(bar[0], bar[1], th, x, y_s + th / 2)
+        segs += bsegs
+        x += bw + 2 * th
+    if text:
+        segs += lbl.text_segments(text, th, x, y_s + (h - th) / 2)
+    if opts.label_north:
+        segs += lbl.north_arrow(h, cx, y_n)
+    if not segs:
+        return None
+    return lbl.stroke_field(segs, sw / 2, (R + 1, C + 1), cell_mm)
+
+
 def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: ProgressFn) -> BuildResult:
     g = elev.grid
     nx, ny = g.nx, g.ny
@@ -542,11 +661,19 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
     zscale = mm_per_m * opts.z_exaggeration
     notes = list(surf.notes)
     col = opts.colors
-    base = float(opts.base_mm)
+    lh, fl = opts.layer_height_mm, opts.first_layer_mm
+    # base thickness on the layer grid of its own print (first layer + k layers)
+    base = float(LayerGrid(0.0, fl, lh).snap(max(opts.base_mm, fl)))
+    # layer grid of the multi-colour print (starts on top of a separately printed base)
+    lg = LayerGrid(base if opts.base_separate else 0.0, fl, lh)
 
-    # --- padded vertex grid (room for the frame ring) and the shape outline field
+    # --- padded vertex grid (room for the frame ring and the base lip) and the outline field
     frame_cells = opts.frame_width_mm / cell_mm if opts.frame else 0.0
-    pad = int(np.ceil(frame_cells)) + 2 if opts.frame else 0
+    use_lip = opts.base_separate and opts.base_lip
+    lip_in = frame_cells + opts.lip_clearance_mm / cell_mm
+    lip_out = lip_in + opts.lip_width_mm / cell_mm
+    reach = max(frame_cells, lip_out if use_lip else 0.0)
+    pad = int(np.ceil(reach)) + 2 if (opts.frame or use_lip) else 0
     R, C = ny + 2 * pad, nx + 2 * pad
 
     def P(a: np.ndarray) -> np.ndarray:
@@ -572,7 +699,7 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
     if opts.frame:
         part.step(shape_field(opts.shape, R, C, nx, ny, corner_cells, grow=frame_cells), 0.0, below=DROPPED)
         part.step(f_model, 0.0, below=FRAME)
-    elif opts.shape != "rectangle":
+    elif opts.shape != "rectangle" or pad:
         part.step(f_model, 0.0, below=DROPPED)
     # the base plate spans every colour region: build it from the outline cuts only, so later
     # colour cuts cannot leave T-junctions inside it
@@ -607,6 +734,14 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
                        ROAD: col.roads,
                        VEG: col.vegetation}
         cmasks = {lab: P(surf.masks[lab]) for lab in (BUILDING, ROAD, WATER, RIVER, VEG)}
+        cmasks = _min_features(cmasks, opts.min_feature_mm / cell_mm / 2)
+        # flat lakes / sea: water surface on a layer boundary (rivers keep their slope)
+        wet = cmasks[WATER] | cmasks[RIVER]
+        if wet.any():
+            _, (wi, wj) = ndimage.distance_transform_edt(~wet, return_indices=True)
+            lake_owned = cmasks[WATER][wi, wj]
+            fields[WATER] = np.maximum(np.where(lake_owned, lg.snap(fields[WATER]), fields[WATER]), lowest)
+            fields[RIVER] = fields[WATER]
         if opts.color_depth_mm > 0 and opts.swap_patch_budget_mm2 > 0:
             cmasks, n_rm, a_rm, saved = _drop_swap_patches(
                 cmasks, {lab: fields[lab] for lab in cmasks}, G_mm, opts.color_depth_mm, cell_mm,
@@ -642,7 +777,7 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
             # layer only carries the colours whose visible surface is within ~d of it (plus
             # building walls). The skin/body interface is the ground surface minus d, rounded down
             # to 0.5 mm terraces: shared by all classes and mostly flat (cheap to triangulate).
-            I = FieldSpec(flat(_terraced(G_mm + min(0.0, opts.road_emboss_mm), d, base)))
+            I = FieldSpec(flat(_terraced(G_mm + min(0.0, opts.road_emboss_mm), d, base, lg)))
             # one ground-coloured body under all land (outline + water cut only)
             defs.append(("body", "Body", col.ground, {GROUND}, I, FieldSpec(base)))
         for lab in (GROUND, BUILDING, WATER, RIVER, ROAD, VEG):
@@ -653,7 +788,7 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
                 defs.append((names[lab].lower(), names[lab], label_color[lab], {lab}, FieldSpec(T), FieldSpec(base)))
             elif lab in (WATER, RIVER):
                 # water colour cap (flat on lakes, following the profile on rivers) on a ground body
-                body_top = FieldSpec(flat(_terraced(fields[lab], d, base)))
+                body_top = FieldSpec(flat(_terraced(fields[lab], d, base, lg)))
                 defs.append(("water", names[lab], label_color[lab], {lab}, FieldSpec(T), body_top))
                 defs.append(("fill", f"{names[lab]} (body)", col.ground, {lab}, body_top, FieldSpec(base)))
             else:  # skin on the shared body
@@ -668,7 +803,9 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
             th = list(np.percentile(hv, np.linspace(0, 100, nb + 1)[1:-1]))
         else:
             th = list(np.linspace(hmin, hmax, nb + 1)[1:-1])
-        lo_mm = [base] + [round(float(min((t - hmin) * zscale + base + opts.floor_mm, zcap)), 3) for t in th]
+        lo_mm = [base] + [float(lg.snap(min((t - hmin) * zscale + base + opts.floor_mm, zcap))) for t in th]
+        for k in range(1, len(lo_mm)):  # snapped thresholds stay strictly increasing
+            lo_mm[k] = max(lo_mm[k], lo_mm[k - 1] + lh)
         wmask = surf.masks[WATER] | surf.masks[RIVER]
         water_sep = opts.elevation_water and wmask.any()
         if water_sep:  # flat, recessed water in its own colour; bands cover the land only
@@ -687,12 +824,15 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
                      if water_sep and ((part.tri_label == lab).any() or (part.p_label == lab).any())]
         if present_w:
             wtop = np.maximum(np.round(zmm(surf.level), 3) - opts.water_recess_mm, lowest)
+            wet_e = P(surf.masks[WATER] | surf.masks[RIVER])
+            _, (wi, wj) = ndimage.distance_transform_edt(~wet_e, return_indices=True)
+            wtop = np.maximum(np.where(P(surf.masks[WATER])[wi, wj], lg.snap(wtop), wtop), lowest)
             d = opts.color_depth_mm
             for lab in present_w:
                 nm = "Water" if lab == WATER else "Rivers"
                 label_color[lab] = col.water
                 if d > 0:
-                    body = FieldSpec(flat(_terraced(wtop, d, base)))
+                    body = FieldSpec(flat(_terraced(wtop, d, base, lg)))
                     defs.append(("water", nm, col.water, {lab}, FieldSpec(flat(wtop)), body))
                     defs.append(("fill", f"{nm} (fill)", bands[0], {lab}, body, FieldSpec(base)))
                 else:
@@ -711,18 +851,44 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         if col.base.upper() != bands[0].upper():
             color_changes.insert(0, {"z_mm": round(base, 2), "color": bands[0], "elevation_m": None})
     if opts.frame:
-        defs.append(("frame", "Frame", col.frame, {FRAME}, FieldSpec(base + opts.frame_height_mm), FieldSpec(0.0)))
+        frame_top = float(lg.snap(base + opts.frame_height_mm)) if opts.frame_height_mm > 0 else base
+        has_label = False
+        if opts.label:
+            field = _label_field(opts, nx, ny, pad, frame_cells, cell_mm, mm_per_m, R, C, notes)
+            if field is not None:
+                outline.step(field.ravel(), 0.0, above=LABEL, only=FRAME)
+                has_label = (outline.tri_label == LABEL).any() or (outline.p_label == LABEL).any()
+        defs.append(("frame", "Frame", col.frame, {FRAME}, FieldSpec(frame_top), FieldSpec(0.0)))
+        if has_label:
+            ltop = float(lg.snap(frame_top + opts.label_emboss_mm))
+            defs.append(("label", "Label", col.label, {LABEL}, FieldSpec(ltop), FieldSpec(frame_top)))
+            defs.append(("lfill", "Label (body)", col.frame, {LABEL}, FieldSpec(frame_top), FieldSpec(0.0)))
         label_color[FRAME] = col.frame
+    elif opts.label:
+        notes.append("Labels need the frame (enable Frame / border).")
 
     # --- base plate as its own print: drop it from the model, which then starts on top of it
     base_defs: list = []
+    base_src = outline
     if opts.base_separate:
         defs = [dd for dd in defs if dd[0] != "base"]
-        base_defs.append(("base", "Base plate", col.base, {GROUND, FRAME} if opts.frame else {GROUND},
-                          FieldSpec(base), FieldSpec(0.0)))
+        if use_lip:
+            # tray: the base reaches past the model (+frame) by clearance + lip, and a raised lip
+            # around it locates the model without pins or glue jigs
+            basep = Partition(R, C, np.abs(a00 - a11) <= np.abs(a01 - a10))
+            basep.step(shape_field(opts.shape, R, C, nx, ny, corner_cells, grow=lip_out), 0.0, below=DROPPED)
+            basep.step(shape_field(opts.shape, R, C, nx, ny, corner_cells, grow=lip_in), 0.0, below=LIP)
+            basep.finish(GROUND)
+            base_src = basep
+            lip_top = float(LayerGrid(0.0, fl, lh).snap(base + opts.lip_height_mm))
+            base_defs.append(("base", "Base plate", col.base, {GROUND}, FieldSpec(base), FieldSpec(0.0)))
+            base_defs.append(("base", "Base lip", col.base, {LIP}, FieldSpec(lip_top), FieldSpec(0.0)))
+        else:
+            base_defs.append(("base", "Base plate", col.base,
+                              {GROUND, FRAME, LABEL} if opts.frame else {GROUND}, FieldSpec(base), FieldSpec(0.0)))
         sep = []
         for cat, name, colr, labels, top, bottom in defs:
-            if cat in ("model", "frame"):  # these used to reach down to the bed
+            if cat in ("model", "frame", "lfill"):  # these used to reach down to the bed
                 if cat == "frame" and opts.frame_height_mm <= 0:
                     continue
                 bottom = FieldSpec(base)
@@ -735,25 +901,37 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
     base_parts: list[Part] = []
     re_ = np.linspace(0, R, opts.tiles_y + 1).round().astype(int)
     ce_ = np.linspace(0, C, opts.tiles_x + 1).round().astype(int)
+
+    def staggered(e: np.ndarray, size: int) -> np.ndarray:
+        # base seams half a tile off the model seams: every model seam sits mid-base-tile
+        if len(e) <= 2:
+            return e
+        return np.concatenate([[0], ((e[:-1] + e[1:]) / 2).round().astype(int), [size]])
+
+    bre_, bce_ = staggered(re_, R), staggered(ce_, C)
     ntiles = opts.tiles_x * opts.tiles_y
     multi = ntiles > 1
+    bmulti = (len(bre_) - 1) * (len(bce_) - 1) > 1
     done = 0
-    total = ntiles * (len(defs) + len(base_defs))
-    for ty in range(opts.tiles_y):
-        for tx in range(opts.tiles_x):
-            win = (re_[ty], re_[ty + 1], ce_[tx], ce_[tx + 1])
-            tname = f"Tile {ty * opts.tiles_x + tx + 1}" if multi else opts.name
-            for target, dlist in ((parts, defs), (base_parts, base_defs)):
+    total = ntiles * len(defs) + (len(bre_) - 1) * (len(bce_) - 1) * len(base_defs)
+    sources = {"base": base_src, "body": land, "frame": outline, "label": outline, "lfill": outline}
+    jobs = [(parts, defs, re_, ce_, multi, "Tile"), (base_parts, base_defs, bre_, bce_, bmulti, "Base tile")]
+    for target, dlist, rows_e, cols_e, is_multi, tword in jobs:
+        nty, ntx = len(rows_e) - 1, len(cols_e) - 1
+        for ty in range(nty):
+            for tx in range(ntx):
+                win = (rows_e[ty], rows_e[ty + 1], cols_e[tx], cols_e[tx + 1])
+                tname = f"{tword} {ty * ntx + tx + 1}" if is_multi else opts.name
                 for cat, name, color, labels, top, bottom in dlist:
-                    src = outline if cat == "base" else land if cat == "body" else part
-                    mesh = src.build_part(labels, top, bottom, win, cell_mm,
-                                          tx * opts.tile_gap_mm, ty * opts.tile_gap_mm)
+                    src = sources.get(cat, part)
+                    mesh = src.build_part(labels, top, bottom, win, cell_mm, tx * opts.tile_gap_mm,
+                                          ty * opts.tile_gap_mm, simplify=opts.simplify_mm)
                     done += 1
-                    progress(0.2 + 0.8 * done / total, f"Meshing {name}" + (f" ({tname})" if multi else ""))
+                    progress(0.2 + 0.8 * done / total, f"Meshing {name}" + (f" ({tname})" if is_multi else ""))
                     if mesh is not None and len(mesh.triangles):
                         if base_defs and target is parts:
                             mesh = mesh.translate(0, 0, -base)  # sits on the bed; the base is its own print
-                        target.append(Part(name if not multi else f"{tname} - {name}", color.upper(), mesh,
+                        target.append(Part(name if not is_multi else f"{tname} - {name}", color.upper(), mesh,
                                            tname, cat))
 
     # --- filaments
@@ -761,6 +939,9 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
     for p in parts:
         if p.color not in colors_order:
             colors_order.append(p.color)
+    # light -> dark: slicers that change filament in slot order then flush light into dark,
+    # which needs the least purge
+    colors_order.sort(key=_luminance, reverse=True)
     filaments = [{"slot": i + 1, "color": c,
                   "used_by": sorted({p.name.split(" - ")[-1] for p in parts if p.color == c})}
                  for i, c in enumerate(colors_order)]
@@ -768,7 +949,7 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
     vmax = max(float(p.mesh.vertices[:, 2].max()) for p in parts)
     swaps, max_colors = _layer_color_stats(parts, vmax)
     stats = {
-        "size_mm": [round(C * cell_mm, 1), round(R * cell_mm, 1), round(vmax, 1)],
+        "size_mm": _extent(parts),
         "cell_mm": round(cell_mm, 3),
         "ground_m_per_cell": round(g.step, 3),
         "scale": f"1:{round(1000 / mm_per_m):,}",
@@ -799,9 +980,21 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
     zthumb = S_mm.copy()
     if opts.frame:
         zthumb = np.where(f_model >= 0, zthumb, base + opts.frame_height_mm)
+    stats["layer_mm"] = [fl, lh]
+    tips = [f"Slice with first layer {fl:g} mm and layer height {lh:g} mm: colour boundaries, water "
+            "surfaces and band heights are aligned to that layer grid.",
+            "Filament slots are ordered light to dark; when the slicer changes in slot order it flushes "
+            "light into dark, which needs the least purge.",
+            "Enable 'Flush into objects' / 'Flush into infill' (Bambu Studio, OrcaSlicer) or 'Purge into "
+            "infill' (PrusaSlicer) so purged filament ends up inside the model instead of the waste chute."]
     if base_parts:
-        stats["base_plate_mm"] = [round(C * cell_mm, 1), round(R * cell_mm, 1), round(base, 2)]
-        notes.append(f"Base plate ({base:g} mm, {col.base}) is a separate file; the model starts on top of it "
-                     "and has the same footprint.")
+        stats["base_plate_mm"] = _extent(base_parts)
+        notes.append(f"Base plate ({base:g} mm, {col.base}) is a separate file; the model starts on top of it.")
+        if use_lip:
+            tips.append(f"Base plate: the {opts.lip_height_mm:g} mm lip locates the model with "
+                        f"{opts.lip_clearance_mm:g} mm clearance - print both flat, drop the model in, glue.")
+        if len(bre_) > 2 or len(bce_) > 2:
+            tips.append("Base tiles are split half a tile off the model tiles, so every model seam is bridged "
+                        "by a base tile - glue the base first, then the model tiles on top.")
     return BuildResult(parts, stats, filaments, color_changes, notes, cell_rgb=rgb, z_mm=zthumb,
-                       base_parts=base_parts or None)
+                       base_parts=base_parts or None, tips=tips)
