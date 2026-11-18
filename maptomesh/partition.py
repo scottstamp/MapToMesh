@@ -114,16 +114,22 @@ class Partition:
         self.M = M
 
     # ------------------------------------------------------------ steps
-    def step(self, field: np.ndarray, th: float, above: int | None = None, below: int | None = None) -> None:
+    def step(self, field: np.ndarray, th: float, above: int | None = None, below: int | None = None,
+             only: int | None = None) -> None:
         """Split along ``field == th``. ``above``/``below``: final label for that side
-        (None keeps it active for later steps, DROPPED discards it)."""
+        (None keeps it active for later steps, DROPPED discards it).
+
+        ``only``: instead of the active pieces, split just the pieces already labelled ``only``
+        (None keeps that label) - e.g. dividing one water region into lake and river without
+        re-deriving its outline, so no land can appear between the two."""
         field = np.asarray(field, dtype=np.float64).ravel()
         sidx = len(self.steps)
         assert sidx < MAX_STEPS
-        self.steps.append((field, th, above, below))
+        self.steps.append((field, th, above, below, only))
+        src = ACTIVE if only is None else only
 
         # full triangles
-        act = np.nonzero(self.tri_label == ACTIVE)[0]
+        act = np.nonzero(self.tri_label == src)[0]
         fv = field[self.tris[act]]
         fmax, fmin = fv.max(axis=1), fv.min(axis=1)
         out = fmax <= th
@@ -152,10 +158,10 @@ class Partition:
             self.p_org = np.concatenate([self.p_org, org])
             self.p_cnt = np.concatenate([self.p_cnt, np.full(n, 3)])
             self.p_tri = np.concatenate([self.p_tri, ct])
-            self.p_label = np.concatenate([self.p_label, np.full(n, ACTIVE, np.int16)])
+            self.p_label = np.concatenate([self.p_label, np.full(n, src, np.int16)])
 
         # polygons
-        pidx = np.nonzero(self.p_label == ACTIVE)[0]
+        pidx = np.nonzero(self.p_label == src)[0]
         if not len(pidx):
             return
         f = self._poly_field(field, pidx)
@@ -173,9 +179,10 @@ class Partition:
         if not cr.any():
             return
         ci = pidx[cr]
-        self._clip(ci, f[cr], th, sidx, above, below)
+        self._clip(ci, f[cr], th, sidx, above, below, src)
 
-    def _clip(self, ci: np.ndarray, f: np.ndarray, th: float, sidx: int, above, below) -> None:
+    def _clip(self, ci: np.ndarray, f: np.ndarray, th: float, sidx: int, above, below,
+              src: int = ACTIVE) -> None:
         M = self.M
         n = len(ci)
         cnt = self.p_cnt[ci]
@@ -228,8 +235,8 @@ class Partition:
         (ka, xa, oa, na), (kb, xb, ob, nb) = results
         # inside part replaces the original row, outside part is appended
         self.p_keys[ci] = ka; self.p_xy[ci] = xa; self.p_org[ci] = oa; self.p_cnt[ci] = na
-        self.p_label[ci] = ACTIVE if above is None else above
-        lab_b = ACTIVE if below is None else below
+        self.p_label[ci] = src if above is None else above
+        lab_b = src if below is None else below
         self.p_keys = np.concatenate([self.p_keys, kb])
         self.p_xy = np.concatenate([self.p_xy, xb])
         self.p_org = np.concatenate([self.p_org, ob])
@@ -244,8 +251,8 @@ class Partition:
     def classify(self, values: list[np.ndarray], default: int) -> np.ndarray:
         """Apply the recorded steps to arbitrary sample points (e.g. cell centres)."""
         lab = np.full(values[0].shape, ACTIVE, np.int16)
-        for (field, th, above, below), v in zip(self.steps, values):
-            act = lab == ACTIVE
+        for (field, th, above, below, only), v in zip(self.steps, values):
+            act = lab == (ACTIVE if only is None else only)
             if below is not None:
                 lab[act & (v <= th)] = below
             if above is not None:

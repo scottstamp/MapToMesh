@@ -288,6 +288,20 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
             river &= ~osm_roads           # roads cross over streams (bridges / culverts)
         if osm_bld is not None:
             river &= ~osm_bld
+    if river.any() and W.any():
+        # LiDAR water returns along a stream belong to the stream, not to separate ponds: absorb
+        # water patches touching the corridor that are narrow (widest inscribed circle < ~15 m)
+        # or small. Lakes and the sea stay flat bodies of their own.
+        lab, n = ndimage.label(W, structure=np.ones((3, 3)))
+        touch = np.unique(lab[ndimage.binary_dilation(river, iterations=2) & (lab > 0)])
+        if len(touch):
+            radius = np.asarray(ndimage.maximum(ndimage.distance_transform_edt(W), lab, touch))
+            size = np.bincount(lab.ravel(), minlength=n + 1)[touch]
+            take = touch[(radius * step <= max(15.0, 3 * step)) | (size < cells(3000))]
+            if len(take):
+                absorb = np.isin(lab, take)
+                river |= absorb
+                W &= ~absorb
     if W.any():
         if opts.flatten_water:
             L = _water_level_map(Gf, W, hint, cov, step)
@@ -401,6 +415,25 @@ def _indicator(mask: np.ndarray, min_cells: int, sigma: float = 0.7) -> np.ndarr
     m |= ~m & ~remove_small(~m, min_cells)
     f = m.astype(np.float64)
     return ndimage.gaussian_filter(f, sigma, mode="nearest") if sigma > 0 else f
+
+
+def _cut_water(part: Partition, lakes: np.ndarray, rivers: np.ndarray, min_cells: int,
+               land: Partition | None = None) -> None:
+    """One outline for all water (label WATER), then the river share of it relabelled RIVER."""
+    wet = lakes | rivers
+    if not wet.any():
+        return
+    ind = _indicator(wet, min_cells)
+    part.step(ind, 0.5, above=WATER)
+    if land is not None:
+        land.step(ind, 0.5, above=WATER)
+    if rivers.any():
+        if lakes.any():
+            split = (ndimage.gaussian_filter(rivers.astype(np.float64), 1.0, mode="nearest")
+                     - ndimage.gaussian_filter(lakes.astype(np.float64), 1.0, mode="nearest"))
+            part.step(split, 0.0123, above=RIVER, only=WATER)
+        else:
+            part.step(np.ones(wet.shape), 0.0, above=RIVER, only=WATER)
 
 
 def _drop_swap_patches(masks: dict[int, np.ndarray], tops: dict[int, np.ndarray], ground: np.ndarray,
@@ -587,16 +620,17 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         # under all land colours (no walls along every colour boundary). LiDAR bridges were
         # already removed from the water mask, so they survive as roads.
         land = copy.deepcopy(part)
-        for i, lab in enumerate((WATER, RIVER, BUILDING, ROAD, VEG)):  # priority order
+        # all water (lakes, sea, rivers) is cut as ONE region, then divided into lake / river
+        # inside it - separate outlines would leave slivers of land between a river and LiDAR
+        # water patches or a lake it runs into
+        _cut_water(part, cmasks[WATER], cmasks[RIVER], min_cells, land=land)
+        for i, lab in enumerate((BUILDING, ROAD, VEG), start=2):  # priority order
             m = cmasks[lab]
             if m.any():
                 # distinct thresholds: two class outlines never cross a grid edge at the very
                 # same point (which would pinch the region between them to a single point)
                 sigma = 1.2 if lab == VEG else 0.7  # tree canopies are ragged: smoother outline
-                ind = _indicator(m, min_cells, sigma)
-                part.step(ind, 0.5 + 0.0173 * i, above=lab)
-                if lab in (WATER, RIVER):
-                    land.step(ind, 0.5 + 0.0173 * i, above=WATER)
+                part.step(_indicator(m, min_cells, sigma), 0.5 + 0.0173 * i, above=lab)
         part.finish(GROUND)
         land.finish(GROUND)
         default = GROUND
@@ -639,9 +673,7 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         water_sep = opts.elevation_water and wmask.any()
         if water_sep:  # flat, recessed water in its own colour; bands cover the land only
             progress(0.08, "Cutting water")
-            for i, lab in enumerate((WATER, RIVER)):
-                if surf.masks[lab].any():
-                    part.step(P(_indicator(surf.masks[lab], min_cells)), 0.5 + 0.0173 * i, above=lab)
+            _cut_water(part, P(surf.masks[WATER]), P(surf.masks[RIVER]), min_cells)
         # with separate water the bands only cover land: use the land surface continued over
         # the water so shores are clean walls (see Surface.surface_land)
         Sb_mm = np.round(zmm(surf.surface_land), 3) if water_sep else S_mm
