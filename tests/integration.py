@@ -58,6 +58,11 @@ CASES: dict[str, dict] = {
     "stj_bands_base_separate": dict(lat=47.5550, lon=-52.7300, width_m=6000, height_m=6000, shape="circle",
                                     grid_cells=500, surface="terrain", color_mode="elevation",
                                     z_exaggeration=2.5, base_separate=True, name="St Johns bands base"),
+    # frame label + separate base with locating lip, 2 tiles (staggered base seams)
+    "stj_label_lip_tiles": dict(lat=47.5660, lon=-52.6950, width_m=3200, height_m=2400, grid_cells=600,
+                                color_mode="landcover", osm_roads="medium", frame=True, frame_width_mm=8,
+                                label=True, label_text="St. John's Harbour", base_separate=True, tiles_x=2,
+                                name="St Johns label"),
     # regressions: buildings unclassified (Ottawa 2020), trees unclassified (Hamilton 2021)
     "ottawa_landcover": dict(lat=45.4236, lon=-75.7009, width_m=2000, height_m=1500, shape="rounded", grid_cells=700,
                              frame=True, osm_roads="medium", color_mode="landcover", name="Ottawa"),
@@ -88,18 +93,23 @@ def water_levels(path: Path) -> dict | None:
         up = n[:, 2] > 1e-12
         a = np.abs(n[up, 2]) / 2
         level = (p[up][:, 0, 2] == p[up][:, 1, 2]) & (p[up][:, 1, 2] == p[up][:, 2, 2])
+        zl = p[up][:, 0, 2]
         name = obj.get("name") or ""
         if name.split(" - ")[-1] in ("Base",) or "(fill)" in name:
             continue
         all_area += a.sum()
         if name.split(" - ")[-1] == "Water":
             water_area += a.sum()
-            tops.append((a, level))
+            # flat water tops must sit on the 0.2 mm layer grid (default layer settings)
+            on_grid = np.abs(zl / 0.2 - np.round(zl / 0.2)) < 1e-3
+            tops.append((a, level, level & on_grid))
     if not tops:
         return None
     a = np.concatenate([t[0] for t in tops])
     lv = np.concatenate([t[1] for t in tops])
-    return {"flat_share": float(a[lv].sum() / max(a.sum(), 1e-12)), "area_share": water_area / max(all_area, 1e-9)}
+    og = np.concatenate([t[2] for t in tops])
+    return {"flat_share": float(a[lv].sum() / max(a.sum(), 1e-12)), "area_share": water_area / max(all_area, 1e-9),
+            "on_layer_grid": float(a[og].sum() / max(a[lv].sum(), 1e-12))}
 
 
 def _min_z(path: Path) -> float:
@@ -147,7 +157,7 @@ def run_case(base: str, name: str, body: dict, timeout: float = 1800) -> dict:
         if abs(zmin) > 1e-3 or in_main:
             ok = False
     water = water_levels(path)
-    if water is not None and water["flat_share"] < 0.95:
+    if water is not None and (water["flat_share"] < 0.95 or water["on_layer_grid"] < 0.99):
         print(f"  water surface not flat: {water}")
         ok = False
     return {
@@ -183,7 +193,7 @@ def main() -> None:
             if r.get("water"):
                 w = r["water"]
                 print(f"     water: {w['flat_share']:.1%} of water surface perfectly level, "
-                      f"water = {w['area_share']:.0%} of top area")
+                      f"{w['on_layer_grid']:.1%} of it on the layer grid, water = {w['area_share']:.0%} of top area")
             for note in r["notes"]:
                 print(f"     note: {note}")
         else:
