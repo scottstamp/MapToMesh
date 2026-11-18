@@ -12,7 +12,7 @@ main { flex: 1; position: relative; display: flex; flex-direction: column; }
 #viewer canvas { display: block; }
 #viewerMsg { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); }
 #topview { display: grid; place-items: center; background: #fff; overflow: auto; }
-#topview img { max-width: 95%; max-height: 95%; image-rendering: pixelated; }
+#topview img { max-width: 95%; max-height: 95%; }
 [hidden] { display: none !important; }
 
 header { position: sticky; top: 0; background: var(--panel); padding: 14px 0 8px; z-index: 2; border-bottom: 1px solid var(--line); }
@@ -74,3 +74,8 @@ button.secondary.active { background: var(--ink); color: #fff; border-color: var
 
 .leaflet-container.drawing { cursor: crosshair; }
 .map-hint { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 800; background: rgba(29,31,34,.85); color: #fff; padding: 6px 12px; border-radius: 16px; font-size: 12.5px; pointer-events: none; }
+
+.resize-handle { background: #fff; border: 2px solid #c8553d; border-radius: 3px; box-shadow: 0 1px 3px rgba(0,0,0,.35); }
+.resize-handle:hover { background: #c8553d; }
+.cursor-nwse { cursor: nwse-resize; } .cursor-nesw { cursor: nesw-resize; }
+.cursor-ns { cursor: ns-resize; } .cursor-ew { cursor: ew-resize; }

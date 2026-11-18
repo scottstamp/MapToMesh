@@ -72,6 +72,10 @@
     <label>Terrain smoothing <b id="smoothingOut"></b>
       <input id="smoothing" type="range" min="0" max="4" step="0.25" value="0">
     </label>
+    <label title="Extra smoothing applied only on steep slopes (cliffs, bluffs), where LiDAR ground is sparse and noisy">
+      Cliff smoothing <b id="cliffOut"></b>
+      <input id="cliffSmoothing" type="range" min="0" max="4" step="0.25" value="1">
+    </label>
   </section>
 
   <section>
@@ -85,6 +89,8 @@
       <label>Min. terrain (mm)<input id="floorMm" type="number" min="0.2" step="0.1" value="1.5"
               title="Thickness of the lowest terrain above the base"></label>
     </div>
+    <label class="check" title="The model starts on top of the base and the base plate becomes its own single-colour file, freeing a filament slot. Glue them together after printing.">
+      <input id="baseSeparate" type="checkbox"> Print base plate separately (separate file)</label>
     <label>Vertical exaggeration: <b id="zExOut"></b>×
       <input id="zEx" type="range" min="0.5" max="10" step="0.1" value="1">
     </label>
@@ -109,6 +115,17 @@
     <label class="check"><input id="flattenWater" type="checkbox" checked> Flatten water bodies</label>
     <label class="check"><input id="voidsWater" type="checkbox" checked> Treat LiDAR voids as water</label>
     <label class="check"><input id="osmWater" type="checkbox" checked> Use OpenStreetMap water</label>
+    <div class="row">
+      <label>OSM rivers &amp; streams
+        <select id="osmStreams">
+          <option value="all" selected>Rivers + streams</option>
+          <option value="rivers">Rivers only</option>
+          <option value="none">None</option>
+        </select>
+      </label>
+      <label title="Narrow rivers and streams are widened to at least this printed width so they stay continuous">
+        Min river width (mm)<input id="riverMin" type="number" min="0.2" step="0.1" value="0.8"></label>
+    </div>
     <label>Water recess (mm)<input id="waterRecess" type="number" min="0" step="0.1" value="0.6"></label>
     <label>OpenStreetMap roads
       <select id="osmRoads">
@@ -147,9 +164,21 @@
       </div>
       <div id="bandColors" class="colors"></div>
       <label>Custom thresholds (m, comma-separated)<input id="bandThresholds" type="text" placeholder="auto"></label>
+      <label class="check"><input id="elevWater" type="checkbox" checked> Separate flat water colour (needs AMS / multi-material)</label>
     </div>
     <div id="colorsCommon" class="colors"></div>
-    <label>Merge colour islands smaller than (mm²)<input id="minRegion" type="number" min="0" step="0.1" value="0.4"></label>
+    <div id="waterColorWrap" class="colors"></div>
+    <div id="depthWrap">
+      <label>Colour depth (mm)
+        <input id="colorDepth" type="number" min="0" step="0.2" value="1"
+               title="Water, roads, trees and building bases are only coloured this deep below the surface; everything underneath is ground colour, so most layers need no filament swaps. 0 = full-height colour columns.">
+      </label>
+      <label title="Small patches (a lone pond, a hilltop house...) that are the only reason their colour is needed in some layers are recoloured to ground, best savings first, up to this total area. 0 = off.">
+        Drop swap-only patches, up to (mm²)
+        <input id="swapBudget" type="number" min="0" step="10" value="50">
+      </label>
+    </div>
+    <label>Merge colour islands smaller than (mm²)<input id="minRegion" type="number" min="0" step="0.1" value="1"></label>
   </section>
 
   <section>

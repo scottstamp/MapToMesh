@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js';
 
 const $ = (id) => document.getElementById(id);
 const R_EARTH = 6371008.8;
@@ -15,10 +16,10 @@ const PRESETS = {
     'All white': { base: '#F2F2F2', ground: '#F2F2F2', water: '#F2F2F2', buildings: '#F2F2F2', roads: '#F2F2F2', vegetation: '#F2F2F2', frame: '#F2F2F2' },
   },
   elevation: {
-    'Topographic': ['#2F8FD8', '#6FA35A', '#C9B26B', '#8B5A2B', '#F4F4F4'],
-    'Canyon': ['#3A6EA5', '#7A3B22', '#B5562A', '#E08E45', '#F6C99A'],
-    'Island': ['#2BB3D9', '#9CCB86', '#3E8E5A', '#1F5E3B', '#5B4636'],
-    'Greyscale': ['#2B2B2B', '#555555', '#808080', '#ABABAB', '#E0E0E0'],
+    'Topographic': ['#6FA35A', '#C9B26B', '#B07A3E', '#7A4E2A', '#F4F4F4'],
+    'Canyon': ['#7A3B22', '#9E4A26', '#B5562A', '#E08E45', '#F6C99A'],
+    'Island': ['#E8D9A8', '#9CCB86', '#3E8E5A', '#1F5E3B', '#5B4636'],
+    'Greyscale': ['#3A3A3A', '#5E5E5E', '#858585', '#ABABAB', '#E0E0E0'],
   },
 };
 const LANDCOVER_KEYS = [['ground', 'Ground'], ['water', 'Water'], ['buildings', 'Buildings'], ['roads', 'Roads & bridges'], ['vegetation', 'Trees']];
@@ -141,9 +142,58 @@ const centerMarker = L.circleMarker([0, 0], { radius: 4, color: '#c8553d', fillO
 let coverageLayer = null;
 let hintEl = null;
 
+// ---- resize handles: corners and edge midpoints of the area's bounding box
+const HANDLE_DIRS = [[-1, -1], [0, -1], [1, -1], [1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0]];
+const HANDLE_CURSOR = { '-1,-1': 'nesw', '0,-1': 'ns', '1,-1': 'nwse', '1,0': 'ew', '1,1': 'nesw', '0,1': 'ns', '-1,1': 'nwse', '-1,0': 'ew' };
+let resizing = null;
+const handles = HANDLE_DIRS.map(([sx, sy]) => {
+  const m = L.marker([0, 0], {
+    draggable: true, keyboard: false, zIndexOffset: 1000,
+    icon: L.divIcon({ className: `resize-handle cursor-${HANDLE_CURSOR[`${sx},${sy}`]}`, iconSize: [12, 12] }),
+  }).addTo(map);
+  m.on('dragstart', () => {
+    const { w, h } = areaDims();
+    resizing = { sx, sy, w, h, lat: state.center.lat, lon: state.center.lon, marker: m };
+  });
+  m.on('drag', (e) => resizeTo(e.target.getLatLng()));
+  m.on('dragend', () => { resizing = null; redrawSelection(); saveSettings(); });
+  return { m, sx, sy };
+});
+
+function resizeTo(ll) {
+  const r = resizing;
+  if (!r) return;
+  const cosl = Math.cos(r.lat * DEG);
+  // handle position in metres from the original centre
+  const px = (ll.lng - r.lon) * DEG * R_EARTH * cosl;
+  const py = (ll.lat - r.lat) * DEG * R_EARTH;
+  // the opposite side stays put; size = signed distance from it (never flips through)
+  let w = r.sx ? Math.max(50, r.sx * px + r.w / 2) : r.w;
+  let h = r.sy ? Math.max(50, r.sy * py + r.h / 2) : r.h;
+  const shape = $('shape').value;
+  if (shape === 'circle') {
+    const v = r.sx && r.sy ? Math.max(w, h) : r.sx ? w : h;
+    w = h = v;
+  } else if (shape === 'hexagon') {
+    if (r.sx) h = w * 0.8660254; else w = h / 0.8660254;
+  }
+  // new centre: opposite side + half the new size towards the handle (axes without a handle stay centred)
+  const cx = r.sx ? -r.sx * r.w / 2 + r.sx * w / 2 : 0;
+  const cy = r.sy ? -r.sy * r.h / 2 + r.sy * h / 2 : 0;
+  state.center = { lat: r.lat + (cy / R_EARTH) / DEG, lon: r.lon + (cx / (R_EARTH * cosl)) / DEG };
+  $('widthKm').value = +(w / 1000).toFixed(3);
+  $('heightKm').value = +(h / 1000).toFixed(3);
+  redrawSelection();
+}
+
 function redrawSelection() {
   selection.setLatLngs(outlineMetres().map(([x, y]) => toLatLng(x, y)));
   centerMarker.setLatLng([state.center.lat, state.center.lon]);
+  const { w, h } = areaDims();
+  for (const { m, sx, sy } of handles) {
+    if (resizing && resizing.marker === m) continue;  // the one under the mouse follows the cursor
+    m.setLatLng(toLatLng(sx * w / 2, sy * h / 2));
+  }
   updateDerived();
   scheduleCoverage();
 }
@@ -197,7 +247,7 @@ selection.on('mousedown', (e) => {
   dragStart = { ll: e.latlng, center: { ...state.center } };
   map.dragging.disable();
 });
-selection.bindTooltip('Drag to move', { sticky: true });
+selection.bindTooltip('Drag to move · drag the white handles to resize', { sticky: true });
 
 function loadCoverage() {
   fetch('/api/projects').then((r) => (r.ok ? r.json() : null)).then((gj) => {
@@ -220,6 +270,7 @@ function updateDerived() {
   const cells = parseInt($('gridCells').value);
   $('gridCellsOut').textContent = cells;
   $('smoothingOut').textContent = $('smoothing').value;
+  $('cliffOut').textContent = $('cliffSmoothing').value;
   $('zExOut').textContent = parseFloat($('zEx').value).toFixed(1);
   $('scaleOut').value = `1:${Math.round((longM * 1000) / size).toLocaleString()}`;
   const mPerCell = longM / cells, mmPerCell = size / cells;
@@ -236,6 +287,12 @@ function updateDerived() {
   $('colorsSingle').hidden = mode !== 'single';
   $('colorsLandcover').hidden = mode !== 'landcover';
   $('colorsElevation').hidden = mode !== 'elevation';
+  $('depthWrap').hidden = mode === 'single';
+  // the water picker lives with the land-cover colours; show a copy in elevation mode
+  const wl = document.querySelector('[data-color="water"]').parentElement;
+  const target = mode === 'elevation' ? $('waterColorWrap') : $('colorsLandcover');
+  if (wl.parentElement !== target) target.insertBefore(wl, mode === 'elevation' ? null : target.children[1] || null);
+  $('waterColorWrap').hidden = mode !== 'elevation' || !$('elevWater').checked;
   document.querySelector('[data-color="base"]').parentElement.hidden = mode === 'single';
 }
 
@@ -313,9 +370,10 @@ $('search').addEventListener('input', () => {
 });
 
 // ------------------------------------------------------------------ settings
-const FIELDS = ['shape', 'widthKm', 'heightKm', 'source', 'surface', 'gridCells', 'smoothing', 'sizeMm', 'baseMm', 'floorMm',
+const FIELDS = ['shape', 'widthKm', 'heightKm', 'source', 'surface', 'gridCells', 'smoothing', 'cliffSmoothing', 'baseSeparate', 'sizeMm', 'baseMm', 'floorMm',
   'zEx', 'maxHeight', 'cornerMm', 'frame', 'frameW', 'frameH', 'tilesX', 'tilesY', 'flattenWater', 'voidsWater', 'osmWater',
-  'waterRecess', 'osmRoads', 'roadMin', 'roadEmboss', 'colorMode', 'bandCount', 'bandMode', 'bandThresholds', 'minRegion',
+  'waterRecess', 'osmStreams', 'riverMin', 'osmRoads', 'roadMin', 'roadEmboss', 'colorMode', 'bandCount', 'bandMode', 'bandThresholds', 'minRegion',
+  'colorDepth', 'swapBudget', 'elevWater',
   'name', 'layout', 'showCoverage'];
 
 function saveSettings() {
@@ -355,14 +413,17 @@ function buildOptions() {
     shape: $('shape').value, corner_radius_mm: num('cornerMm', 12),
     source: $('source').value, surface: $('surface').value,
     grid_cells: parseInt($('gridCells').value), smoothing: num('smoothing', 0),
+    cliff_smoothing: num('cliffSmoothing', 1),
     size_mm: num('sizeMm', 200), base_mm: num('baseMm', 3), floor_mm: num('floorMm', 1.5),
+    base_separate: $('baseSeparate').checked,
     z_exaggeration: num('zEx', 1), max_height_mm: $('maxHeight').value ? num('maxHeight', null) : null,
     frame: $('frame').checked, frame_width_mm: num('frameW', 6), frame_height_mm: num('frameH', 2),
     tiles_x: parseInt($('tilesX').value) || 1, tiles_y: parseInt($('tilesY').value) || 1,
     flatten_water: $('flattenWater').checked, water_recess_mm: num('waterRecess', 0.6),
     voids_as_water: $('voidsWater').checked, osm_water: $('osmWater').checked,
+    osm_streams: $('osmStreams').value, river_min_width_mm: num('riverMin', 0.8),
     osm_roads: $('osmRoads').value, road_min_width_mm: num('roadMin', 0.6), road_emboss_mm: num('roadEmboss', 0),
-    color_mode: mode, min_region_mm2: num('minRegion', 0.4),
+    color_mode: mode, min_region_mm2: num('minRegion', 1), color_depth_mm: num('colorDepth', 1), swap_patch_budget_mm2: num('swapBudget', 50), elevation_water: $('elevWater').checked,
     colors: {
       single: colorVal('single'), base: colorVal('base'), frame: colorVal('frame'),
       ground: colorVal('ground'), water: colorVal('water'), buildings: colorVal('buildings'),
@@ -385,11 +446,11 @@ function applyOptions(o) {
   };
   state.center = { lat: o.lat, lon: o.lon };
   const fields = { shape: 'shape', corner_radius_mm: 'cornerMm', source: 'source', surface: 'surface', grid_cells: 'gridCells',
-    smoothing: 'smoothing', size_mm: 'sizeMm', base_mm: 'baseMm', floor_mm: 'floorMm', z_exaggeration: 'zEx',
+    smoothing: 'smoothing', cliff_smoothing: 'cliffSmoothing', base_separate: 'baseSeparate', size_mm: 'sizeMm', base_mm: 'baseMm', floor_mm: 'floorMm', z_exaggeration: 'zEx',
     max_height_mm: 'maxHeight', frame: 'frame', frame_width_mm: 'frameW', frame_height_mm: 'frameH', tiles_x: 'tilesX',
     tiles_y: 'tilesY', flatten_water: 'flattenWater', water_recess_mm: 'waterRecess', voids_as_water: 'voidsWater',
-    osm_water: 'osmWater', osm_roads: 'osmRoads', road_min_width_mm: 'roadMin', road_emboss_mm: 'roadEmboss',
-    color_mode: 'colorMode', min_region_mm2: 'minRegion', layout: 'layout', name: 'name' };
+    osm_water: 'osmWater', osm_streams: 'osmStreams', river_min_width_mm: 'riverMin', osm_roads: 'osmRoads', road_min_width_mm: 'roadMin', road_emboss_mm: 'roadEmboss',
+    color_mode: 'colorMode', min_region_mm2: 'minRegion', color_depth_mm: 'colorDepth', swap_patch_budget_mm2: 'swapBudget', elevation_water: 'elevWater', layout: 'layout', name: 'name' };
   for (const [k, id] of Object.entries(fields)) if (k in o) set(id, o[k]);
   $('widthKm').value = +(o.width_m / 1000).toFixed(3);
   $('heightKm').value = +(o.height_m / 1000).toFixed(3);
@@ -471,6 +532,7 @@ function showResult(j) {
       <a href="/api/jobs/${id}/model.3mf" download>⬇ 3MF (${fmtBytes(r.file_size)})</a>
       <a class="alt" href="/api/jobs/${id}/stl.zip" download>STL per colour (.zip)</a>
     </div>
+    ${r.base_file ? `<div class="downloads"><a class="alt" href="/api/jobs/${id}/base.3mf" download>⬇ Base plate 3MF (${fmtBytes(r.base_file_size)}, ${s.base_plate_mm.join(' × ')} mm)</a></div>` : ''}
     <dl class="stats">
       <dt>Model size</dt><dd>${s.size_mm[0]} × ${s.size_mm[1]} × ${s.size_mm[2]} mm</dd>
       ${s.tile_size_mm ? `<dt>Tiles</dt><dd>${s.tiles} × ${s.tile_size_mm[0]} × ${s.tile_size_mm[1]} mm</dd>` : ''}
@@ -478,6 +540,7 @@ function showResult(j) {
       <dt>Elevation</dt><dd>${s.elevation_range_m[0]} – ${s.elevation_range_m[1]} m → relief ${s.relief_mm} mm</dd>
       <dt>Resolution</dt><dd>${s.ground_m_per_cell} m / ${s.cell_mm} mm per cell</dd>
       <dt>Mesh</dt><dd>${s.triangles.toLocaleString()} triangles, ${s.parts} parts</dd>
+      ${s.colour_changes_est != null ? `<dt>Colour changes</dt><dd>≈ ${s.colour_changes_est.toLocaleString()} at 0.2 mm layers (max ${s.max_colours_per_layer} colours in a layer)</dd>` : ''}
       ${r.data.points ? `<dt>LiDAR</dt><dd>${(r.data.points / 1e6).toFixed(1)} M points from ${r.data.tiles} tiles</dd>` : ''}
       ${projects ? `<dt>Projects</dt><dd>${projects}</dd>` : ''}
       ${r.data.items ? `<dt>HRDEM</dt><dd>${r.data.items.join(', ')}</dd>` : ''}
@@ -535,17 +598,29 @@ const viewer = {
       const g = new THREE.BufferGeometry();
       g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(buf, base + p.vOffset, p.vCount * 3), 3));
       g.setIndex(new THREE.BufferAttribute(new Uint32Array(buf, base + p.tOffset, p.tCount * 3), 1));
-      const mat = new THREE.MeshStandardMaterial({ color: p.color, roughness: 0.85, metalness: 0.0, flatShading: true });
-      const mesh = new THREE.Mesh(g, mat);
+      const mat = new THREE.MeshStandardMaterial({ color: p.color, roughness: 0.85, metalness: 0.0 });
+      // smooth terrain, crisp walls / building edges
+      const mesh = new THREE.Mesh(toCreasedNormals(g, Math.PI / 5), mat);
+      g.dispose();
       mesh.name = p.name;
       this.group.add(mesh);
     }
     this.scene.add(this.group);
     const box = new THREE.Box3().setFromObject(this.group);
     const c = box.getCenter(new THREE.Vector3()), size = box.getSize(new THREE.Vector3());
-    const d = Math.max(size.x, size.z) * 1.1;
+    // optional camera from the URL: zoom, az/el (degrees, az 0 = from the south), fx/fy focus (0..1)
+    const q = new URLSearchParams(location.search);
+    const zoom = parseFloat(q.get('zoom') || '1');
+    const d = Math.max(size.x, size.z) * 1.1 / zoom;
+    if (q.has('fx')) c.x = box.min.x + parseFloat(q.get('fx')) * size.x;
+    if (q.has('fy')) c.z = box.max.z - parseFloat(q.get('fy')) * size.z;
     this.controls.target.copy(c);
-    this.camera.position.set(c.x - d * 0.1, c.y + d * 0.75, c.z + d * 0.85);
+    if (q.has('az')) {
+      const az = parseFloat(q.get('az')) * Math.PI / 180, el = parseFloat(q.get('el') || '35') * Math.PI / 180;
+      this.camera.position.set(c.x + d * Math.sin(az) * Math.cos(el), c.y + d * Math.sin(el), c.z + d * Math.cos(az) * Math.cos(el));
+    } else {
+      this.camera.position.set(c.x - d * 0.1, c.y + d * 0.75, c.z + d * 0.85);
+    }
     this.camera.near = d / 100; this.camera.far = d * 20; this.camera.updateProjectionMatrix();
     $('viewerMsg').hidden = true;
   },
@@ -596,7 +671,7 @@ $('showCoverage').onchange = () => {
 };
 $('generateBtn').onclick = generate;
 $('cancelBtn').onclick = () => state.jobId && fetch(`/api/jobs/${state.jobId}/cancel`, { method: 'POST' });
-for (const id of ['gridCells', 'smoothing', 'sizeMm', 'zEx', 'tilesX', 'tilesY', 'frame', 'cornerMm']) {
+for (const id of ['gridCells', 'smoothing', 'cliffSmoothing', 'sizeMm', 'zEx', 'tilesX', 'tilesY', 'frame', 'cornerMm', 'elevWater']) {
   $(id).addEventListener('input', () => { if (id === 'sizeMm' || id === 'cornerMm') redrawSelection(); else updateDerived(); });
 }
 $('gridCells').addEventListener('change', scheduleCoverage);
