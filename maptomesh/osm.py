@@ -35,6 +35,7 @@ ROAD_LEVELS = {
     "all": set(ROAD_WIDTH),
 }
 WATERWAY_WIDTH = {"river": 25, "canal": 12, "stream": 3, "drain": 1.5, "ditch": 1.5}
+STREAM_LEVELS = {"none": set(), "rivers": {"river", "canal"}, "all": {"river", "canal", "stream"}}
 SKIP_WATER = {"swimming_pool"}
 
 _tile_url: tuple[float, str] | None = None
@@ -255,7 +256,8 @@ def fetch_osm(aoi: AOI, grid: Grid, roads: str, water: bool, buildings: bool = F
 # ---------------------------------------------------------------- rasterising
 
 def rasterize_osm(data: dict, aoi: AOI, grid: Grid, mm_per_m: float, min_width_mm: float = 0.6,
-                  road_scale: float = 1.0, road_level: str = "medium") -> dict[str, np.ndarray]:
+                  road_scale: float = 1.0, road_level: str = "medium", stream_level: str = "all",
+                  river_min_width_mm: float = 0.8) -> dict[str, np.ndarray]:
     """Return {'water' (areas), 'waterways' (lines), 'roads', 'buildings'} vertex-grid masks."""
     from pyproj import Transformer
 
@@ -281,11 +283,15 @@ def rasterize_osm(data: dict, aoi: AOI, grid: Grid, mm_per_m: float, min_width_m
                 continue
             water |= fill_polygon(parts, shape)
         elif layer == "waterway" and f["type"] == "line":
-            if props.get("brunnel") == "tunnel":
+            # rivers / streams as continuous centrelines, at least a printable width wide
+            if props.get("class") not in STREAM_LEVELS.get(stream_level, set()):
+                continue
+            if props.get("brunnel") in ("tunnel", "culvert") or props.get("intermittent") in (1, True, "1"):
                 continue
             wm = WATERWAY_WIDTH.get(props.get("class"), 3)
+            min_river_hw = (river_min_width_mm / mm_per_m) / grid.step / 2 if mm_per_m > 0 else 1.0
             for p in parts:
-                water_lines.append((p, max(wm / grid.step / 2, min_hw)))
+                water_lines.append((p, max(wm / grid.step / 2, min_river_hw)))
         elif layer == "transportation" and f["type"] == "line":
             cls = props.get("class")
             if cls not in wanted_roads or props.get("brunnel") == "tunnel":
