@@ -233,10 +233,16 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
         to_veg = um & bcls & ~vcls        # buildings classified -> class 1 is mostly trees
         maybe_bld = um & ~bcls & vcls     # trees classified -> class 1 is buildings + clutter
         unknown = um & ~bcls & ~vcls      # nothing classified
+        both = um & bcls & vcls           # both classified -> class 1 is leftovers, e.g. skyscrapers
         cand = maybe_bld | unknown
+        has_osm = osm_bld is not None and osm_bld.any()
+        near = ndimage.binary_dilation(osm_bld, iterations=max(1, int(round(2.0 / step)))) if has_osm else None
+        if both.any() and has_osm:
+            # classifiers often leave the tallest towers unclassified (Chicago 2017: class 6 tops out
+            # at ~120 m, Willis Tower is class 1); inside a mapped footprint that is the building
+            bld_v = np.where(both & near, np.fmax(bld_v, Uf), bld_v)
         if cand.any():
-            if osm_bld is not None and osm_bld.any():
-                near = ndimage.binary_dilation(osm_bld, iterations=max(1, int(round(2.0 / step))))
+            if has_osm:
                 is_b = cand & near
                 notes.append("Some LiDAR here has no building class; OpenStreetMap footprints identified buildings.")
             else:
