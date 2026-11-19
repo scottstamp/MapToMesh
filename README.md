@@ -182,3 +182,19 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 - Map tiles, roads, water and building footprints: © OpenStreetMap contributors (ODbL), served by
   [OpenFreeMap](https://openfreemap.org/); place search by Nominatim.
 - Please respect the tile and Nominatim usage policies; everything is cached locally.
+- Selling prints? Both data sources allow it with credit: "Contains information licensed under
+  the Open Government Licence – Canada" and "© OpenStreetMap contributors" (e.g. in the listing
+  or on a label).
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE.md) with an additional permission for generated models:
+
+- **Free for personal and other noncommercial use**: run, modify and share the software.
+- **Generated models and prints are yours to use and sell**, including commercially. The
+  licensor claims no rights in them (third-party data credits above still apply).
+- **Not allowed without permission**: selling or bundling the software itself, or offering it
+  (or a modified version) as a commercial product or paid service.
+
+This is a source-available licence, not an OSI open-source licence. See [LICENSE.md](LICENSE.md)
+for the full terms.
