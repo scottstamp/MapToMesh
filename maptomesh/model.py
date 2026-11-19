@@ -68,7 +68,8 @@ def get_elevation(opts: Options, progress: ProgressFn, cancel: threading.Event) 
         if opts.source == "lidar":
             from .lidar_index import INDEX
             from .pointcloud import fetch_lidar
-            r = fetch_lidar(aoi, grid, INDEX.get(), progress, cancel, max_tiles=config.MAX_TILES)
+            r = fetch_lidar(aoi, grid, INDEX.get(), progress, cancel, max_tiles=config.MAX_TILES,
+                            us_source=opts.us_source)
             arrays = {"ground": r.ground, "water": r.water_frac, "building": r.building, "bridge": r.bridge,
                       "veg": r.veg, "unclass": r.unclass, "bld_cls": r.bld_classified, "veg_cls": r.veg_classified,
                       "density": r.density.astype(np.float32), "covered": r.covered}
@@ -242,13 +243,16 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
             # at ~120 m, Willis Tower is class 1); inside a mapped footprint that is the building
             bld_v = np.where(both & near, np.fmax(bld_v, Uf), bld_v)
         if cand.any():
+            show = opts.surface != "terrain"  # bare terrain uses no buildings
             if has_osm:
                 is_b = cand & near
-                notes.append("Some LiDAR here has no building class; OpenStreetMap footprints identified buildings.")
+                if show:
+                    notes.append("Some LiDAR here has no building class; OpenStreetMap footprints identified buildings.")
             else:
                 is_b = _planar_components(Uf, cand, step) & cand
-                notes.append("Some LiDAR here has no building class; a roof-flatness heuristic was used "
-                             "(OpenStreetMap footprints give better results).")
+                if show:
+                    notes.append("Some LiDAR here has no building class; a roof-flatness heuristic was used "
+                                 "(OpenStreetMap footprints give better results).")
             bld_v = np.where(is_b, np.fmax(bld_v, Uf), bld_v)
             to_veg |= unknown & ~is_b
         veg_v = np.where(to_veg, np.fmax(veg_v, Uf), veg_v)

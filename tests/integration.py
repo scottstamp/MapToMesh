@@ -63,13 +63,20 @@ CASES: dict[str, dict] = {
                                 color_mode="landcover", osm_roads="medium", frame=True, frame_width_mm=8,
                                 label=True, label_text="St. John's Harbour", base_separate=True, tiles_x=2,
                                 name="St Johns label"),
-    # USGS 3DEP (Planetary Computer COPC): Chicago Loop - towers left in class 1 by a project that
-    # classifies buildings + trees; Niagara Falls - one area from NRCan and USGS tiles
+    # USGS 3DEP. Planetary Computer (COPC): Chicago Loop - towers left in class 1 by a project that
+    # classifies buildings + trees. AWS Entwine (default): Niagara Falls - NRCan tiles and USGS
+    # octree nodes in one area; Seattle and the Grand Canyon - not in the Planetary Computer copy
     "us_chicago_loop": dict(lat=41.8830, lon=-87.6250, width_m=2000, height_m=1500, grid_cells=600,
-                            color_mode="landcover", surface="buildings", osm_roads="medium", name="Chicago Loop"),
+                            us_source="planetary", color_mode="landcover", surface="buildings",
+                            osm_roads="medium", name="Chicago Loop"),
     "border_niagara_falls": dict(lat=43.0800, lon=-79.0700, width_m=3000, height_m=3000, grid_cells=500,
                                  color_mode="landcover", surface="buildings", osm_roads="medium",
                                  name="Niagara Falls"),
+    "us_seattle_ept": dict(lat=47.6062, lon=-122.3321, width_m=2400, height_m=1800, grid_cells=600,
+                           us_source="usgs", color_mode="landcover", surface="buildings", osm_roads="medium",
+                           name="Seattle"),
+    "us_grand_canyon_ept": dict(lat=36.0570, lon=-112.1180, width_m=4000, height_m=4000, grid_cells=500,
+                                us_source="usgs", surface="terrain", color_mode="elevation", name="Grand Canyon"),
     # regressions: buildings unclassified (Ottawa 2020), trees unclassified (Hamilton 2021)
     "ottawa_landcover": dict(lat=45.4236, lon=-75.7009, width_m=2000, height_m=1500, shape="rounded", grid_cells=700,
                              frame=True, osm_roads="medium", color_mode="landcover", name="Ottawa"),
@@ -83,6 +90,9 @@ EXPECT = {
     "us_chicago_loop": {"projects": ["USGS "], "min_relief_mm": 35.0},   # Willis Tower ~442 m at 1:10,000
     # the upper rapids and the falls drop ~50 m: that river keeps a sloped surface by design
     "border_niagara_falls": {"projects": ["USGS ", "Hamilton_Niagara"], "min_flat_share": 0.85},
+    "us_seattle_ept": {"projects": ["USGS WA_KingCo"], "min_relief_mm": 15.0},   # Columbia Center ~284 m
+    # ~1 km of relief; no water in this area (sparse, unsurveyed parts must not become "void" water)
+    "us_grand_canyon_ept": {"projects": ["USGS AZ_GrandCanyonNP"], "min_relief_mm": 25.0, "max_water_share": 0.005},
 }
 
 
@@ -202,6 +212,9 @@ def run_case(base: str, name: str, body: dict, timeout: float = 1800) -> dict:
         print(f"  relief {res['stats']['relief_mm']} mm < {exp['min_relief_mm']} mm (tall buildings missing?)")
         ok = False
     water = water_levels(path)
+    if water is not None and water["area_share"] > exp.get("max_water_share", 1.0):
+        print(f"  water covers {water['area_share']:.1%} of the top, expected at most {exp['max_water_share']:.1%}")
+        ok = False
     if water is not None and (water["flat_share"] < exp.get("min_flat_share", 0.95) or water["on_layer_grid"] < 0.99):
         print(f"  water surface not flat: {water}")
         ok = False
@@ -215,6 +228,7 @@ def run_case(base: str, name: str, body: dict, timeout: float = 1800) -> dict:
         "triangles": res["stats"]["triangles"], "parts": res["stats"]["parts"], "mb": round(len(data) / 1e6, 1),
         "size_mm": res["stats"]["size_mm"], "relief_mm": res["stats"]["relief_mm"],
         "lidar": f"{res['data'].get('points', 0) / 1e6:.1f}M pts/{res['data'].get('tiles', '-')} tiles"
+                 + (f"+{res['data']['ept_nodes']} nodes" if res["data"].get("ept_nodes") else "")
         if res["data"].get("points") else ",".join(res["data"].get("items", [])),
         "notes": res["notes"],
         "water": water,

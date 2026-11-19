@@ -59,6 +59,12 @@
         <option value="hrdem">HRDEM 1 m mosaic (Canada only, faster for big areas)</option>
       </select>
     </label>
+    <label title="Where point clouds for US areas come from (Canada always uses NRCan CanElevation)">US LiDAR source
+      <select id="usSource">
+        <option value="usgs">USGS 3DEP on AWS (Entwine, complete and current)</option>
+        <option value="planetary">Microsoft Planetary Computer (COPC snapshot to ~2022)</option>
+      </select>
+    </label>
     <label>Surface
       <select id="surface">
         <option value="terrain">Bare terrain</option>

@@ -135,7 +135,7 @@ function enforceAspect(changed) {
 const map = L.map('map', { zoomControl: true }).setView([state.center.lat, state.center.lon], 14);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · LiDAR: <a href="https://open.canada.ca/data/en/dataset/7069387e-9986-4297-9f55-0288e9676947">NRCan CanElevation</a> (OGL-Canada) · <a href="https://www.usgs.gov/3d-elevation-program">USGS 3DEP</a> via <a href="https://planetarycomputer.microsoft.com/dataset/3dep-lidar-copc">Planetary Computer</a>',
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · LiDAR: <a href="https://open.canada.ca/data/en/dataset/7069387e-9986-4297-9f55-0288e9676947">NRCan CanElevation</a> (OGL-Canada) · <a href="https://www.usgs.gov/3d-elevation-program">USGS 3DEP</a> (<a href="https://registry.opendata.aws/usgs-lidar/">AWS</a> / <a href="https://planetarycomputer.microsoft.com/dataset/3dep-lidar-copc">Planetary Computer</a>)',
 }).addTo(map);
 
 const selection = L.polygon([], { color: '#c8553d', weight: 2, fillOpacity: 0.12 }).addTo(map);
@@ -261,10 +261,37 @@ function scheduleUsCoverage() {
   clearTimeout(usTimer);
   usTimer = setTimeout(loadUsCoverage, 500);
 }
+let usgsLayer = null, usgsLoading = false;
+function loadUsgsProjects() {
+  if (usgsLayer || usgsLoading) return;
+  usgsLoading = true;
+  $('usCovHint').textContent = '· loading USGS 3DEP coverage…';
+  fetch('/api/projects/usgs').then((r) => (r.ok ? r.json() : null)).then((gj) => {
+    usgsLoading = false;
+    $('usCovHint').textContent = gj ? '' : '· USGS coverage unavailable';
+    if (!gj) return;
+    usgsLayer = L.geoJSON(gj, {
+      renderer: L.canvas({ padding: 0.5 }),  // 2,000+ project outlines
+      style: { color: '#2b7a78', weight: 0.6, opacity: 0.6, fillColor: '#3aafa9', fillOpacity: 0.08 },
+      onEachFeature: (f, layer) => layer.bindTooltip(`${f.properties.project}${f.properties.year ? ' (' + f.properties.year + ')' : ''}`, { sticky: true }),
+    });
+    loadUsCoverage();
+  }).catch(() => { usgsLoading = false; });
+}
 async function loadUsCoverage() {
   const hint = $('usCovHint');
   const b = map.getBounds();
   const show = $('showCoverage').checked && viewInUs(b);
+  if ($('usSource').value === 'usgs') {
+    // every AWS Entwine project footprint at once (no per-view search)
+    if (usLayer) map.removeLayer(usLayer);
+    if (!show) { if (usgsLayer) map.removeLayer(usgsLayer); if (!usgsLoading) hint.textContent = ''; return; }
+    if (!usgsLayer) { loadUsgsProjects(); return; }
+    hint.textContent = '';
+    usgsLayer.addTo(map); selection.bringToFront();
+    return;
+  }
+  if (usgsLayer) map.removeLayer(usgsLayer);
   hint.textContent = '';
   if (!show) { if (usLayer) map.removeLayer(usLayer); return; }
   if ((b.getEast() - b.getWest()) * (b.getNorth() - b.getSouth()) > 0.35) {
@@ -350,22 +377,28 @@ async function checkCoverage() {
   try {
     const r = await fetch('/api/coverage', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lat: state.center.lat, lon: state.center.lon, width_m: w, height_m: h, grid_cells: parseInt($('gridCells').value) }),
+      body: JSON.stringify({ lat: state.center.lat, lon: state.center.lon, width_m: w, height_m: h,
+        grid_cells: parseInt($('gridCells').value), us_source: $('usSource').value }),
     });
     const d = await r.json();
     box.className = 'info';
     if (!d.ready) { box.textContent = `LiDAR index loading… ${d.message || ''}`; return; }
-    if (!d.tiles) {
+    if (!d.tiles && !d.ept_projects) {
       box.className = 'info warn';
       box.textContent = 'No LiDAR point-cloud tiles here (NRCan / USGS 3DEP on Planetary Computer). In Canada try the HRDEM source, or move the area onto the shaded coverage.'
         + (d.errors && d.errors.length ? `
 ${d.errors[0]}` : '');
       return;
     }
-    const projects = d.projects.map((p) => `${p.name}${p.year ? ' (' + p.year + ')' : ''}: ${p.tiles}`).join('\n');
-    box.className = d.tiles > d.max_tiles ? 'info err' : d.tiles > 300 ? 'info warn' : 'info';
-    box.innerText = `${d.tiles} LiDAR tile${d.tiles > 1 ? 's' : ''}` +
-      (d.tiles > d.max_tiles ? ` — over the ${d.max_tiles} limit, use HRDEM` : d.tiles > 300 ? ' — large request, HRDEM will be faster' : '') +
+    const projects = d.projects.map((p) => `${p.name}${p.year ? ' (' + p.year + ')' : ''}` + (p.tiles != null ? `: ${p.tiles}` : '')).join('\n');
+    const parts = [];
+    if (d.tiles) parts.push(`${d.tiles} LiDAR tile${d.tiles > 1 ? 's' : ''}`);
+    if (d.ept_projects) parts.push(`${d.ept_projects} USGS 3DEP project${d.ept_projects > 1 ? 's' : ''} (AWS)`);
+    const tooBig = d.tiles > d.max_tiles || (d.ept_projects && d.area_km2 > d.max_tiles);
+    const big = d.tiles > 300 || (d.ept_projects && d.area_km2 > 300);
+    box.className = tooBig ? 'info err' : big ? 'info warn' : 'info';
+    box.innerText = parts.join(' + ') +
+      (tooBig ? ` — over the ${d.max_tiles} limit, pick a smaller area` : big ? ' — large request' : '') +
       `\n${projects}`;
   } catch (e) { box.textContent = ''; }
 }
@@ -419,7 +452,7 @@ const FIELDS = ['shape', 'widthKm', 'heightKm', 'source', 'surface', 'gridCells'
   'baseLip', 'lipH', 'lipW', 'lipC', 'label', 'labelText', 'labelScale', 'labelNorth', 'layerH', 'firstLayer',
   'minFeature', 'simplify', 'sizeMm', 'baseMm', 'floorMm',
   'zEx', 'maxHeight', 'cornerMm', 'frame', 'frameW', 'frameH', 'tilesX', 'tilesY', 'flattenWater', 'voidsWater', 'osmWater',
-  'waterRecess', 'shoreSlope', 'osmStreams', 'riverMin', 'osmRoads', 'roadMin', 'roadEmboss', 'colorMode', 'bandCount', 'bandMode', 'bandThresholds', 'minRegion',
+  'usSource', 'waterRecess', 'shoreSlope', 'osmStreams', 'riverMin', 'osmRoads', 'roadMin', 'roadEmboss', 'colorMode', 'bandCount', 'bandMode', 'bandThresholds', 'minRegion',
   'colorDepth', 'swapBudget', 'elevWater',
   'name', 'layout', 'showCoverage'];
 
@@ -458,7 +491,7 @@ function buildOptions() {
   return {
     lat: state.center.lat, lon: state.center.lon, width_m: w, height_m: h,
     shape: $('shape').value, corner_radius_mm: num('cornerMm', 12),
-    source: $('source').value, surface: $('surface').value,
+    source: $('source').value, us_source: $('usSource').value, surface: $('surface').value,
     grid_cells: parseInt($('gridCells').value), smoothing: num('smoothing', 0),
     cliff_smoothing: num('cliffSmoothing', 1),
     size_mm: num('sizeMm', 200), base_mm: num('baseMm', 3), floor_mm: num('floorMm', 1.5),
@@ -497,7 +530,7 @@ function applyOptions(o) {
     else el.value = v;
   };
   state.center = { lat: o.lat, lon: o.lon };
-  const fields = { shape: 'shape', corner_radius_mm: 'cornerMm', source: 'source', surface: 'surface', grid_cells: 'gridCells',
+  const fields = { shape: 'shape', corner_radius_mm: 'cornerMm', source: 'source', us_source: 'usSource', surface: 'surface', grid_cells: 'gridCells',
     smoothing: 'smoothing', cliff_smoothing: 'cliffSmoothing', base_separate: 'baseSeparate', base_lip: 'baseLip',
     lip_height_mm: 'lipH', lip_width_mm: 'lipW', lip_clearance_mm: 'lipC', label: 'label', label_text: 'labelText',
     label_scale_bar: 'labelScale', label_north: 'labelNorth', layer_height_mm: 'layerH', first_layer_mm: 'firstLayer',
@@ -596,7 +629,7 @@ function showResult(j) {
       <dt>Resolution</dt><dd>${s.ground_m_per_cell} m / ${s.cell_mm} mm per cell</dd>
       <dt>Mesh</dt><dd>${s.triangles.toLocaleString()} triangles, ${s.parts} parts</dd>
       ${s.colour_changes_est != null ? `<dt>Colour changes</dt><dd>≈ ${s.colour_changes_est.toLocaleString()} at 0.2 mm layers (max ${s.max_colours_per_layer} colours in a layer)</dd>` : ''}
-      ${r.data.points ? `<dt>LiDAR</dt><dd>${(r.data.points / 1e6).toFixed(1)} M points from ${r.data.tiles} tiles</dd>` : ''}
+      ${r.data.points ? `<dt>LiDAR</dt><dd>${(r.data.points / 1e6).toFixed(1)} M points from ${[r.data.tiles ? `${r.data.tiles} tiles` : '', r.data.ept_nodes ? `${r.data.ept_nodes} USGS octree nodes (AWS)` : ''].filter(Boolean).join(' + ')}</dd>` : ''}
       ${projects ? `<dt>Projects</dt><dd>${projects}</dd>` : ''}
       ${r.data.items ? `<dt>HRDEM</dt><dd>${r.data.items.join(', ')}</dd>` : ''}
     </dl>
@@ -722,6 +755,7 @@ $('heightKm').oninput = () => { enforceAspect('h'); redrawSelection(); };
 $('colorMode').onchange = () => { fillPresets(); updateDerived(); saveSettings(); };
 $('preset').onchange = applyPreset;
 $('bandCount').oninput = () => { renderBandInputs(); saveSettings(); };
+$('usSource').addEventListener('change', () => { scheduleUsCoverage(); scheduleCoverage(); });
 $('showCoverage').onchange = () => {
   scheduleUsCoverage();
   if (!coverageLayer) return;

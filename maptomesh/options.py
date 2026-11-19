@@ -47,6 +47,9 @@ class Options(BaseModel):
 
     # data
     source: Literal["lidar", "hrdem"] = "lidar"
+    # US point clouds: USGS's own Entwine collection on AWS (complete, current) or the Microsoft
+    # Planetary Computer COPC snapshot (to ~2022, with gaps); Canada always uses NRCan
+    us_source: Literal["usgs", "planetary"] = "usgs"
     surface: Literal["terrain", "buildings", "full"] = "buildings"
     grid_cells: int = Field(600, ge=50, le=2400)
     smoothing: float = Field(0.0, ge=0, le=10)
@@ -113,4 +116,4 @@ class Options(BaseModel):
     name: str = Field("MapToMesh", max_length=80)
 
     def elevation_key(self) -> str:
-        return f"v5|{self.source}|{self.lat:.6f}|{self.lon:.6f}|{self.width_m:.1f}|{self.height_m:.1f}|{self.grid_cells}"
+        return f"v7|{self.source}|{self.us_source}|{self.lat:.6f}|{self.lon:.6f}|{self.width_m:.1f}|{self.height_m:.1f}|{self.grid_cells}"

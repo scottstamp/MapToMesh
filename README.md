@@ -1,8 +1,8 @@
 # MapToMesh
 
 Generate 3D-printable, multi-colour **3MF** topographic / city models of anywhere in Canada and
-much of the US from **LiDAR point clouds** (COPC) - **NRCan CanElevation** and **USGS 3DEP** (via
-Microsoft Planetary Computer) - with an OpenStreetMap-based area picker.
+the US from **LiDAR point clouds** - **NRCan CanElevation** and **USGS 3DEP** (USGS's Entwine
+collection on AWS, or Microsoft Planetary Computer) - with an OpenStreetMap-based area picker.
 
 - Pick an area on an OpenStreetMap map (rectangle, rounded rectangle, circle, hexagon); the
   LiDAR coverage is shown as an overlay.
@@ -36,7 +36,9 @@ On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and co
    corners/edges to resize it (the opposite side stays put). The info box lists how many
    LiDAR tiles / which acquisition projects cover the area.
 2. **Elevation data** – *LiDAR point clouds* (default; NRCan in Canada, USGS 3DEP in the US,
-   both merged on the border) or *HRDEM 1 m mosaic* (Canada only). Surface:
+   both merged on the border) or *HRDEM 1 m mosaic* (Canada only). *US LiDAR source*: USGS 3DEP
+   on AWS (default; every project, kept current) or Microsoft Planetary Computer (a COPC snapshot
+   to about 2022 with gaps). Surface:
    bare terrain, terrain + buildings & bridges, or full surface including trees. *Detail* is the
    number of grid cells along the long side; the hint shows metres and millimetres per cell.
    *Cliff smoothing* only affects steep slopes; raise it if sea cliffs or bluffs still look rough.
@@ -137,10 +139,16 @@ web/ (Leaflet + three.js)  ──HTTP──>  maptomesh/server.py (FastAPI, back
   areas (bases, frames, water, band tops) are strip-triangulated, and near-flat terrain is merged
   into larger triangles (quadtree, within the simplification tolerance) - both without
   T-junctions. Most remaining triangles sit along colour boundaries.
-- **USGS 3DEP (US)**: tiles are found with a STAC search of Planetary Computer's
+- **USGS 3DEP (US), AWS**: USGS / Hobu publish every 3DEP project as an Entwine Point Tile
+  octree in `s3://usgs-lidar-public` (Web Mercator, one small LAZ file per node). Projects
+  intersecting the area come from Hobu's `resources.geojson` footprints (also the coverage
+  overlay); each octree is walked down to the depth whose point spacing matches the grid and the
+  intersecting nodes are fetched whole (in parallel, through the range cache). No token needed.
+- **USGS 3DEP (US), Planetary Computer**: tiles are found with a STAC search of the
   `3dep-lidar-copc` collection (cached for a day) and read with the same remote COPC reader.
   Blob URLs need a SAS token, fetched anonymously and added per request by the cache, so cached
-  blocks outlive the tokens. Heights are converted to metres from each file's CRS. 3DEP projects
+  blocks outlive the tokens. Heights are converted to metres from each file's CRS (both US
+  sources agree to a few cm on a shared project). 3DEP projects
   classify ground / water / bridges but usually leave buildings and trees in class 1, which goes
   through the same OSM-footprint routing as unclassified Canadian projects; where a project does
   classify both, leftover class-1 points inside OSM footprints still count as buildings
@@ -165,7 +173,8 @@ web/ (Leaflet + three.js)  ──HTTP──>  maptomesh/server.py (FastAPI, back
 The integration suite focuses on **St_Johns_2020_2** (downtown + harbour, a 10 km / 121-tile
 elevation-band model split into 4 tiles, Cape Spear running off the eastern edge of the data,
 Signal Hill full surface at high detail, and the HRDEM comparison), plus Ottawa and Hamilton
-regressions, the Chicago Loop (USGS 3DEP) and Niagara Falls (NRCan + USGS in one model). Each output is re-parsed and every part is checked for open edges, duplicate edges,
+regressions, the Chicago Loop (Planetary Computer), Niagara Falls (NRCan + USGS in one model),
+Seattle and the Grand Canyon (USGS on AWS). Each output is re-parsed and every part is checked for open edges, duplicate edges,
 degenerate triangles and positive volume. Thumbnails land in `cache/integration/`.
 
 ## Configuration
@@ -181,9 +190,12 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 - Up to 2,500 LiDAR tiles per request (≈ 2,500 km²); use HRDEM for anything larger.
 - Areas outside LiDAR coverage are interpolated and reported in the result notes.
 - USGS 3DEP on Planetary Computer is a snapshot (projects up to about 2022) with gaps - e.g.
-  Seattle, Miami, Manhattan, the Grand Canyon have no tiles there. The map shows the available
-  3DEP tiles when zoomed in. A source for USGS's complete Entwine collection on AWS is planned
-  ([docs/plans/usgs-3dep-ept.md](docs/plans/usgs-3dep-ept.md)). HRDEM is Canada only.
+  Seattle, Miami, Manhattan, the Grand Canyon have no tiles there (the default AWS source has
+  them). With Planetary Computer selected the map shows its tiles only when zoomed in. HRDEM is
+  Canada only.
+- USGS on AWS reads whole octree nodes: the coarse levels near the root cover a whole project,
+  so a first request in a new project downloads more than COPC would (Seattle 2.4 x 1.8 km:
+  ~28 MB); everything is cached afterwards.
 - Waterfalls are not modelled specially: a river and the pool below the falls form one water
   body whose level is smoothed between the two.
 - HRDEM has no classification: buildings come from OSM footprints, other raised objects count as trees.
@@ -195,8 +207,9 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 
 - LiDAR point clouds and HRDEM: Natural Resources Canada, CanElevation series –
   [Open Government Licence – Canada](https://open.canada.ca/en/open-government-licence-canada).
-- US LiDAR: USGS 3D Elevation Program (public domain), served by
-  [Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/dataset/3dep-lidar-copc)
+- US LiDAR: USGS 3D Elevation Program (public domain), served from the
+  [AWS Open Data registry](https://registry.opendata.aws/usgs-lidar/) (Entwine, footprints by
+  Hobu) or [Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/dataset/3dep-lidar-copc)
   (subject to its terms of use).
 - Map tiles, roads, water and building footprints: © OpenStreetMap contributors (ODbL), served by
   [OpenFreeMap](https://openfreemap.org/); place search by Nominatim.

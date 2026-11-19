@@ -1,7 +1,10 @@
 # Plan: USGS 3DEP from the AWS Entwine (EPT) collection
 
-Status: not started. The Planetary Computer COPC source (`maptomesh/usgs3dep.py`) works but
-is a snapshot with large gaps. This source would cover the rest of the US.
+Status: **implemented** (2026-11-19) in `maptomesh/usgs_ept.py` as the default *US LiDAR
+source*. Planetary Computer stays selectable. Differences from the sketch below: there is no
+separate point-source class; every COPC tile and every octree node is one job in
+`pointcloud.fetch_lidar`. The user picks one US provider, so there is no dedupe step. Still
+open: the US equivalent of HRDEM (last section).
 
 ## Why
 

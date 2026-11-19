@@ -1,8 +1,9 @@
 """Fetch LiDAR COPC tiles for an AOI and bin them onto the vertex grid.
 
-Sources: NRCan CanElevation (Canada, own tile index) and USGS 3DEP via Microsoft Planetary
-Computer (US, STAC search) - both are COPC, so an area on the border simply gets tiles from both
-and the projects merge like any overlapping projects.
+Sources: NRCan CanElevation (Canada, own tile index, COPC) and USGS 3DEP in the US - either the
+AWS Entwine collection (octree nodes, ``usgs_ept``) or Microsoft Planetary Computer (COPC,
+``usgs3dep``). Every tile / node is an independent job; an area on the border simply gets data
+from both countries and the projects merge like any overlapping projects.
 
 Each COPC file is queried remotely (HTTP range requests) for only the octree
 nodes intersecting the AOI and only down to the level of detail needed for the
@@ -29,21 +30,25 @@ builder route class 1 accordingly. Projects are merged oldest -> newest.
 from __future__ import annotations
 
 import concurrent.futures as cf
+import io
 import json
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Callable
 
 import numpy as np
+import laspy
 from laspy import CopcReader, DecompressionSelection
 from laspy.copc import Bounds
 from pyproj import CRS, Transformer
+from scipy import ndimage
 
 from . import config
 from .geo import AOI, Grid
 from .httpcache import RANGE_CACHE, install_laspy_cache
-from . import usgs3dep
+from . import usgs3dep, usgs_ept
 from .lidar_index import Tile, TileIndex
 from .raster import fill_polygon
 
@@ -157,6 +162,59 @@ def _file_crs(reader: CopcReader) -> tuple[CRS | None, float]:
 install_laspy_cache()  # every COPC byte read (NRCan, USGS) is kept in the on-disk range cache
 
 
+def _keep(cls: np.ndarray, pts) -> np.ndarray:
+    keep = ~np.isin(cls, NOISE)
+    try:
+        keep &= ~np.asarray(pts.withheld, dtype=bool)
+    except Exception:  # noqa: BLE001
+        pass
+    return keep
+
+
+def _bin(lx: np.ndarray, ly: np.ndarray, z: np.ndarray, cls: np.ndarray, grid: Grid):
+    """Points in local metres -> (vertex index, z, class, dx, dy) for points on the grid."""
+    fx = (lx - grid.x0) / grid.step
+    fy = (ly - grid.y0) / grid.step
+    j = np.rint(fx).astype(np.int64)
+    i = np.rint(fy).astype(np.int64)
+    ok = (j >= 0) & (j <= grid.nx) & (i >= 0) & (i <= grid.ny)
+    idx = (i[ok] * (grid.nx + 1) + j[ok]).astype(np.int64)
+    dx = ((fx - j) * grid.step)[ok].astype(np.float32)  # offset from the vertex, metres
+    dy = ((fy - i) * grid.step)[ok].astype(np.float32)
+    return idx, z[ok], cls[ok], dx, dy
+
+
+_MERC_LOCK = threading.Lock()
+_MERC: dict = {}
+
+
+def _merc_to_local(aoi: AOI) -> Transformer:
+    """Web Mercator -> local transformer (pyproj transformers are not thread-safe: one per thread)."""
+    key = (threading.get_ident(), aoi.lat, aoi.lon)
+    with _MERC_LOCK:
+        t = _MERC.get(key)
+        if t is None:
+            if len(_MERC) > 64:
+                _MERC.clear()
+            t = _MERC[key] = Transformer.from_crs("EPSG:3857", aoi.crs, always_xy=True)
+    return t
+
+
+def _process_ept_node(project, key: str, aoi: AOI, grid: Grid, cancel: threading.Event):
+    """One AWS Entwine octree node (a small LAZ file in Web Mercator) -> binned points."""
+    if cancel.is_set():
+        raise Cancelled()
+    las = laspy.read(io.BytesIO(usgs_ept.node_bytes(project, key)))
+    if cancel.is_set():
+        raise Cancelled()
+    cls = np.asarray(las.classification, dtype=np.uint8)
+    keep = _keep(cls, las)
+    lx, ly = _merc_to_local(aoi).transform(np.asarray(las.x)[keep], np.asarray(las.y)[keep])
+    z = np.asarray(las.z, dtype=np.float32)[keep]
+    data = _bin(np.asarray(lx), np.asarray(ly), z, cls[keep], grid)
+    return (None, data if len(data[0]) else None), "ok"
+
+
 def _process_tile(tile: Tile, aoi: AOI, grid: Grid, resolution: float, cancel: threading.Event):
     if cancel.is_set():
         raise Cancelled()
@@ -165,7 +223,7 @@ def _process_tile(tile: Tile, aoi: AOI, grid: Grid, resolution: float, cancel: t
     with CopcReader.open(tile.url, http_num_threads=8, decompression_selection=sel) as r:
         crs, zf = _file_crs(r)
         if crs is None:
-            return tile, None, "no CRS"
+            return None, "no CRS"
         to_file = Transformer.from_crs(aoi.crs, crs, always_xy=True)
         to_local = Transformer.from_crs(crs, aoi.crs, always_xy=True)
         ring = aoi.outline_local(margin=grid.step * 1.5)
@@ -174,7 +232,7 @@ def _process_tile(tile: Tile, aoi: AOI, grid: Grid, resolution: float, cancel: t
         qmin = np.array([max(fx.min(), hmin[0]), max(fy.min(), hmin[1])])
         qmax = np.array([min(fx.max(), hmax[0]), min(fy.max(), hmax[1])])
         if (qmax <= qmin).any():
-            return tile, None, "outside"
+            return None, "outside"
         # tile footprint -> local grid coverage polygon
         cx = np.array([hmin[0], hmax[0], hmax[0], hmin[0]])
         cy = np.array([hmin[1], hmin[1], hmax[1], hmax[1]])
@@ -184,27 +242,28 @@ def _process_tile(tile: Tile, aoi: AOI, grid: Grid, resolution: float, cancel: t
         if cancel.is_set():
             raise Cancelled()
         if len(pts) == 0:
-            return tile, (footprint, None), "empty"
+            return (footprint, None), "empty"
         cls = np.asarray(pts.classification, dtype=np.uint8)
-        keep = ~np.isin(cls, NOISE)
-        try:
-            keep &= ~np.asarray(pts.withheld, dtype=bool)
-        except Exception:  # noqa: BLE001
-            pass
+        keep = _keep(cls, pts)
         x = np.asarray(pts.x)[keep]
         y = np.asarray(pts.y)[keep]
         z = (np.asarray(pts.z, dtype=np.float64)[keep] * zf).astype(np.float32)
         cls = cls[keep]
     lx, ly = to_local.transform(x, y)
-    fx = (lx - grid.x0) / grid.step
-    fy = (ly - grid.y0) / grid.step
-    j = np.rint(fx).astype(np.int64)
-    i = np.rint(fy).astype(np.int64)
-    ok = (j >= 0) & (j <= grid.nx) & (i >= 0) & (i <= grid.ny)
-    idx = (i[ok] * (grid.nx + 1) + j[ok]).astype(np.int64)
-    dx = ((fx - j) * grid.step)[ok].astype(np.float32)  # offset from the vertex, metres
-    dy = ((fy - i) * grid.step)[ok].astype(np.float32)
-    return tile, (footprint, (idx, z[ok], cls[ok], dx, dy)), "ok"
+    return (footprint, _bin(np.asarray(lx), np.asarray(ly), z, cls, grid)), "ok"
+
+
+def _data_coverage(total: np.ndarray, step: float) -> np.ndarray:
+    """Where a project actually has data: at least half the vertices within ~40 m hold points,
+    plus fully enclosed holes (lakes without returns stay "covered", so they become water).
+
+    The published footprints of the AWS Entwine projects are coarse and can include large areas
+    the survey never captured (the inner Grand Canyon in AZ_GrandCanyonNP_1_2019 has only a few
+    sparse points); treating those as covered turned them into "voids" and printed them as water.
+    COPC tiles (NRCan, Planetary Computer) keep their exact tile extents instead."""
+    k = max(3, int(round(40.0 / step)) | 1)
+    hit = ndimage.uniform_filter((total > 0).astype(np.float32), size=k, mode="nearest")
+    return ndimage.binary_fill_holes(hit >= 0.5)
 
 
 _FLAGS_PATH = config.CACHE_DIR / "project_classes.json"
@@ -280,73 +339,113 @@ def _plane_fit_ground(a: _Acc, shape: tuple[int, int], step: float) -> np.ndarra
     return out.ravel()
 
 
-def find_tiles(bbox: tuple[float, float, float, float], index: TileIndex | None,
-               max_items: int = 5000) -> tuple[list[Tile], list[str]]:
-    """LiDAR tiles from every provider covering ``bbox`` (lon/lat) and any search errors."""
+def find_sources(bbox: tuple[float, float, float, float], index: TileIndex | None, us_source: str = "usgs",
+                 max_items: int = 5000) -> tuple[list[Tile], list, list[str]]:
+    """LiDAR covering ``bbox`` (lon/lat): COPC tiles (NRCan, Planetary Computer), AWS Entwine
+    projects (USGS) and any search errors."""
     tiles = index.query(*bbox) if index is not None else []
-    errors = []
+    projects, errors = [], []
     if usgs3dep.in_us(bbox):
         try:
-            tiles += usgs3dep.tiles(bbox, max_items)
+            if us_source == "planetary":
+                tiles += usgs3dep.tiles(bbox, max_items)
+            else:
+                projects = usgs_ept.INDEX.query(bbox)
         except Exception as e:  # noqa: BLE001 - keep whatever the other provider has
             errors.append(f"USGS 3DEP search failed: {e}")
-    return tiles, errors
+    return tiles, projects, errors
 
 
 def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: ProgressFn,
                 cancel: threading.Event | None = None, max_tiles: int = 2500,
-                workers: int = 6) -> LidarResult:
+                workers: int = 6, us_source: str = "usgs") -> LidarResult:
     cancel = cancel or threading.Event()
     bbox = aoi.lonlat_bbox(margin=grid.step * 2)
-    tiles, search_errors = find_tiles(bbox, index, max_tiles + 1)
-    if not tiles:
-        raise RuntimeError("No LiDAR point-cloud tiles (NRCan CanElevation or USGS 3DEP) cover this area. "
+    tiles, projects, search_errors = find_sources(bbox, index, us_source, max_tiles + 1)
+    if not tiles and not projects:
+        raise RuntimeError("No LiDAR point clouds (NRCan CanElevation or USGS 3DEP) cover this area. "
                            "Enable the coverage overlay, or switch the source to HRDEM (Canada)."
                            + (f" {search_errors[0]}" if search_errors else ""))
     if len(tiles) > max_tiles:
         raise RuntimeError(f"{len(tiles)} LiDAR tiles intersect this area (limit {max_tiles}). "
                            "Pick a smaller area or use the HRDEM source.")
-    # COPC octree LOD giving ~1 point per (step/2)^2 at most
+    if projects and aoi.width_m * aoi.height_m > max_tiles * 1e6:
+        raise RuntimeError(f"Area over {max_tiles} km2: pick a smaller area for USGS 3DEP point clouds.")
+    # octree LOD giving ~1 point per (step/2)^2 at most
     resolution = max(grid.step * 0.7, 0.25)
     hit0, miss0, req0 = RANGE_CACHE.counters()
     shape = grid.vshape
     accs: dict[str, _Acc] = defaultdict(lambda: _Acc(shape))
     years: dict[str, int] = {}
+    errors: list[str] = list(search_errors)
+    ept_labels: set[str] = set()
+    # jobs: (project, year, callable -> ((footprint | None, data | None) | None, status))
+    jobs = [(t.project, t.year, partial(_process_tile, t, aoi, grid, resolution, cancel)) for t in tiles]
+    if projects:
+        progress(0.0, f"Reading the octree of {len(projects)} USGS 3DEP project(s)")
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(usgs_ept.plan, p, aoi, grid, resolution): p for p in projects}
+            for fut in cf.as_completed(futs):
+                p = futs[fut]
+                try:
+                    pl = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{p.name}: {type(e).__name__}: {e}")
+                    continue
+                if not pl.keys:
+                    continue
+                acc = accs[p.label]
+                years[p.label] = p.year
+                ept_labels.add(p.label)
+                acc.covered |= fill_polygon(pl.footprint, shape)
+                jobs += [(p.label, p.year, partial(_process_ept_node, p, k, aoi, grid, cancel)) for k in pl.keys]
+        if cancel.is_set():
+            raise Cancelled()
+    if not jobs:
+        raise RuntimeError("No LiDAR point clouds cover this area." + (f" {errors[0]}" if errors else ""))
     npts = 0
     done = 0
-    errors: list[str] = []
-    progress(0.0, f"Fetching {len(tiles)} LiDAR tiles from {len({t.project for t in tiles})} project(s)")
+    n_proj = len({j[0] for j in jobs})
+    unit = "tiles" if len(jobs) == len(tiles) else "octree nodes" if not tiles else "tiles / octree nodes"
+    progress(0.0, f"Fetching {len(jobs)} LiDAR {unit} from {n_proj} project(s)")
+    failed = 0
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(_process_tile, t, aoi, grid, resolution, cancel) for t in tiles]
+        futs = {ex.submit(fn): (proj, year) for proj, year, fn in jobs}
         try:
             for fut in cf.as_completed(futs):
                 if cancel.is_set():
                     raise Cancelled()
+                proj, year = futs[fut]
                 try:
-                    tile, payload, status = fut.result()
+                    payload, status = fut.result()
                 except Cancelled:
                     raise
                 except Exception as e:  # noqa: BLE001
                     errors.append(f"{type(e).__name__}: {e}")
-                    payload, status, tile = None, "error", None
+                    failed += 1
+                    payload = None
                 done += 1
-                if payload is not None and tile is not None:
-                    acc = accs[tile.project]
-                    years[tile.project] = tile.year
+                if payload is not None:
+                    acc = accs[proj]
+                    years[proj] = year
                     footprint, data = payload
-                    acc.covered |= fill_polygon([footprint], shape)
+                    if footprint is not None:
+                        acc.covered |= fill_polygon([footprint], shape)
                     if data is not None:
                         idx, z, cls, dx, dy = data
                         acc.add(idx, z, cls, dx, dy)
                         npts += len(idx)
-                progress(done / len(tiles), f"LiDAR tiles {done}/{len(tiles)} - {npts / 1e6:.1f} M points")
+                progress(done / len(jobs), f"LiDAR {unit} {done}/{len(jobs)} - {npts / 1e6:.1f} M points")
         except BaseException:
             cancel.set()
             for f in futs:
                 f.cancel()
             raise
-    if errors and len(errors) == len(tiles):
-        raise RuntimeError("All LiDAR tile requests failed: " + errors[0])
+    if failed == len(jobs):
+        raise RuntimeError("All LiDAR requests failed: " + errors[-1])
+
+    for label in ept_labels:
+        accs[label].covered &= _data_coverage(accs[label].total.reshape(shape), grid.step)
 
     # merge projects, oldest first
     n = shape[0] * shape[1]
@@ -378,10 +477,12 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: Progres
     rs = lambda a: a.reshape(shape)  # noqa: E731
     info = {
         "tiles": len(tiles),
+        "ept_nodes": len(jobs) - len(tiles),
+        "us_source": us_source,
         "points": int(npts),
         "projects": proj_info,
-        "errors": (search_errors + errors)[:5],
-        "failed_tiles": len(errors),
+        "errors": errors[:5],
+        "failed_tiles": failed,
         "coverage": float(cov.mean()),
         "query_resolution_m": resolution,
     }

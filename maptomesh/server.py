@@ -147,7 +147,8 @@ def _run_job(job: Job) -> None:
                 "stats": res.stats, "filaments": res.filaments,
                 "color_changes": res.color_changes, "notes": res.notes, "tips": res.tips or [],
                 "data": {k: v for k, v in elev.info.items() if k in ("tiles", "points", "projects", "coverage",
-                                                                       "items", "failed_tiles", "errors")},
+                                                                       "items", "failed_tiles", "errors",
+                                                                       "ept_nodes", "us_source")},
             }
             job.state = "done"
             job.set(1.0, "Done")
@@ -199,13 +200,14 @@ class AreaIn(BaseModel):
     width_m: float = Field(gt=0)
     height_m: float = Field(gt=0)
     grid_cells: int = 600
+    us_source: str = "usgs"
 
 
 @app.post("/api/coverage")
 def coverage(a: AreaIn) -> dict:
     aoi = AOI(a.lat, a.lon, a.width_m, a.height_m)
     grid = Grid.for_aoi(aoi, max(50, min(a.grid_cells, config.MAX_GRID_CELLS)))
-    from .pointcloud import find_tiles
+    from .pointcloud import find_sources
     from .usgs3dep import in_us
 
     out = {"grid": {"nx": grid.nx, "ny": grid.ny, "step_m": round(grid.step, 3)}}
@@ -213,13 +215,30 @@ def coverage(a: AreaIn) -> dict:
     if not INDEX.ready and not in_us(bbox):
         out.update({"ready": False, "message": INDEX.message})
         return out
-    tiles, errors = find_tiles(bbox, INDEX.get() if INDEX.ready else None, config.MAX_TILES + 1)
+    tiles, projects, errors = find_sources(bbox, INDEX.get() if INDEX.ready else None, a.us_source,
+                                           config.MAX_TILES + 1)
     cnt = Counter((t.project, t.year) for t in tiles)
+    plist = [{"name": p, "year": y, "tiles": n} for (p, y), n in cnt.items()]
+    # AWS Entwine projects have no tiles: report the projects (their octree is read per job)
+    plist += [{"name": p.label, "year": p.year, "tiles": None} for p in projects]
     out.update({
-        "ready": True, "tiles": len(tiles), "max_tiles": config.MAX_TILES, "errors": errors,
-        "projects": [{"name": p, "year": y, "tiles": n} for (p, y), n in sorted(cnt.items(), key=lambda x: -x[0][1])],
+        "ready": True, "tiles": len(tiles), "ept_projects": len(projects), "max_tiles": config.MAX_TILES,
+        "area_km2": round(a.width_m * a.height_m / 1e6, 2), "errors": errors,
+        "projects": sorted(plist, key=lambda x: -x["year"]),
     })
     return out
+
+
+@app.get("/api/projects/usgs")
+def projects_usgs():
+    """Footprints of every USGS 3DEP project in the AWS Entwine collection (simplified)."""
+    from .usgs_ept import INDEX as EPT_INDEX
+
+    try:
+        return Response(EPT_INDEX.overlay(), media_type="application/geo+json",
+                        headers={"Content-Encoding": "gzip"})
+    except Exception as ex:  # noqa: BLE001
+        raise HTTPException(502, f"USGS 3DEP project list unavailable: {ex}") from ex
 
 
 @app.get("/api/coverage/usgs")
