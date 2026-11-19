@@ -1,6 +1,6 @@
-"""Persistent HTTP range cache for NRCan's public LiDAR / HRDEM files.
+"""Persistent HTTP range cache for public LiDAR / DEM files (NRCan CanElevation, USGS 3DEP).
 
-CanElevation is a free public resource: every byte fetched from it is kept in
+These are free public resources: every byte fetched from them is kept in
 an on-disk SQLite block store (64 KiB blocks per URL) so that any later query -
 another area overlapping the same tiles, a different level of detail, a
 re-generation with other print settings - only downloads blocks it has never
@@ -10,6 +10,10 @@ ETag is re-checked after 30 days (if the file changed, its blocks are dropped).
 Used by
   * laspy's COPC reader (``HttpRangeStream.read`` is routed through ``RANGE_CACHE``)
   * rasterio / GDAL for HRDEM COGs via ``CachedHttpFile`` as a rasterio ``opener``
+
+Hosts that need signed URLs (Planetary Computer's SAS tokens) register a signer: callers and
+cache keys always use the plain URL, the token is only added to the outgoing request (and
+renewed once when the host rejects an expired one), so cached blocks outlive the tokens.
 """
 
 from __future__ import annotations
@@ -26,6 +30,32 @@ from . import config
 
 BLOCK = 64 * 1024
 REVALIDATE_S = 30 * 86400
+
+# (url prefix, signer(url, refresh) -> signed url)
+_SIGNERS: list = []
+
+
+def register_signer(prefix: str, signer) -> None:
+    _SIGNERS.append((prefix, signer))
+
+
+def _signer_for(url: str):
+    for prefix, fn in _SIGNERS:
+        if url.startswith(prefix):
+            return fn
+    return None
+
+
+def http_request(session: requests.Session, method: str, url: str, **kw) -> requests.Response:
+    """``session.request`` with the URL signed when its host needs it (retry once with a fresh
+    token if the signature was rejected)."""
+    fn = _signer_for(url)
+    if fn is None:
+        return session.request(method, url, **kw)
+    r = session.request(method, fn(url, False), **kw)
+    if r.status_code in (403, 409):  # expired / invalid token
+        r = session.request(method, fn(url, True), **kw)
+    return r
 
 
 class RangeCache:
@@ -82,7 +112,7 @@ class RangeCache:
         uid, size, etag, checked = row
         if etag and checked and now - checked > REVALIDATE_S:
             try:
-                r = (session or self._session()).head(url, timeout=30)
+                r = http_request(session or self._session(), "HEAD", url, timeout=30)
                 with self._lock:
                     self.requests += 1
                 new = r.headers.get("ETag")
@@ -100,7 +130,7 @@ class RangeCache:
     def size(self, url: str, session: requests.Session | None = None) -> int:
         uid, size = self._url_row(url, session)
         if size is None:
-            r = (session or self._session()).head(url, timeout=30, allow_redirects=True)
+            r = http_request(session or self._session(), "HEAD", url, timeout=30, allow_redirects=True)
             r.raise_for_status()
             with self._lock:
                 self.requests += 1
@@ -154,7 +184,7 @@ class RangeCache:
         sess = session or self._session()
         for run in runs:
             lo, hi = run[0] * BLOCK, (run[-1] + 1) * BLOCK - 1
-            r = sess.get(url, headers={"Range": f"bytes={lo}-{hi}"}, timeout=120)
+            r = http_request(sess, "GET", url, headers={"Range": f"bytes={lo}-{hi}"}, timeout=120)
             r.raise_for_status()
             data = r.content
             total = None
@@ -252,7 +282,7 @@ class CachedHttpFile(io.RawIOBase):
 
 
 def install_laspy_cache() -> None:
-    """Route laspy's COPC HTTP range reads through the persistent cache."""
+    """Route laspy's COPC HTTP range reads through the persistent cache (and URL signers)."""
     from laspy import copc
 
     if getattr(copc.HttpRangeStream, "_maptomesh_cached", False):

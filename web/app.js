@@ -135,7 +135,7 @@ function enforceAspect(changed) {
 const map = L.map('map', { zoomControl: true }).setView([state.center.lat, state.center.lon], 14);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · LiDAR: <a href="https://open.canada.ca/data/en/dataset/7069387e-9986-4297-9f55-0288e9676947">NRCan CanElevation</a> (OGL-Canada)',
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · LiDAR: <a href="https://open.canada.ca/data/en/dataset/7069387e-9986-4297-9f55-0288e9676947">NRCan CanElevation</a> (OGL-Canada) · <a href="https://www.usgs.gov/3d-elevation-program">USGS 3DEP</a> via <a href="https://planetarycomputer.microsoft.com/dataset/3dep-lidar-copc">Planetary Computer</a>',
 }).addTo(map);
 
 const selection = L.polygon([], { color: '#c8553d', weight: 2, fillOpacity: 0.12 }).addTo(map);
@@ -250,6 +250,45 @@ selection.on('mousedown', (e) => {
 });
 selection.bindTooltip('Drag to move · drag the white handles to resize', { sticky: true });
 
+// USGS 3DEP has no national footprint file on Planetary Computer: tile footprints are searched
+// per map view, only when zoomed in far enough for one search to cover it
+const US_REGIONS = [[-125.0, 24.0, -66.5, 49.5], [-180.0, 51.0, -129.5, 71.6], [-160.5, 18.8, -154.6, 22.4], [-67.5, 17.5, -64.4, 18.6]];
+let usLayer = null, usTimer = null, usKey = '';
+function viewInUs(b) {
+  return US_REGIONS.some(([w, s, e, n]) => b.getWest() <= e && b.getEast() >= w && b.getSouth() <= n && b.getNorth() >= s);
+}
+function scheduleUsCoverage() {
+  clearTimeout(usTimer);
+  usTimer = setTimeout(loadUsCoverage, 500);
+}
+async function loadUsCoverage() {
+  const hint = $('usCovHint');
+  const b = map.getBounds();
+  const show = $('showCoverage').checked && viewInUs(b);
+  hint.textContent = '';
+  if (!show) { if (usLayer) map.removeLayer(usLayer); return; }
+  if ((b.getEast() - b.getWest()) * (b.getNorth() - b.getSouth()) > 0.35) {
+    hint.textContent = '· zoom in to see USGS 3DEP tiles';
+    if (usLayer) map.removeLayer(usLayer);
+    return;
+  }
+  const q = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].map((v) => v.toFixed(3));
+  const key = q.join(',');
+  if (key === usKey && usLayer) { usLayer.addTo(map); selection.bringToFront(); return; }
+  try {
+    const r = await fetch(`/api/coverage/usgs?w=${q[0]}&s=${q[1]}&e=${q[2]}&n=${q[3]}`);
+    if (!r.ok) { hint.textContent = '· USGS coverage unavailable'; return; }
+    const gj = await r.json();
+    if (usLayer) map.removeLayer(usLayer);
+    usKey = key;
+    usLayer = L.geoJSON(gj, {
+      style: { stroke: false, fillColor: '#3aafa9', fillOpacity: 0.12 },
+      onEachFeature: (f, layer) => layer.bindTooltip(`${f.properties.project}${f.properties.year ? ' (' + f.properties.year + ')' : ''}`, { sticky: true }),
+    });
+    if ($('showCoverage').checked) { usLayer.addTo(map); selection.bringToFront(); }
+  } catch (e) { hint.textContent = ''; }
+}
+
 function loadCoverage() {
   fetch('/api/projects').then((r) => (r.ok ? r.json() : null)).then((gj) => {
     if (!gj) return;
@@ -318,7 +357,9 @@ async function checkCoverage() {
     if (!d.ready) { box.textContent = `LiDAR index loading… ${d.message || ''}`; return; }
     if (!d.tiles) {
       box.className = 'info warn';
-      box.textContent = 'No LiDAR point-cloud tiles here. Try the HRDEM source, or move the area onto the shaded coverage.';
+      box.textContent = 'No LiDAR point-cloud tiles here (NRCan / USGS 3DEP on Planetary Computer). In Canada try the HRDEM source, or move the area onto the shaded coverage.'
+        + (d.errors && d.errors.length ? `
+${d.errors[0]}` : '');
       return;
     }
     const projects = d.projects.map((p) => `${p.name}${p.year ? ' (' + p.year + ')' : ''}: ${p.tiles}`).join('\n');
@@ -353,7 +394,7 @@ $('search').addEventListener('input', () => {
   const q = $('search').value.trim();
   if (q.length < 3) { $('searchResults').innerHTML = ''; return; }
   searchTimer = setTimeout(async () => {
-    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&countrycodes=ca&limit=6&q=${encodeURIComponent(q)}`;
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&countrycodes=ca,us&limit=6&q=${encodeURIComponent(q)}`;
     try {
       const res = await (await fetch(url, { headers: { 'Accept-Language': navigator.language || 'en' } })).json();
       $('searchResults').innerHTML = '';
@@ -663,6 +704,7 @@ enforceAspect('w');
 redrawSelection();
 updateDerived();
 pollIndex();
+scheduleUsCoverage();
 
 // reopen a finished job from the URL (?job=<id>)
 const jobParam = new URLSearchParams(location.search).get('job');
@@ -681,6 +723,7 @@ $('colorMode').onchange = () => { fillPresets(); updateDerived(); saveSettings()
 $('preset').onchange = applyPreset;
 $('bandCount').oninput = () => { renderBandInputs(); saveSettings(); };
 $('showCoverage').onchange = () => {
+  scheduleUsCoverage();
   if (!coverageLayer) return;
   if ($('showCoverage').checked) { coverageLayer.addTo(map); selection.bringToFront(); } else map.removeLayer(coverageLayer);
 };
@@ -692,4 +735,5 @@ for (const id of ['baseSeparate', 'label', 'gridCells', 'smoothing', 'cliffSmoot
 $('gridCells').addEventListener('change', scheduleCoverage);
 document.getElementById('sidebar').addEventListener('change', saveSettings);
 map.on('moveend', saveSettings);
+map.on('moveend', scheduleUsCoverage);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.drawing) setDrawing(false); });

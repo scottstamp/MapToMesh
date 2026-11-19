@@ -35,6 +35,9 @@ selling prints.
   (<https://open.canada.ca/en/open-government-licence-canada>). Commercial use is allowed with
   attribution, for example: "Contains information licensed under the Open Government Licence -
   Canada."
+- US elevation (LiDAR point clouds): USGS 3D Elevation Program, public domain
+  (<https://www.usgs.gov/information-policies-and-instructions/copyrights-and-credits>), served
+  by Microsoft Planetary Computer. No attribution is required; "USGS 3DEP" is appreciated.
 - Water, rivers, roads and building footprints: OpenStreetMap data under the Open Database
   License 1.0 (<https://opendatacommons.org/licenses/odbl/1-0/>), via OpenFreeMap / OpenMapTiles
   vector tiles. Models and prints are Produced Works; credit "(c) OpenStreetMap contributors"

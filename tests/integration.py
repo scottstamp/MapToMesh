@@ -63,11 +63,26 @@ CASES: dict[str, dict] = {
                                 color_mode="landcover", osm_roads="medium", frame=True, frame_width_mm=8,
                                 label=True, label_text="St. John's Harbour", base_separate=True, tiles_x=2,
                                 name="St Johns label"),
+    # USGS 3DEP (Planetary Computer COPC): Chicago Loop - towers left in class 1 by a project that
+    # classifies buildings + trees; Niagara Falls - one area from NRCan and USGS tiles
+    "us_chicago_loop": dict(lat=41.8830, lon=-87.6250, width_m=2000, height_m=1500, grid_cells=600,
+                            color_mode="landcover", surface="buildings", osm_roads="medium", name="Chicago Loop"),
+    "border_niagara_falls": dict(lat=43.0800, lon=-79.0700, width_m=3000, height_m=3000, grid_cells=500,
+                                 color_mode="landcover", surface="buildings", osm_roads="medium",
+                                 name="Niagara Falls"),
     # regressions: buildings unclassified (Ottawa 2020), trees unclassified (Hamilton 2021)
     "ottawa_landcover": dict(lat=45.4236, lon=-75.7009, width_m=2000, height_m=1500, shape="rounded", grid_cells=700,
                              frame=True, osm_roads="medium", color_mode="landcover", name="Ottawa"),
     "hamilton_bands": dict(lat=43.2385, lon=-79.8950, width_m=3000, height_m=2598, shape="hexagon", grid_cells=500,
                            surface="terrain", color_mode="elevation", z_exaggeration=2.0, name="Hamilton"),
+}
+
+
+# data providers that must contribute (project name prefixes), and checks on the result
+EXPECT = {
+    "us_chicago_loop": {"projects": ["USGS "], "min_relief_mm": 35.0},   # Willis Tower ~442 m at 1:10,000
+    # the upper rapids and the falls drop ~50 m: that river keeps a sloped surface by design
+    "border_niagara_falls": {"projects": ["USGS ", "Hamilton_Niagara"], "min_flat_share": 0.85},
 }
 
 
@@ -177,8 +192,17 @@ def run_case(base: str, name: str, body: dict, timeout: float = 1800) -> dict:
         print(f"  separate base {res_base}: model min z = {zmin:.3f} mm, base colour in model filaments: {in_main}")
         if abs(zmin) > 1e-3 or in_main:
             ok = False
+    exp = EXPECT.get(name, {})
+    got = [p["name"] for p in res.get("data", {}).get("projects", [])]
+    for prefix in exp.get("projects", []):
+        if not any(g.startswith(prefix) for g in got):
+            print(f"  expected data from {prefix!r}, got projects {got}")
+            ok = False
+    if res["stats"]["relief_mm"] < exp.get("min_relief_mm", 0):
+        print(f"  relief {res['stats']['relief_mm']} mm < {exp['min_relief_mm']} mm (tall buildings missing?)")
+        ok = False
     water = water_levels(path)
-    if water is not None and (water["flat_share"] < 0.95 or water["on_layer_grid"] < 0.99):
+    if water is not None and (water["flat_share"] < exp.get("min_flat_share", 0.95) or water["on_layer_grid"] < 0.99):
         print(f"  water surface not flat: {water}")
         ok = False
     # land meets water at one uniform edge (shore ramp): no tall, jagged walls at cliff feet

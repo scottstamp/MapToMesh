@@ -1,7 +1,8 @@
 # MapToMesh
 
-Generate 3D-printable, multi-colour **3MF** topographic / city models of anywhere in Canada from
-**NRCan CanElevation LiDAR point clouds** (COPC), with an OpenStreetMap-based area picker.
+Generate 3D-printable, multi-colour **3MF** topographic / city models of anywhere in Canada and
+much of the US from **LiDAR point clouds** (COPC) - **NRCan CanElevation** and **USGS 3DEP** (via
+Microsoft Planetary Computer) - with an OpenStreetMap-based area picker.
 
 - Pick an area on an OpenStreetMap map (rectangle, rounded rectangle, circle, hexagon); the
   LiDAR coverage is shown as an overlay.
@@ -34,7 +35,8 @@ On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and co
    centre) or type the width/height. Drag the red outline to move it, or the white handles on its
    corners/edges to resize it (the opposite side stays put). The info box lists how many
    LiDAR tiles / which acquisition projects cover the area.
-2. **Elevation data** – *LiDAR point clouds* (default) or *HRDEM 1 m mosaic*. Surface:
+2. **Elevation data** – *LiDAR point clouds* (default; NRCan in Canada, USGS 3DEP in the US,
+   both merged on the border) or *HRDEM 1 m mosaic* (Canada only). Surface:
    bare terrain, terrain + buildings & bridges, or full surface including trees. *Detail* is the
    number of grid cells along the long side; the hint shows metres and millimetres per cell.
    *Cliff smoothing* only affects steep slopes; raise it if sea cliffs or bluffs still look rough.
@@ -135,8 +137,16 @@ web/ (Leaflet + three.js)  ──HTTP──>  maptomesh/server.py (FastAPI, back
   areas (bases, frames, water, band tops) are strip-triangulated, and near-flat terrain is merged
   into larger triangles (quadtree, within the simplification tolerance) - both without
   T-junctions. Most remaining triangles sit along colour boundaries.
-- **Caching NRCan data**: CanElevation is a free public service, so every byte read from it -
-  COPC point-cloud nodes and HRDEM COG tiles - is kept in an on-disk block cache
+- **USGS 3DEP (US)**: tiles are found with a STAC search of Planetary Computer's
+  `3dep-lidar-copc` collection (cached for a day) and read with the same remote COPC reader.
+  Blob URLs need a SAS token, fetched anonymously and added per request by the cache, so cached
+  blocks outlive the tokens. Heights are converted to metres from each file's CRS. 3DEP projects
+  classify ground / water / bridges but usually leave buildings and trees in class 1, which goes
+  through the same OSM-footprint routing as unclassified Canadian projects; where a project does
+  classify both, leftover class-1 points inside OSM footprints still count as buildings
+  (classifiers often skip the tallest towers - Chicago 2017 leaves Willis Tower in class 1).
+- **Caching LiDAR data**: CanElevation and 3DEP are free public services, so every byte read from
+  them - COPC point-cloud nodes and HRDEM COG tiles - is kept in an on-disk block cache
   (`cache/nrcan_range_cache.sqlite`, 64 KiB blocks, LRU, default 10 GB via
   `MAPTOMESH_DATA_CACHE_GB`, ETags re-checked after 30 days). Overlapping areas, other detail
   levels and re-generations only download blocks never seen before; the job log reports MB
@@ -155,7 +165,7 @@ web/ (Leaflet + three.js)  ──HTTP──>  maptomesh/server.py (FastAPI, back
 The integration suite focuses on **St_Johns_2020_2** (downtown + harbour, a 10 km / 121-tile
 elevation-band model split into 4 tiles, Cape Spear running off the eastern edge of the data,
 Signal Hill full surface at high detail, and the HRDEM comparison), plus Ottawa and Hamilton
-regressions. Each output is re-parsed and every part is checked for open edges, duplicate edges,
+regressions, the Chicago Loop (USGS 3DEP) and Niagara Falls (NRCan + USGS in one model). Each output is re-parsed and every part is checked for open edges, duplicate edges,
 degenerate triangles and positive volume. Thumbnails land in `cache/integration/`.
 
 ## Configuration
@@ -164,12 +174,18 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 |---|---|
 | `MAPTOMESH_CACHE` | `./cache` (tile index, elevation/OSM caches, outputs) |
 | `MAPTOMESH_VECTOR_TILES` | `https://tiles.openfreemap.org/planet` (any OpenMapTiles TileJSON) |
-| `MAPTOMESH_DATA_CACHE_GB` | `10` (size limit of the NRCan range cache) |
+| `MAPTOMESH_DATA_CACHE_GB` | `10` (size limit of the LiDAR / DEM range cache) |
 
 ## Limits and known behaviour
 
 - Up to 2,500 LiDAR tiles per request (≈ 2,500 km²); use HRDEM for anything larger.
 - Areas outside LiDAR coverage are interpolated and reported in the result notes.
+- USGS 3DEP on Planetary Computer is a snapshot (projects up to about 2022) with gaps - e.g.
+  Seattle, Miami, Manhattan, the Grand Canyon have no tiles there. The map shows the available
+  3DEP tiles when zoomed in. A source for USGS's complete Entwine collection on AWS is planned
+  ([docs/plans/usgs-3dep-ept.md](docs/plans/usgs-3dep-ept.md)). HRDEM is Canada only.
+- Waterfalls are not modelled specially: a river and the pool below the falls form one water
+  body whose level is smoothed between the two.
 - HRDEM has no classification: buildings come from OSM footprints, other raised objects count as trees.
 - On hilly terrain with trees/roads/buildings at every elevation, most layers still need every
   colour: a colour must be printed wherever its surface is visible. Fewer colours (e.g. trees in
@@ -179,12 +195,15 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 
 - LiDAR point clouds and HRDEM: Natural Resources Canada, CanElevation series –
   [Open Government Licence – Canada](https://open.canada.ca/en/open-government-licence-canada).
+- US LiDAR: USGS 3D Elevation Program (public domain), served by
+  [Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/dataset/3dep-lidar-copc)
+  (subject to its terms of use).
 - Map tiles, roads, water and building footprints: © OpenStreetMap contributors (ODbL), served by
   [OpenFreeMap](https://openfreemap.org/); place search by Nominatim.
 - Please respect the tile and Nominatim usage policies; everything is cached locally.
-- Selling prints? Both data sources allow it with credit: "Contains information licensed under
-  the Open Government Licence – Canada" and "© OpenStreetMap contributors" (e.g. in the listing
-  or on a label).
+- Selling prints? The data sources allow it with credit: "Contains information licensed under
+  the Open Government Licence – Canada" (Canadian elevation) and "© OpenStreetMap contributors"
+  (e.g. in the listing or on a label). USGS data needs no credit, but "USGS 3DEP" is appreciated.
 
 ## License
 

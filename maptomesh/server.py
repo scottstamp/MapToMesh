@@ -10,7 +10,7 @@ import uuid
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -205,17 +205,39 @@ class AreaIn(BaseModel):
 def coverage(a: AreaIn) -> dict:
     aoi = AOI(a.lat, a.lon, a.width_m, a.height_m)
     grid = Grid.for_aoi(aoi, max(50, min(a.grid_cells, config.MAX_GRID_CELLS)))
+    from .pointcloud import find_tiles
+    from .usgs3dep import in_us
+
     out = {"grid": {"nx": grid.nx, "ny": grid.ny, "step_m": round(grid.step, 3)}}
-    if not INDEX.ready:
+    bbox = aoi.lonlat_bbox(margin=grid.step * 2)
+    if not INDEX.ready and not in_us(bbox):
         out.update({"ready": False, "message": INDEX.message})
         return out
-    tiles = INDEX.get().query(*aoi.lonlat_bbox(margin=grid.step * 2))
+    tiles, errors = find_tiles(bbox, INDEX.get() if INDEX.ready else None, config.MAX_TILES + 1)
     cnt = Counter((t.project, t.year) for t in tiles)
     out.update({
-        "ready": True, "tiles": len(tiles), "max_tiles": config.MAX_TILES,
+        "ready": True, "tiles": len(tiles), "max_tiles": config.MAX_TILES, "errors": errors,
         "projects": [{"name": p, "year": y, "tiles": n} for (p, y), n in sorted(cnt.items(), key=lambda x: -x[0][1])],
     })
     return out
+
+
+@app.get("/api/coverage/usgs")
+def coverage_usgs(w: float = Query(...), s: float = Query(...), e: float = Query(...), n: float = Query(...)):
+    """USGS 3DEP tile footprints in a map view (only when zoomed in: one search per view)."""
+    from .usgs3dep import footprints, in_us
+
+    bbox = (w, s, e, n)
+    if not in_us(bbox):
+        return {"type": "FeatureCollection", "features": [], "in_us": False}
+    if (e - w) * (n - s) > 0.35:
+        return {"type": "FeatureCollection", "features": [], "in_us": True, "too_large": True}
+    try:
+        gj = footprints(bbox)
+    except Exception as ex:  # noqa: BLE001
+        raise HTTPException(502, f"USGS 3DEP search failed: {ex}") from ex
+    gj["in_us"] = True
+    return gj
 
 
 @app.post("/api/jobs")

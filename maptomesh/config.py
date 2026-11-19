@@ -19,6 +19,11 @@ TILES_ZIP_URL = LIDAR_BASE + "Index_LiDARtiles_tuileslidar.zip"
 
 STAC_API = "https://datacube.services.geo.ca/stac/api"
 
+# USGS 3DEP LiDAR (COPC) on Microsoft Planetary Computer: anonymous, URL signing via SAS tokens
+PC_STAC_API = "https://planetarycomputer.microsoft.com/api/stac/v1"
+PC_SAS_API = "https://planetarycomputer.microsoft.com/api/sas/v1/token"
+USGS_COPC_COLLECTION = "3dep-lidar-copc"
+
 USER_AGENT = "MapToMesh/0.1 (topographic 3MF generator)"
 
 # Hard safety limits

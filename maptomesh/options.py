@@ -37,8 +37,9 @@ class Colors(BaseModel):
 
 class Options(BaseModel):
     # area (centre + ground size in metres, local transverse Mercator)
-    lat: float = Field(..., ge=41.0, le=84.0)
-    lon: float = Field(..., ge=-142.0, le=-50.0)
+    # Canada (NRCan) and the US incl. Alaska, Hawaii, Puerto Rico (USGS 3DEP)
+    lat: float = Field(..., ge=17.0, le=84.0)
+    lon: float = Field(..., ge=-180.0, le=-50.0)
     width_m: float = Field(..., gt=20, le=200_000)
     height_m: float = Field(..., gt=20, le=200_000)
     shape: Literal["rectangle", "rounded", "circle", "hexagon"] = "rectangle"
@@ -112,4 +113,4 @@ class Options(BaseModel):
     name: str = Field("MapToMesh", max_length=80)
 
     def elevation_key(self) -> str:
-        return f"v4|{self.source}|{self.lat:.6f}|{self.lon:.6f}|{self.width_m:.1f}|{self.height_m:.1f}|{self.grid_cells}"
+        return f"v5|{self.source}|{self.lat:.6f}|{self.lon:.6f}|{self.width_m:.1f}|{self.height_m:.1f}|{self.grid_cells}"

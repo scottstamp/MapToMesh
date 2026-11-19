@@ -1,4 +1,8 @@
-"""Fetch CanElevation COPC tiles for an AOI and bin them onto the vertex grid.
+"""Fetch LiDAR COPC tiles for an AOI and bin them onto the vertex grid.
+
+Sources: NRCan CanElevation (Canada, own tile index) and USGS 3DEP via Microsoft Planetary
+Computer (US, STAC search) - both are COPC, so an area on the border simply gets tiles from both
+and the projects merge like any overlapping projects.
 
 Each COPC file is queried remotely (HTTP range requests) for only the octree
 nodes intersecting the AOI and only down to the level of detail needed for the
@@ -6,7 +10,8 @@ grid spacing, so a 1 km tile at 2 m spacing is ~1-3 MB of transfer.
 
 Per vertex we accumulate (ASPRS classes):
   ground   local plane fit (cell + weighted neighbours) through ground points of classes
-           2 ground, 8 key-point, 9 water, 11 road surface, evaluated at the vertex - unlike a
+           2 ground, 8 key-point, 9 water, 11 road surface, 20 ignored ground (3DEP: ground
+           next to breaklines), evaluated at the vertex - unlike a
            plain mean this does not depend on where inside a cell the points fall, which
            matters on cliffs where one 5 m cell can span tens of metres of height
   water    count of 9
@@ -38,12 +43,13 @@ from pyproj import CRS, Transformer
 from . import config
 from .geo import AOI, Grid
 from .httpcache import RANGE_CACHE, install_laspy_cache
+from . import usgs3dep
 from .lidar_index import Tile, TileIndex
 from .raster import fill_polygon
 
 ProgressFn = Callable[[float, str], None]
 
-GROUND = (2, 8, 9, 11)
+GROUND = (2, 8, 9, 11, 20)
 NOISE = (7, 18)
 
 
@@ -122,20 +128,33 @@ class LidarResult:
     info: dict
 
 
-def _file_crs(reader: CopcReader) -> CRS | None:
+def _file_crs(reader: CopcReader) -> tuple[CRS | None, float]:
+    """Horizontal CRS of a file and the factor taking its Z values to metres (many 3DEP
+    projects use US survey feet; a horizontal-only CRS in feet implies heights in feet)."""
     try:
         crs = reader.header.parse_crs()
     except Exception:  # noqa: BLE001
         crs = None
     if crs is None:
-        return None
+        return None, 1.0
+    zf = 1.0
     try:
-        return crs.to_2d()
+        if crs.is_compound and len(crs.sub_crs_list) > 1:
+            zf = crs.sub_crs_list[1].axis_info[0].unit_conversion_factor
+        elif len(crs.axis_info) >= 3:
+            zf = crs.axis_info[2].unit_conversion_factor
+        elif crs.is_projected and crs.axis_info:
+            zf = crs.axis_info[0].unit_conversion_factor
     except Exception:  # noqa: BLE001
-        return crs
+        zf = 1.0
+    zf = zf if 0.2 < zf < 2.0 else 1.0
+    try:
+        return crs.to_2d(), zf
+    except Exception:  # noqa: BLE001
+        return crs, zf
 
 
-install_laspy_cache()  # every COPC byte read from NRCan is kept in the on-disk range cache
+install_laspy_cache()  # every COPC byte read (NRCan, USGS) is kept in the on-disk range cache
 
 
 def _process_tile(tile: Tile, aoi: AOI, grid: Grid, resolution: float, cancel: threading.Event):
@@ -144,7 +163,7 @@ def _process_tile(tile: Tile, aoi: AOI, grid: Grid, resolution: float, cancel: t
     sel = (DecompressionSelection.base() | DecompressionSelection.Z
            | DecompressionSelection.CLASSIFICATION | DecompressionSelection.FLAGS)
     with CopcReader.open(tile.url, http_num_threads=8, decompression_selection=sel) as r:
-        crs = _file_crs(r)
+        crs, zf = _file_crs(r)
         if crs is None:
             return tile, None, "no CRS"
         to_file = Transformer.from_crs(aoi.crs, crs, always_xy=True)
@@ -174,7 +193,7 @@ def _process_tile(tile: Tile, aoi: AOI, grid: Grid, resolution: float, cancel: t
             pass
         x = np.asarray(pts.x)[keep]
         y = np.asarray(pts.y)[keep]
-        z = np.asarray(pts.z, dtype=np.float32)[keep]
+        z = (np.asarray(pts.z, dtype=np.float64)[keep] * zf).astype(np.float32)
         cls = cls[keep]
     lx, ly = to_local.transform(x, y)
     fx = (lx - grid.x0) / grid.step
@@ -261,15 +280,29 @@ def _plane_fit_ground(a: _Acc, shape: tuple[int, int], step: float) -> np.ndarra
     return out.ravel()
 
 
-def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex, progress: ProgressFn,
+def find_tiles(bbox: tuple[float, float, float, float], index: TileIndex | None,
+               max_items: int = 5000) -> tuple[list[Tile], list[str]]:
+    """LiDAR tiles from every provider covering ``bbox`` (lon/lat) and any search errors."""
+    tiles = index.query(*bbox) if index is not None else []
+    errors = []
+    if usgs3dep.in_us(bbox):
+        try:
+            tiles += usgs3dep.tiles(bbox, max_items)
+        except Exception as e:  # noqa: BLE001 - keep whatever the other provider has
+            errors.append(f"USGS 3DEP search failed: {e}")
+    return tiles, errors
+
+
+def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: ProgressFn,
                 cancel: threading.Event | None = None, max_tiles: int = 2500,
                 workers: int = 6) -> LidarResult:
     cancel = cancel or threading.Event()
     bbox = aoi.lonlat_bbox(margin=grid.step * 2)
-    tiles = index.query(*bbox)
+    tiles, search_errors = find_tiles(bbox, index, max_tiles + 1)
     if not tiles:
-        raise RuntimeError("No CanElevation LiDAR tiles cover this area. "
-                           "Enable the coverage overlay, or switch the source to HRDEM.")
+        raise RuntimeError("No LiDAR point-cloud tiles (NRCan CanElevation or USGS 3DEP) cover this area. "
+                           "Enable the coverage overlay, or switch the source to HRDEM (Canada)."
+                           + (f" {search_errors[0]}" if search_errors else ""))
     if len(tiles) > max_tiles:
         raise RuntimeError(f"{len(tiles)} LiDAR tiles intersect this area (limit {max_tiles}). "
                            "Pick a smaller area or use the HRDEM source.")
@@ -347,7 +380,7 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex, progress: ProgressFn,
         "tiles": len(tiles),
         "points": int(npts),
         "projects": proj_info,
-        "errors": errors[:5],
+        "errors": (search_errors + errors)[:5],
         "failed_tiles": len(errors),
         "coverage": float(cov.mean()),
         "query_resolution_m": resolution,

@@ -20,14 +20,14 @@
 <aside id="sidebar">
   <header>
     <h1>MapToMesh</h1>
-    <p class="sub">NRCan CanElevation LiDAR → 3D-printable 3MF</p>
+    <p class="sub">NRCan CanElevation + USGS 3DEP LiDAR → 3D-printable 3MF</p>
     <div id="indexStatus" class="status"></div>
   </header>
 
   <section>
     <h2>1 · Area</h2>
     <div class="search">
-      <input id="search" type="search" placeholder="Search a place in Canada…" autocomplete="off">
+      <input id="search" type="search" placeholder="Search a place in Canada or the US…" autocomplete="off">
       <ul id="searchResults"></ul>
     </div>
     <label>Shape
@@ -46,7 +46,8 @@
       <button id="drawBtn" class="secondary" title="Drag on the map to draw the area">✎ Draw on map</button>
       <button id="centerBtn" class="secondary" title="Centre the area on the current map view">⌖ Centre on view</button>
     </div>
-    <label class="check"><input id="showCoverage" type="checkbox" checked> Show LiDAR coverage</label>
+    <label class="check"><input id="showCoverage" type="checkbox" checked> Show LiDAR coverage
+      <span id="usCovHint" class="hint"></span></label>
     <div id="coverageInfo" class="info"></div>
   </section>
 
@@ -54,8 +55,8 @@
     <h2>2 · Elevation data</h2>
     <label>Source
       <select id="source">
-        <option value="lidar">LiDAR point clouds (COPC, classified)</option>
-        <option value="hrdem">HRDEM 1 m mosaic (faster for big areas)</option>
+        <option value="lidar">LiDAR point clouds (COPC, classified: NRCan + USGS 3DEP)</option>
+        <option value="hrdem">HRDEM 1 m mosaic (Canada only, faster for big areas)</option>
       </select>
     </label>
     <label>Surface
