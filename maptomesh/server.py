@@ -107,13 +107,15 @@ def _run_job(job: Job) -> None:
             want_water = o.osm_water
             want_roads = o.osm_roads != "none" and (o.color_mode == "landcover" or o.road_emboss_mm != 0)
             want_bld = o.surface != "terrain" or o.color_mode == "landcover"
-            if want_water or want_roads or want_bld:
+            want_bridges = o.surface != "terrain"   # bridge decks over water (OSM tags them)
+            if want_water or want_roads or want_bld or want_bridges:
                 job.set(0.66, "Fetching OpenStreetMap layers")
                 try:
-                    data = fetch_osm(aoi, g, o.osm_roads if want_roads else "none", want_water, want_bld,
-                                     progress=stage(0.66, 0.72))
+                    data = fetch_osm(aoi, g, o.osm_roads if want_roads else ("bridges" if want_bridges else "none"),
+                                     want_water, want_bld, progress=stage(0.66, 0.72))
                     osm = rasterize_osm(data, aoi, g, mm_per_m, o.road_min_width_mm, o.road_width_scale,
-                                        o.osm_roads, o.osm_streams if o.osm_water else "none",
+                                        o.osm_roads if want_roads else "none",
+                                        o.osm_streams if o.osm_water else "none",
                                         o.river_min_width_mm)
                     job.set(0.72, f"OpenStreetMap: {len(data['features']):,} features from {data['tiles']} tiles")
                 except Exception as e:  # noqa: BLE001 - OSM is optional

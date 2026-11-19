@@ -243,6 +243,38 @@ def _smooth_steep(G: np.ndarray, step: float, strength: float) -> np.ndarray:
     return G1 + w * (S - G1)
 
 
+def _osm_bridges(osm_br, BRm, BRv, U, Gf, W, opts, notes):
+    """Add OpenStreetMap bridges that the data has no bridge class for.
+
+    Elevation models (and LiDAR projects without class 17) carry no bridge information, so the
+    water cut swallowed every deck (London's Thames bridges). The deck height comes from the
+    surface heights on the bridge (DSM / class-1 returns) where they stand clear of the ground or
+    water below; spans without them carry the height of the bridge's ends across."""
+    if osm_br is None or not osm_br.any() or opts.surface == "terrain":
+        return BRm, BRv
+    nb = osm_br & ~BRm
+    if not nb.any():
+        return BRm, BRv
+    deck = np.where(nb & np.isfinite(U) & (np.nan_to_num(U, nan=-1e9) > Gf + 1.0), U, np.nan)
+    ends = nb & ~W & np.isnan(deck)          # approaches on land: at least the ground
+    deck = np.where(ends, Gf, deck)
+    if not np.isfinite(deck[nb]).any():
+        return BRm, BRv
+    lab, n = ndimage.label(nb, structure=np.ones((3, 3)))
+    filled = np.full(deck.shape, np.nan)
+    for k, sl in enumerate(ndimage.find_objects(lab), start=1):   # interpolate within each bridge
+        if sl is None:
+            continue
+        m = lab[sl] == k
+        d = np.where(m, deck[sl], np.nan)
+        if np.isfinite(d).any():
+            filled[sl] = np.where(m, fill_nan(d), filled[sl])
+    nb &= np.isfinite(filled)
+    BRv = np.where(nb, filled, BRv)
+    notes.append("Bridges without a bridge class in the elevation data come from OpenStreetMap.")
+    return BRm | nb, BRv
+
+
 def _planar_components(U: np.ndarray, mask: np.ndarray, step: float) -> np.ndarray:
     """Connected raised regions whose surface is locally planar (roofs, incl.
     pitched) rather than rough (tree crowns)."""
@@ -299,6 +331,9 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
     bcls, vcls = a["bld_cls"].astype(bool), a["veg_cls"].astype(bool)
     Uf = despike(np.where(np.isfinite(U), U, Gf), np.isfinite(U), thresh=12.0, size=5)
     um = above(Uf, 2.0) & np.isfinite(U)
+    if osm.get("bridges") is not None and opts.surface != "terrain":
+        # decks over water in surface models are bridges (_osm_bridges), not trees or buildings
+        um &= ~ndimage.binary_dilation(osm["bridges"], iterations=max(1, int(round(3.0 / step))))
     to_veg = um & bcls & ~vcls        # buildings classified -> class 1 is mostly trees
     maybe_bld = um & ~bcls & vcls     # trees classified -> class 1 is buildings + clutter
     unknown = um & ~bcls & ~vcls      # nothing classified
@@ -327,6 +362,7 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
     veg_v = np.where(to_veg, np.fmax(veg_v, Uf), veg_v)
     Bm, Bv = _close_and_fill(bld_v, above(bld_v, 2.0), cells(12))
     BRm, BRv = _close_and_fill(a["bridge"], above(a["bridge"], 1.0), cells(20))
+    BRm, BRv = _osm_bridges(osm.get("bridges"), BRm, BRv, a["unclass"], Gf, W, opts, notes)
     vfin = np.isfinite(veg_v)
     V0 = despike(np.where(vfin, veg_v, Gf), vfin, thresh=10.0, size=5)
     vmask = vfin & (V0 > Gf + 1.5) & ~Bm
@@ -348,6 +384,8 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
             river &= ~osm_roads           # roads cross over streams (bridges / culverts)
         if osm_bld is not None:
             river &= ~osm_bld
+        if opts.surface != "terrain":
+            river &= ~BRm                 # rail / foot bridges too (not in the road mask)
     if river.any() and W.any():
         # LiDAR water returns along a stream belong to the stream, not to separate ponds: absorb
         # water patches touching the corridor that are narrow (widest inscribed circle < ~15 m)

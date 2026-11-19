@@ -34,6 +34,9 @@ ROAD_LEVELS = {
     "medium": {"motorway", "trunk", "primary", "secondary", "tertiary", "minor", "raceway", "busway"},
     "all": set(ROAD_WIDTH),
 }
+# bridges (brunnel=bridge) of any road class plus railways, at least this wide (decks are wider
+# than the carriageway; footbridges get a printable width from min_width_mm)
+BRIDGE_WIDTH = {**ROAD_WIDTH, "rail": 10, "transit": 8, "path": 4}
 WATERWAY_WIDTH = {"river": 25, "canal": 12, "stream": 3, "drain": 1.5, "ditch": 1.5}
 STREAM_LEVELS = {"none": set(), "rivers": {"river", "canal"}, "all": {"river", "canal", "stream"}}
 SKIP_WATER = {"swimming_pool"}
@@ -258,7 +261,9 @@ def fetch_osm(aoi: AOI, grid: Grid, roads: str, water: bool, buildings: bool = F
 def rasterize_osm(data: dict, aoi: AOI, grid: Grid, mm_per_m: float, min_width_mm: float = 0.6,
                   road_scale: float = 1.0, road_level: str = "medium", stream_level: str = "all",
                   river_min_width_mm: float = 0.8) -> dict[str, np.ndarray]:
-    """Return {'water' (areas), 'waterways' (lines), 'roads', 'buildings'} vertex-grid masks."""
+    """Return {'water' (areas), 'waterways' (lines), 'roads', 'bridges', 'buildings'} vertex-grid
+    masks. ``bridges`` are road / rail / foot bridges whatever ``road_level`` is (the structure
+    matters even when roads aren't shown); pass ``road_level="none"`` to get only those."""
     from pyproj import Transformer
 
     shape = grid.vshape
@@ -270,7 +275,7 @@ def rasterize_osm(data: dict, aoi: AOI, grid: Grid, mm_per_m: float, min_width_m
 
     water = np.zeros(shape, bool)
     bld = np.zeros(shape, bool)
-    road_lines, water_lines = [], []
+    road_lines, water_lines, bridge_lines = [], [], []
     min_hw = (min_width_mm / mm_per_m) / grid.step / 2 if mm_per_m > 0 else 0.5
     wanted_roads = ROAD_LEVELS.get(road_level, set())
     for f in data.get("features", []):
@@ -294,6 +299,10 @@ def rasterize_osm(data: dict, aoi: AOI, grid: Grid, mm_per_m: float, min_width_m
                 water_lines.append((p, max(wm / grid.step / 2, min_river_hw)))
         elif layer == "transportation" and f["type"] == "line":
             cls = props.get("class")
+            if props.get("brunnel") == "bridge" and cls in BRIDGE_WIDTH:
+                bw = BRIDGE_WIDTH[cls] * road_scale
+                for p in parts:
+                    bridge_lines.append((p, max(bw / grid.step / 2, min_hw)))
             if cls not in wanted_roads or props.get("brunnel") == "tunnel":
                 continue
             wm = ROAD_WIDTH.get(cls, 6) * road_scale * (0.6 if props.get("ramp") else 1.0)
@@ -303,4 +312,5 @@ def rasterize_osm(data: dict, aoi: AOI, grid: Grid, mm_per_m: float, min_width_m
             bld |= fill_polygon(parts, shape)
     waterways = rasterize_lines(water_lines, shape)
     roads = rasterize_lines(road_lines, shape)
-    return {"water": water, "waterways": waterways, "roads": roads, "buildings": bld}
+    bridges = rasterize_lines(bridge_lines, shape)
+    return {"water": water, "waterways": waterways, "roads": roads, "bridges": bridges, "buildings": bld}
