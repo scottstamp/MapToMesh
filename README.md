@@ -279,11 +279,11 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 | `MAPTOMESH_DATA_CACHE_GB` | `10` (size limit of the LiDAR / DEM range cache) |
 | `MAPTOMESH_SERVICE_CACHE_GB` | `2` (size limit of cached elevation-service responses) |
 | `MAPTOMESH_DATA_DIR` | `./data` (user reviews database; not a cache, keep it private) |
-| `MAPTOMESH_PUBLIC_URL` | URL the request came in on (set it behind a proxy, e.g. `https://maptomesh.example.org`) |
+| `MAPTOMESH_PUBLIC_URL` | `https://maptomesh.com` (base of the absolute URLs in link previews; empty = the URL each request came in on) |
 
 **Link previews**: the page carries Open Graph / Twitter-card metadata, so links posted to Discord,
 Slack, X, iMessage etc. show a preview. The server fills in absolute URLs (from
-`MAPTOMESH_PUBLIC_URL`). The default image is `web/og-image.jpg` (1200 x 630); a shared
+`MAPTOMESH_PUBLIC_URL`, default `https://maptomesh.com`). The default image is `web/og-image.jpg` (1200 x 630); a shared
 `?job=<id>` link previews that model's top view instead. To regenerate the example image, generate
 San Francisco (centre 37.7870, -122.4400, 10 x 8.5 km, 1000 cells, land cover, bare terrain,
 z x2) and screenshot the 3D view alone with headless Chrome at 1200 x 630:

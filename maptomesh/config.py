@@ -28,9 +28,9 @@ USGS_COPC_COLLECTION = "3dep-lidar-copc"
 
 USER_AGENT = "MapToMesh/0.1 (topographic 3MF generator)"
 
-# public base URL (e.g. "https://maptomesh.example.org") for absolute links in the page metadata
-# (link previews); defaults to the URL the request came in on, which is wrong behind a proxy
-PUBLIC_URL = os.environ.get("MAPTOMESH_PUBLIC_URL", "").rstrip("/")
+# public base URL for absolute links in the page metadata (link previews); set it to an empty
+# value to use the URL each request came in on instead (local testing)
+PUBLIC_URL = os.environ.get("MAPTOMESH_PUBLIC_URL", "https://maptomesh.com").rstrip("/")
 
 # Hard safety limits
 MAX_GRID_CELLS = 2400  # cells along the longest side
