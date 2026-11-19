@@ -138,19 +138,23 @@ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · Elevation: NRCan, USGS, national mapping agencies, Copernicus (credits listed with each model)',
 }).addTo(map);
 
-const selection = L.polygon([], { color: '#c8553d', weight: 2, fillOpacity: 0.12 }).addTo(map);
-const centerMarker = L.circleMarker([0, 0], { radius: 4, color: '#c8553d', fillOpacity: 1 }).addTo(map);
+const selection = L.polygon([], { color: '#c8553d', weight: 2, fillOpacity: 0.12, className: 'aoi' }).addTo(map);
+const centerMarker = L.circleMarker([0, 0], { radius: 4, color: '#c8553d', fillOpacity: 1, className: 'aoi' }).addTo(map);
 let coverageLayer = null;
 let hintEl = null;
+const COARSE = matchMedia('(pointer: coarse)').matches;   // touch screen: bigger handles
+// phones held upright: the panel is a bottom sheet over a full-width map (same query as style.css)
+const MOBILE = matchMedia('(orientation: portrait) and (max-width: 900px)');
 
 // ---- resize handles: corners and edge midpoints of the area's bounding box
 const HANDLE_DIRS = [[-1, -1], [0, -1], [1, -1], [1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0]];
 const HANDLE_CURSOR = { '-1,-1': 'nesw', '0,-1': 'ns', '1,-1': 'nwse', '1,0': 'ew', '1,1': 'nesw', '0,1': 'ns', '-1,1': 'nwse', '-1,0': 'ew' };
+const HANDLE_PX = COARSE ? 18 : 12;
 let resizing = null;
 const handles = HANDLE_DIRS.map(([sx, sy]) => {
   const m = L.marker([0, 0], {
     draggable: true, keyboard: false, zIndexOffset: 1000,
-    icon: L.divIcon({ className: `resize-handle cursor-${HANDLE_CURSOR[`${sx},${sy}`]}`, iconSize: [12, 12] }),
+    icon: L.divIcon({ className: `resize-handle cursor-${HANDLE_CURSOR[`${sx},${sy}`]}`, iconSize: [HANDLE_PX, HANDLE_PX] }),
   }).addTo(map);
   m.on('dragstart', () => {
     const { w, h } = areaDims();
@@ -210,45 +214,70 @@ function setDrawing(on) {
   map.getContainer().classList.toggle('drawing', on);
   const shape = $('shape').value;
   showHint(on ? (shape === 'circle' || shape === 'hexagon' ? 'Drag from the centre outwards' : 'Drag a box') : '');
-  if (on) map.dragging.disable(); else map.dragging.enable();
+  if (on) { map.dragging.disable(); setSheet(false); } else map.dragging.enable();
 }
 
+// Drawing and moving the area use pointer events (mouse, touch and pen alike): Leaflet's map
+// mousedown / mousemove never arrive for a finger, so on phones the map panned instead.
+// pointer: the one pointer doing it; downPointers: every pointer currently down (pinch-zoom check)
 let drawStart = null, dragStart = null;
-map.on('mousedown', (e) => {
-  if (state.drawing) { drawStart = e.latlng; }
-});
-map.on('mousemove', (e) => {
-  if (drawStart) {
+const downPointers = new Set();
+window.addEventListener('pointerdown', (e) => {
+  downPointers.add(e.pointerId);
+  if (dragStart && e.pointerId !== dragStart.pointer) endMove();   // second finger: let Leaflet pinch-zoom
+}, true);
+for (const t of ['pointerup', 'pointercancel']) window.addEventListener(t, (e) => downPointers.delete(e.pointerId), true);
+
+function startMove(e) {
+  if (state.drawing || e.button > 0 || downPointers.size > 1) return;
+  e.stopPropagation(); e.preventDefault();   // the map must not start panning (preventDefault: no mousedown)
+  dragStart = { pointer: e.pointerId, ll: map.mouseEventToLatLng(e), center: { ...state.center } };
+  map.dragging.disable();
+}
+function endMove() {
+  if (!dragStart) return;
+  dragStart = null;
+  map.dragging.enable();
+  saveSettings();
+}
+selection.getElement().addEventListener('pointerdown', startMove);
+centerMarker.getElement().addEventListener('pointerdown', startMove);
+
+map.getContainer().addEventListener('pointerdown', (e) => {
+  if (!state.drawing || e.button > 0 || e.target.closest('.leaflet-control')) return;
+  e.stopPropagation(); e.preventDefault();
+  drawStart = { pointer: e.pointerId, ll: map.mouseEventToLatLng(e) };
+}, true);   // capture: before the area's own handler
+
+window.addEventListener('pointermove', (e) => {
+  if (drawStart && e.pointerId === drawStart.pointer) {
+    const a = drawStart.ll, b = map.mouseEventToLatLng(e);
     const shape = $('shape').value;
+    const { dx, dy } = metresBetween(a, b);
     if (shape === 'circle' || shape === 'hexagon') {
-      const { dx, dy } = metresBetween(drawStart, e.latlng);
       const r = Math.max(25, Math.hypot(dx, dy));
-      state.center = { lat: drawStart.lat, lon: drawStart.lng };
+      state.center = { lat: a.lat, lon: a.lng };
       $('widthKm').value = +(2 * r / 1000).toFixed(3);
       enforceAspect('w');
     } else {
-      const { dx, dy } = metresBetween(drawStart, e.latlng);
-      state.center = { lat: (drawStart.lat + e.latlng.lat) / 2, lon: (drawStart.lng + e.latlng.lng) / 2 };
+      state.center = { lat: (a.lat + b.lat) / 2, lon: (a.lng + b.lng) / 2 };
       $('widthKm').value = +(Math.max(50, Math.abs(dx)) / 1000).toFixed(3);
       $('heightKm').value = +(Math.max(50, Math.abs(dy)) / 1000).toFixed(3);
     }
     redrawSelection();
-  } else if (dragStart) {
-    state.center = { lat: dragStart.center.lat + (e.latlng.lat - dragStart.ll.lat), lon: dragStart.center.lon + (e.latlng.lng - dragStart.ll.lng) };
+  } else if (dragStart && e.pointerId === dragStart.pointer) {
+    const ll = map.mouseEventToLatLng(e);
+    state.center = { lat: dragStart.center.lat + (ll.lat - dragStart.ll.lat), lon: dragStart.center.lon + (ll.lng - dragStart.ll.lng) };
     redrawSelection();
   }
 });
-map.on('mouseup', () => {
-  if (drawStart) { drawStart = null; setDrawing(false); saveSettings(); }
-  if (dragStart) { dragStart = null; map.dragging.enable(); saveSettings(); }
-});
-selection.on('mousedown', (e) => {
-  if (state.drawing) return;
-  L.DomEvent.stop(e);
-  dragStart = { ll: e.latlng, center: { ...state.center } };
-  map.dragging.disable();
-});
-selection.bindTooltip('Drag to move · drag the white handles to resize', { sticky: true });
+for (const t of ['pointerup', 'pointercancel']) {
+  window.addEventListener(t, (e) => {
+    if (drawStart && e.pointerId === drawStart.pointer) { drawStart = null; setDrawing(false); saveSettings(); }
+    if (dragStart && e.pointerId === dragStart.pointer) endMove();
+  });
+}
+if (!COARSE) selection.bindTooltip('Drag to move · drag the white handles to resize', { sticky: true });
 
 // USGS 3DEP has no national footprint file on Planetary Computer: tile footprints are searched
 // per map view, only when zoomed in far enough for one search to cover it
@@ -352,7 +381,7 @@ function updateDerived() {
   $('labelOpts').hidden = !$('frame').checked;
   $('labelMore').hidden = !$('label').checked;
   $('lipOpts').hidden = !$('baseSeparate').checked;
-  $('cornerWrap').style.visibility = $('shape').value === 'rounded' ? 'visible' : 'hidden';
+  $('cornerWrap').hidden = $('shape').value !== 'rounded';
   const mode = $('colorMode').value;
   $('colorsSingle').hidden = mode !== 'single';
   $('colorsLandcover').hidden = mode !== 'landcover';
@@ -439,6 +468,7 @@ $('search').addEventListener('input', () => {
         li.onclick = () => {
           state.center = { lat: parseFloat(r.lat), lon: parseFloat(r.lon) };
           $('searchResults').innerHTML = ''; $('search').value = r.display_name.split(',')[0];
+          $('search').blur(); setSheet(false);   // phones: show the map with the new area
           redrawSelection();
           map.fitBounds(selection.getBounds().pad(0.4));
           saveSettings();
@@ -475,6 +505,7 @@ function escapeHtml(s) {
 
 // visible label of a form field (its <label>'s own text, without option texts)
 function fieldLabel(el) {
+  if (el.dataset.label) return el.dataset.label;   // where the visible label is too terse out of context
   const lab = el.closest('label');
   if (!lab) return el.id;
   const t = [...lab.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join(' ').replace(/\s+/g, ' ').trim();
@@ -506,12 +537,73 @@ function invalidFields() {
   for (const id of new Set([...FIELDS, ...Object.values(OPTION_IDS)])) {
     const el = $(id);
     if (!el || el.type !== 'number' || el.value === '') continue;
-    if (el.validity.badInput || el.validity.rangeUnderflow || el.validity.rangeOverflow) {
-      bad.push(`${fieldLabel(el)}: ${el.value} (allowed ${rangeText(el)})`);
-    }
+    if (el.validity.badInput || el.validity.rangeUnderflow || el.validity.rangeOverflow) bad.push(el);
   }
   return bad;
 }
+
+// ------------------------------------------------------------------ Simple / Advanced settings
+// Advanced settings (class="adv") are only hidden in Simple mode: their values still apply, so
+// Simple mode lists any that differ from the defaults, with a reset.
+const MODE_KEY = 'maptomesh.mode';
+const MODE_HINT = { simple: 'Essentials only; the defaults suit most prints', advanced: 'Every setting, for fine-tuning' };
+const ADV_IDS = [...new Set([...FIELDS, ...Object.values(OPTION_IDS)])].filter((id) => $(id)?.closest('.adv'));
+
+function isSimple() { return document.documentElement.dataset.mode !== 'advanced'; }
+function setMode(mode) {
+  document.documentElement.dataset.mode = mode;
+  try { localStorage.setItem(MODE_KEY, mode); } catch (e) { /* private mode */ }
+  refreshMode();
+}
+function defaultOf(el) {   // the value in the HTML
+  if (el.type === 'checkbox') return el.defaultChecked;
+  if (el.tagName === 'SELECT') return ([...el.options].find((o) => o.defaultSelected) || el.options[0]).value;
+  return el.defaultValue;
+}
+function differsFromDefault(el) {
+  const d = defaultOf(el);
+  if (el.type === 'checkbox') return el.checked !== d;
+  if ((el.type === 'number' || el.type === 'range') && el.value !== '' && d !== '') return parseFloat(el.value) !== parseFloat(d);
+  return el.value.trim() !== String(d).trim();
+}
+// changed advanced settings that matter now (not those of a switched-off feature, e.g. lip sizes
+// without a separate base plate)
+function changedAdvanced() {
+  return ADV_IDS.map($).filter((el) => !el.closest('[hidden]') && differsFromDefault(el));
+}
+function shownValue(el) {
+  if (el.type === 'checkbox') return el.checked ? 'on' : 'off';
+  if (el.tagName === 'SELECT') return el.selectedOptions[0]?.textContent.split(/[(:]/)[0].trim() ?? el.value;
+  return el.value === '' ? 'none' : el.value;
+}
+function refreshMode() {
+  const simple = isSimple();
+  document.querySelectorAll('.seg [data-mode]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === (simple ? 'simple' : 'advanced'))));
+  $('modeHint').textContent = MODE_HINT[simple ? 'simple' : 'advanced'];
+  const changed = simple ? changedAdvanced() : [];
+  const note = $('advNote');
+  note.hidden = !changed.length;
+  if (!changed.length) { note.innerHTML = ''; return; }
+  note.innerHTML = `<span class="adv-list">Also using ${changed.length} changed advanced setting${changed.length > 1 ? 's' : ''}: `
+    + `${changed.map((el) => `${escapeHtml(fieldLabel(el))} <b>${escapeHtml(shownValue(el))}</b>`).join(', ')}</span>`
+    + '<button type="button" class="secondary" data-act="show">Show them</button>'
+    + '<button type="button" class="secondary" data-act="reset">Reset to defaults</button>';
+}
+function resetAdvanced() {
+  for (const el of changedAdvanced()) {
+    if (el.type === 'checkbox') el.checked = defaultOf(el); else el.value = defaultOf(el);
+  }
+  redrawSelection();   // updates the derived fields and the coverage check
+  scheduleUsCoverage();
+  saveSettings();
+  refreshMode();
+}
+document.querySelectorAll('.seg [data-mode]').forEach((b) => { b.onclick = () => setMode(b.dataset.mode); });
+$('advNote').addEventListener('click', (e) => {
+  const act = e.target.closest('button')?.dataset.act;
+  if (act === 'show') setMode('advanced');
+  else if (act === 'reset') resetAdvanced();
+});
 // FastAPI / pydantic validation errors -> "Simplify (mm): must be less than or equal to 0.5 (got 1)"
 function describeError(d) {
   if (typeof d.detail === 'string') return d.detail;
@@ -618,21 +710,45 @@ function applyOptions(o) {
   redrawSelection();
   map.fitBounds(selection.getBounds().pad(0.3));
   saveSettings();
+  refreshMode();
+}
+
+// progress shows in the panel and, on phones, in the sheet's always-visible header
+function setProgress(frac, msg, isError = false) {
+  if (frac != null) { const w = `${(frac * 100).toFixed(1)}%`; $('bar').style.width = w; $('miniBar').style.width = w; }
+  if (msg != null) {
+    $('progressMsg').textContent = msg;
+    $('miniMsg').textContent = msg.split('\n')[0];
+    $('miniMsg').classList.toggle('err', isError);
+    $('miniStatus').hidden = false;
+  }
+}
+function setRunning(on) {
+  state.running = on;
+  $('generateBtn').disabled = on;
+  $('cancelBtn').hidden = !on;
+  const mg = $('mobileGenerate');
+  mg.textContent = on ? 'Cancel' : 'Generate 3MF';
+  mg.classList.toggle('primary', !on); mg.classList.toggle('secondary', on);
 }
 
 async function generate() {
   const bad = invalidFields();
   if (bad.length) {
-    showSettingsNote(`Fix these settings first:\n${bad.join('\n')}`);
+    showSettingsNote(`Fix these settings first:\n${bad.map((el) => `${fieldLabel(el)}: ${el.value} (allowed ${rangeText(el)})`).join('\n')}`);
+    if (isSimple() && bad.some((el) => el.closest('.adv'))) setMode('advanced');   // show the culprits
+    setSheet(true);
+    $('settingsNote').scrollIntoView({ block: 'center', behavior: 'smooth' });
     return;
   }
   showSettingsNote('');
   saveSettings();
   const body = buildOptions();
-  $('generateBtn').disabled = true;
-  $('cancelBtn').hidden = false;
+  setRunning(true);
   $('progress').hidden = false; $('log').hidden = false;
-  $('bar').style.width = '0%'; $('log').textContent = ''; $('progressMsg').textContent = 'Starting…';
+  $('log').textContent = '';
+  $('miniDownload').hidden = true; $('miniDetails').hidden = true;
+  setProgress(0, 'Starting…');
   $('result').hidden = true;
   hideReview();
   try {
@@ -643,13 +759,13 @@ async function generate() {
     poll();
   } catch (e) {
     finish();
-    $('progressMsg').textContent = `Error: ${e.message}`;
+    setProgress(null, `Error: ${e.message}`, true);
+    $('miniDetails').hidden = false;
   }
 }
 
 function finish() {
-  $('generateBtn').disabled = false;
-  $('cancelBtn').hidden = true;
+  setRunning(false);
   clearTimeout(state.pollTimer);
 }
 
@@ -657,8 +773,7 @@ async function poll() {
   const id = state.jobId;
   try {
     const j = await (await fetch(`/api/jobs/${id}`)).json();
-    $('bar').style.width = `${(j.progress * 100).toFixed(1)}%`;
-    $('progressMsg').textContent = j.message;
+    setProgress(j.progress, j.message);
     $('log').textContent = j.log.join('\n');
     $('log').scrollTop = 1e9;
     if (j.state === 'done') {
@@ -667,7 +782,9 @@ async function poll() {
       return;
     }
     if (j.state === 'error' || j.state === 'cancelled') {
-      finish(); $('progressMsg').textContent = j.state === 'error' ? `Error: ${j.error}` : 'Cancelled';
+      finish();
+      setProgress(null, j.state === 'error' ? `Error: ${j.error}` : 'Cancelled', j.state === 'error');
+      $('miniDetails').hidden = j.state !== 'error';
       if (j.state === 'error') showReview(j);
       return;
     }
@@ -715,6 +832,9 @@ function showResult(j) {
     ${(r.tips || []).length ? `<h2>Print tips</h2><ul class="tips">${r.tips.map((t) => `<li>${t}</li>`).join('')}</ul>` : ''}
     ${notes.length ? `<div class="info warn">${notes.join('<br>')}</div>` : ''}`;
   $('result').hidden = false;
+  setProgress(1, `Done · ${s.size_mm[0]} × ${s.size_mm[1]} mm, ${r.filaments.length} colour${r.filaments.length > 1 ? 's' : ''}`);
+  $('miniDownload').href = `/api/jobs/${id}/model.3mf`; $('miniDownload').hidden = false;
+  $('miniDetails').hidden = false;
   $('topImg').src = `/api/jobs/${id}/thumbnail.png?${Date.now()}`;
   viewer.load(`/api/jobs/${id}/preview.bin`);
   selectTab('view');
@@ -832,7 +952,7 @@ const viewer = {
     this.renderer.setPixelRatio(window.devicePixelRatio);
     el.appendChild(this.renderer.domElement);
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color('#e9e7e2');
+    this.setBackground();
     this.camera = new THREE.PerspectiveCamera(40, 1, 1, 20000);
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
@@ -843,6 +963,9 @@ const viewer = {
     new ResizeObserver(() => this.resize()).observe(el);
     const loop = () => { requestAnimationFrame(loop); this.controls.update(); this.renderer.render(this.scene, this.camera); };
     loop();
+  },
+  setBackground() {   // follows the colour theme
+    if (this.scene) this.scene.background = new THREE.Color(getComputedStyle($('viewer')).backgroundColor);
   },
   resize() {
     const el = $('viewer');
@@ -879,7 +1002,8 @@ const viewer = {
     // optional camera from the URL: zoom, az/el (degrees, az 0 = from the south), fx/fy focus (0..1)
     const q = new URLSearchParams(location.search);
     const zoom = parseFloat(q.get('zoom') || '1');
-    const d = Math.max(size.x, size.z) * 1.1 / zoom;
+    // a portrait view (phones) is narrower than it is tall: back off so the model's width fits
+    const d = Math.max(size.x, size.z) * 1.1 / zoom / Math.min(1, this.camera.aspect);
     if (q.has('fx')) c.x = box.min.x + parseFloat(q.get('fx')) * size.x;
     if (q.has('fy')) c.z = box.max.z - parseFloat(q.get('fy')) * size.z;
     this.controls.target.copy(c);
@@ -896,6 +1020,7 @@ const viewer = {
 
 // ------------------------------------------------------------------ tabs
 function selectTab(name) {
+  setSheet(false);
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
   $('map').hidden = name !== 'map';
   $('viewer').hidden = name !== 'view';
@@ -907,6 +1032,92 @@ function selectTab(name) {
   }
 }
 document.querySelectorAll('#tabs button').forEach((b) => b.addEventListener('click', () => selectTab(b.dataset.tab)));
+
+// ------------------------------------------------------------------ phone layout: bottom sheet
+// The panel's header stays visible at the bottom (--peek); the map / 3D view fill the space above
+// it. Tap the header or "Settings" to expand the sheet, swipe it up or down, or tap a tab to close.
+const sheetHead = $('sheetHead');
+function sheetOpen() { return document.body.classList.contains('sheet-open'); }
+function setSheet(open) {
+  if (!MOBILE.matches) open = false;
+  document.body.classList.toggle('sheet-open', open);
+  $('sheetToggle').textContent = open ? 'Map ▾' : 'Settings ▴';
+  $('sheetToggle').setAttribute('aria-expanded', String(open));
+}
+function layoutVars() {
+  const root = document.documentElement.style;
+  root.setProperty('--peek', `${Math.ceil(sheetHead.getBoundingClientRect().height)}px`);
+  root.setProperty('--tabs-h', `${Math.ceil($('tabs').getBoundingClientRect().height)}px`);
+}
+new ResizeObserver(layoutVars).observe(sheetHead);
+// the map's size changes with the phone sheet's header (progress row); keep the view centred.
+// Not while it's hidden behind the 3D / Top tab: a 0 x 0 map has no centre to keep, and
+// selectTab('map') re-measures it when it comes back.
+new ResizeObserver(() => { if (!$('map').hidden && $('map').clientWidth) map.invalidateSize(); }).observe($('map'));
+MOBILE.addEventListener('change', () => { setSheet(false); layoutVars(); });
+$('sheetToggle').onclick = () => setSheet(!sheetOpen());
+$('miniDetails').onclick = (e) => {
+  e.preventDefault();
+  setSheet(true);
+  const target = $('result').hidden ? $('actions') : $('result');
+  setTimeout(() => target.scrollIntoView({ block: 'start', behavior: 'smooth' }), 280);
+};
+$('mobileGenerate').onclick = () => {
+  if (state.running) { if (state.jobId) fetch(`/api/jobs/${state.jobId}/cancel`, { method: 'POST' }); } else generate();
+};
+// swipe / tap on the header (not on its buttons and links)
+let sheetDrag = null;
+sheetHead.addEventListener('pointerdown', (e) => {
+  if (!MOBILE.matches || e.button > 0 || e.target.closest('button, a, input, select')) return;
+  sheetDrag = { pointer: e.pointerId, y: e.clientY, open: sheetOpen(), moved: 0 };
+  document.body.classList.add('sheet-dragging');
+});
+window.addEventListener('pointermove', (e) => {
+  if (!sheetDrag || e.pointerId !== sheetDrag.pointer) return;
+  const dy = e.clientY - sheetDrag.y;
+  sheetDrag.moved = Math.max(sheetDrag.moved, Math.abs(dy));
+  const sb = $('sidebar');
+  const closedY = sb.offsetHeight - sheetHead.offsetHeight;   // follow the finger
+  const y = Math.min(closedY, Math.max(0, (sheetDrag.open ? 0 : closedY) + dy));
+  sb.style.transform = `translateY(${y}px)`;
+});
+for (const t of ['pointerup', 'pointercancel']) {
+  window.addEventListener(t, (e) => {
+    if (!sheetDrag || e.pointerId !== sheetDrag.pointer) return;
+    const dy = e.clientY - sheetDrag.y, d = sheetDrag;
+    sheetDrag = null;
+    document.body.classList.remove('sheet-dragging');
+    $('sidebar').style.transform = '';
+    if (t === 'pointercancel') return;
+    if (d.moved < 8) setSheet(!d.open);           // tap
+    else if (dy < -40) setSheet(true);
+    else if (dy > 40) setSheet(false);
+    else setSheet(d.open);
+  });
+}
+
+// ------------------------------------------------------------------ colour theme
+// Follows the system setting until the button is used, then the saved choice (light / dark).
+const THEME_KEY = 'maptomesh.theme';
+const DARK_MQ = matchMedia('(prefers-color-scheme: dark)');
+function savedTheme() { try { return localStorage.getItem(THEME_KEY); } catch (e) { return null; } }
+function applyTheme() {
+  const t = savedTheme();
+  const dark = t === 'dark' || (t !== 'light' && DARK_MQ.matches);
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  const btn = $('themeBtn');
+  btn.textContent = dark ? '☀︎' : '☾';
+  btn.title = dark ? 'Switch to the light theme' : 'Switch to the dark theme';
+  btn.setAttribute('aria-label', btn.title);
+  document.querySelector('meta[name=theme-color]').content = dark ? '#1d2024' : '#c8553d';
+  viewer.setBackground();
+}
+$('themeBtn').onclick = () => {
+  localStorage.setItem(THEME_KEY, document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+  applyTheme();
+};
+DARK_MQ.addEventListener('change', applyTheme);
+applyTheme();
 
 // ------------------------------------------------------------------ about / donate
 const ABOUT_KEY = 'maptomesh.about.seen.v1';
@@ -939,6 +1150,7 @@ fillPresets();
 enforceAspect('w');
 redrawSelection();
 updateDerived();
+refreshMode();
 pollIndex();
 scheduleUsCoverage();
 
@@ -976,6 +1188,7 @@ for (const id of ['baseSeparate', 'label', 'gridCells', 'smoothing', 'cliffSmoot
 }
 $('gridCells').addEventListener('change', scheduleCoverage);
 document.getElementById('sidebar').addEventListener('change', saveSettings);
+for (const t of ['input', 'change']) document.getElementById('sidebar').addEventListener(t, refreshMode);
 map.on('moveend', saveSettings);
 map.on('moveend', scheduleUsCoverage);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.drawing) setDrawing(false); });

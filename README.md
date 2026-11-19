@@ -76,6 +76,16 @@ On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and co
 6. **Generate** – progress and log stream in the sidebar. A finished job can be reopened with
    `?job=<id>` while the server is running.
 
+The panel opens in **Simple** mode: area, surface, detail, size, exaggeration, frame and label,
+roads and rivers, colours and name. **Advanced** shows everything else (data source, smoothing,
+base and printer settings, tiles, water tuning, colour depth, 3MF layout). Hidden advanced
+settings keep applying; Simple mode lists any that differ from the defaults, with a reset.
+
+On a phone held upright the settings panel becomes a bottom sheet under a full-width map: tap or
+swipe its header to open it; the header keeps the *Generate* button, progress and the download
+link in view. The area can be moved, resized and drawn with a finger. The ☾ / ☀ button next to
+*About / Donate* switches between the light and dark theme (the default follows the system).
+
 ### In the slicer
 
 - **Bambu Studio / OrcaSlicer**: open the 3MF; it loads as one object whose parts are already
