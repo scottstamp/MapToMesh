@@ -9,8 +9,10 @@ WEB_DIR = ROOT / "web"
 OUTPUT_DIR = CACHE_DIR / "output"
 ELEV_CACHE_DIR = CACHE_DIR / "elevation"
 OSM_CACHE_DIR = CACHE_DIR / "osm"
+# persistent app data (user reviews, incl. optional contact details): not a cache, never committed
+DATA_DIR = Path(os.environ.get("MAPTOMESH_DATA_DIR", ROOT / "data"))
 
-for _d in (CACHE_DIR, OUTPUT_DIR, ELEV_CACHE_DIR, OSM_CACHE_DIR):
+for _d in (CACHE_DIR, OUTPUT_DIR, ELEV_CACHE_DIR, OSM_CACHE_DIR, DATA_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 LIDAR_BASE = "https://canelevation-lidar-point-clouds.s3.ca-central-1.amazonaws.com/pointclouds_nuagespoints/"

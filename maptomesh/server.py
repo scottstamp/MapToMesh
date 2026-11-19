@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
 import traceback
 import uuid
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -353,6 +354,99 @@ def job_preview(jid: str):
     if j.state != "done" or j.parts is None:
         raise HTTPException(409, "Preview not available")
     return Response(preview_bytes(j.parts), media_type="application/octet-stream")
+
+
+# ---------------------------------------------------------------- reviews
+
+class ReviewIn(BaseModel):
+    rating: int | None = Field(None, ge=1, le=5)
+    problems: list[str] = Field(default_factory=list, max_length=12)
+    comment: str = Field("", max_length=4000)
+    followup: bool = False
+    name: str = Field("", max_length=200)
+    email: str = Field("", max_length=254)
+    website: str = Field("", max_length=200)   # honeypot: hidden from people, filled by bots
+    snapshot: dict | None = None                # the browser's copy of the job (server restarted)
+
+
+_JOB_ID = re.compile(r"^[0-9a-f]{12}$")
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_REVIEW_TIMES: dict[str, deque] = {}
+_REVIEW_LOCK = threading.Lock()
+REVIEWS_PER_HOUR = 20      # per client address
+REVIEWS_PER_JOB = 10
+
+
+def _rate_limited(addr: str) -> bool:
+    now = time.time()
+    with _REVIEW_LOCK:
+        q = _REVIEW_TIMES.setdefault(addr, deque())
+        while q and now - q[0] > 3600:
+            q.popleft()
+        if len(q) >= REVIEWS_PER_HOUR:
+            return True
+        q.append(now)
+        if len(_REVIEW_TIMES) > 10_000:   # forget idle addresses
+            for k in [k for k, v in _REVIEW_TIMES.items() if not v]:
+                _REVIEW_TIMES.pop(k, None)
+        return False
+
+
+def _job_snapshot(job: Job) -> tuple[str, dict, dict]:
+    result = {"result": job.result, "error": job.error, "log": job.log[-40:],
+              "created": job.created, "message": job.message}
+    return job.state, job.opts.model_dump(), result
+
+
+def _client_snapshot(snap: dict) -> tuple[str, dict, dict]:
+    if len(json.dumps(snap)) > 200_000:
+        raise HTTPException(413, "Job snapshot too large")
+    try:
+        opts = Options(**(snap.get("options") or {})).model_dump()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"Invalid job settings in snapshot: {e}") from e
+    state = snap.get("state") if snap.get("state") in ("done", "error", "cancelled") else "unknown"
+    result = {"result": snap.get("result"), "error": snap.get("error"), "log": (snap.get("log") or [])[-40:]}
+    return state, opts, result
+
+
+@app.post("/api/jobs/{jid}/review")
+def job_review(jid: str, rv: ReviewIn, request: Request) -> dict:
+    """Store a review of a job with the job's settings and result (see ``maptomesh.reviews``)."""
+    from .reviews import PROBLEM_KEYS, store
+
+    if not _JOB_ID.match(jid):
+        raise HTTPException(404, "Unknown job")
+    problems = list(dict.fromkeys(rv.problems))
+    if any(p not in PROBLEM_KEYS for p in problems):
+        raise HTTPException(400, "Unknown problem category")
+    comment, name, email = rv.comment.strip(), rv.name.strip(), rv.email.strip()
+    if rv.rating is None and not problems and not comment:
+        raise HTTPException(400, "Give a score, pick a problem or write a comment")
+    if rv.followup and not _EMAIL.match(email):
+        raise HTTPException(400, "Enter an email address so we can follow up (or untick follow-up)")
+    if rv.website:   # bot: pretend it worked
+        return {"ok": True, "id": 0}
+    addr = request.client.host if request.client else "unknown"
+    if _rate_limited(addr):
+        raise HTTPException(429, "Too many reviews from here; please try again later")
+    st = store()
+    if st.count_for_job(jid) >= REVIEWS_PER_JOB:
+        raise HTTPException(429, "This model has already been reviewed several times")
+    job = JOBS.get(jid)
+    if job is not None:
+        state, options, result = _job_snapshot(job)
+        source = "server"
+    elif rv.snapshot:
+        state, options, result = _client_snapshot(rv.snapshot)
+        source = "client"
+    else:
+        raise HTTPException(404, "This job is no longer available; generate it again to review it")
+    rid = st.add(job_id=jid, job_state=state, rating=rv.rating, problems=problems, comment=comment,
+                 wants_followup=rv.followup, contact_name=name or None, contact_email=email or None,
+                 options=options, result=result, snapshot_source=source, app_version=__version__,
+                 user_agent=request.headers.get("user-agent", "")[:300])
+    return {"ok": True, "id": rid}
 
 
 @app.exception_handler(ValueError)

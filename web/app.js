@@ -634,6 +634,7 @@ async function generate() {
   $('progress').hidden = false; $('log').hidden = false;
   $('bar').style.width = '0%'; $('log').textContent = ''; $('progressMsg').textContent = 'Starting…';
   $('result').hidden = true;
+  hideReview();
   try {
     const r = await fetch('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const d = await r.json();
@@ -661,12 +662,13 @@ async function poll() {
     $('log').textContent = j.log.join('\n');
     $('log').scrollTop = 1e9;
     if (j.state === 'done') {
-      finish(); showResult(j);
+      finish(); showResult(j); showReview(j);
       history.replaceState(null, '', `?job=${id}`);
       return;
     }
     if (j.state === 'error' || j.state === 'cancelled') {
       finish(); $('progressMsg').textContent = j.state === 'error' ? `Error: ${j.error}` : 'Cancelled';
+      if (j.state === 'error') showReview(j);
       return;
     }
   } catch (e) { /* transient */ }
@@ -716,6 +718,108 @@ function showResult(j) {
   $('topImg').src = `/api/jobs/${id}/thumbnail.png?${Date.now()}`;
   viewer.load(`/api/jobs/${id}/preview.bin`);
   selectTab('view');
+}
+
+// ------------------------------------------------------------------ review / problem report
+const PROBLEMS = [
+  ['terrain', 'Terrain / elevation looks wrong'],
+  ['missing_data', 'Missing or low-detail data for my area'],
+  ['buildings', 'Buildings or trees are wrong'],
+  ['water', 'Water, rivers or shoreline problems'],
+  ['roads', 'Roads are wrong'],
+  ['colors', 'Colours / filament changes'],
+  ['slicer', "Won't open, slice or print properly"],
+  ['slow_failed', 'Generation was slow or failed'],
+  ['other', 'Something else'],
+];
+const REVIEWED_KEY = 'maptomesh.reviewed.v1';
+function reviewedJobs() {
+  try { return JSON.parse(localStorage.getItem(REVIEWED_KEY) || '[]'); } catch (e) { return []; }
+}
+function markReviewed(id) {
+  const ids = reviewedJobs().filter((x) => x !== id).concat(id).slice(-200);
+  localStorage.setItem(REVIEWED_KEY, JSON.stringify(ids));
+}
+
+function hideReview() { $('review').hidden = true; $('review').innerHTML = ''; }
+
+function showReview(j) {
+  const box = $('review');
+  state.reviewJob = j;
+  box.hidden = false;
+  if (reviewedJobs().includes(j.id)) {
+    box.innerHTML = '<p class="hint review-done">Thanks for reviewing this model.</p>';
+    return;
+  }
+  const failed = j.state !== 'done';
+  const stars = [5, 4, 3, 2, 1].map((n) => `<input type="radio" id="star${n}" name="rating" value="${n}">`
+    + `<label for="star${n}" title="${n} star${n > 1 ? 's' : ''}" aria-label="${n} star${n > 1 ? 's' : ''}">★</label>`).join('');
+  box.innerHTML = `
+    <h2>${failed ? 'Report this problem' : 'How did it turn out?'}</h2>
+    <form id="reviewForm" novalidate>
+      ${failed ? '' : `<fieldset class="stars"><legend>Your score</legend><div class="star-row">${stars}</div></fieldset>`}
+      <fieldset class="problems"><legend>${failed ? 'What went wrong?' : 'Anything wrong? (optional)'}</legend>
+        ${PROBLEMS.map(([k, l]) => `<label class="check"><input type="checkbox" name="problem" value="${k}"${failed && k === 'slow_failed' ? ' checked' : ''}> ${l}</label>`).join('')}
+      </fieldset>
+      <label>Details (optional)<textarea id="reviewComment" maxlength="4000" rows="3"
+        placeholder="What did you expect, what went wrong, and where?"></textarea></label>
+      <label class="check"><input type="checkbox" id="reviewFollowup"> I'd like a follow-up about this</label>
+      <div id="reviewContact" hidden>
+        <div class="row">
+          <label>Name (optional)<input type="text" id="reviewName" maxlength="200" autocomplete="name"></label>
+          <label>Email<input type="email" id="reviewEmail" maxlength="254" autocomplete="email"></label>
+        </div>
+      </div>
+      <input type="text" id="reviewWebsite" class="hp" tabindex="-1" autocomplete="off" aria-hidden="true">
+      <p class="hint">Your settings and this review are saved to help improve MapToMesh. Contact details are only
+        stored if you ask for a follow-up, and only used for that.</p>
+      <button type="submit" class="secondary" id="reviewSend">Send</button>
+      <div id="reviewMsg" class="hint" role="status"></div>
+    </form>`;
+  $('reviewFollowup').onchange = () => {
+    $('reviewContact').hidden = !$('reviewFollowup').checked;
+    if ($('reviewFollowup').checked) $('reviewEmail').focus();
+  };
+  $('reviewForm').onsubmit = submitReview;
+}
+
+async function submitReview(e) {
+  e.preventDefault();
+  const form = $('reviewForm'), msg = $('reviewMsg');
+  const rating = form.querySelector('input[name=rating]:checked');
+  const problems = [...form.querySelectorAll('input[name=problem]:checked')].map((i) => i.value);
+  const comment = $('reviewComment').value.trim();
+  const followup = $('reviewFollowup').checked;
+  const email = $('reviewEmail').value.trim();
+  if (!rating && !problems.length && !comment) { msg.textContent = 'Pick a score or a problem, or write a comment.'; return; }
+  if (followup && (!email || !$('reviewEmail').checkValidity())) {
+    msg.textContent = 'Enter your email address for the follow-up (or untick it).';
+    $('reviewEmail').focus();
+    return;
+  }
+  const j = state.reviewJob;
+  const body = {
+    rating: rating ? Number(rating.value) : null, problems, comment, followup,
+    name: followup ? $('reviewName').value.trim() : '', email: followup ? email : '',
+    website: $('reviewWebsite').value,
+    // used only if the server no longer has this job in memory (e.g. after a restart)
+    snapshot: { state: j.state, error: j.error, options: j.options, result: j.result, log: j.log },
+  };
+  $('reviewSend').disabled = true;
+  msg.textContent = 'Sending…';
+  try {
+    const r = await fetch(`/api/jobs/${j.id}/review`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(describeError(d));
+    markReviewed(j.id);
+    $('review').innerHTML = `<p class="hint review-done">Thanks! Your ${problems.length ? 'report' : 'review'} was saved`
+      + `${followup ? ' and we\'ll get back to you by email' : ''}.</p>`;
+  } catch (err) {
+    $('reviewSend').disabled = false;
+    msg.textContent = `Couldn't send: ${err.message}`;
+  }
 }
 
 // ------------------------------------------------------------------ 3D viewer
@@ -844,7 +948,7 @@ const jobParam = new URLSearchParams(location.search).get('job');
 if (!jobParam && !localStorage.getItem(ABOUT_KEY)) openAbout();
 if (jobParam) {
   fetch(`/api/jobs/${jobParam}`).then((r) => (r.ok ? r.json() : null)).then((j) => {
-    if (j && j.state === 'done') { state.jobId = j.id; applyOptions(j.options); showResult(j); }
+    if (j && j.state === 'done') { state.jobId = j.id; applyOptions(j.options); showResult(j); showReview(j); }
   });
 }
 

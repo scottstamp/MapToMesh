@@ -5,3 +5,5 @@ cache/
 _scratch/
 *.3mf
 *.stl
+# user reviews (may contain contact details)
+data/

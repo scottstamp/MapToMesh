@@ -87,6 +87,20 @@ On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and co
 - **Single extruder, elevation bands**: print as one colour and insert filament changes at the
   listed Z heights (round to your layer height).
 
+### Reviews and problem reports
+
+After a model is generated (or a job fails) a short form asks for a 1-5 star score, problem
+categories (terrain, missing data, buildings/trees, water, roads, colours, slicing/printing, slow or
+failed generation, other) and an optional comment. Ticking *I'd like a follow-up* reveals optional
+name and email fields; contact details are only stored then.
+
+Reviews go to SQLite at `data/reviews.sqlite` (`MAPTOMESH_DATA_DIR`), one row per review with the
+job's full settings and a snapshot of its result (stats, data sources, notes, errors, the end of the
+job log), so reported problems can be reproduced. No IP addresses are stored; a hidden honeypot field
+and a per-address limit (20 per hour, 10 per job) keep spam out. The `data/` folder is git-ignored:
+it can contain personal data. Rows have `status` / `admin_note` columns for the planned admin report
+page (`maptomesh.reviews.ReviewStore.recent()` lists them; escape all text when rendering it).
+
 ### Filament changes and purge
 
 The result shows an estimated number of filament changes. Slots are ordered light to dark (slicers
@@ -264,6 +278,7 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 | `MAPTOMESH_VECTOR_TILES` | `https://tiles.openfreemap.org/planet` (any OpenMapTiles TileJSON) |
 | `MAPTOMESH_DATA_CACHE_GB` | `10` (size limit of the LiDAR / DEM range cache) |
 | `MAPTOMESH_SERVICE_CACHE_GB` | `2` (size limit of cached elevation-service responses) |
+| `MAPTOMESH_DATA_DIR` | `./data` (user reviews database; not a cache, keep it private) |
 
 ## Limits and known behaviour
 
