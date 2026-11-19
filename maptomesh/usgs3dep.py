@@ -150,7 +150,7 @@ def tiles(bbox: tuple[float, float, float, float], max_items: int = 5000) -> lis
         name = f.get("usgs_id") or f["id"]
         label = name[len("USGS_LPC_"):] if name.startswith("USGS_LPC_") else name
         out.append(Tile(f["href"].split("?", 1)[0], f"USGS {label}", _year(f.get("start"), name),
-                        tuple(float(v) for v in b[:4])))
+                        tuple(float(v) for v in b[:4]), provider="usgs"))
     return out
 
 

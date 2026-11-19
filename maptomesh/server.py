@@ -86,7 +86,9 @@ def _run_job(job: Job) -> None:
         o = job.opts
         try:
             stage = lambda a, b: (lambda f, m: job.set(a + (b - a) * f, m))  # noqa: E731
-            if o.source == "lidar" and not INDEX.ready:
+            from .providers.north_america import Hrdem
+            in_canada = Hrdem().covers(AOI(o.lat, o.lon, o.width_m, o.height_m).lonlat_bbox())
+            if o.source == "lidar" and not INDEX.ready and in_canada:
                 job.set(0.0, "Waiting for LiDAR tile index")
                 INDEX.start()
                 while not INDEX.ready:
@@ -128,8 +130,12 @@ def _run_job(job: Job) -> None:
             (outdir / "thumbnail.png").write_bytes(thumb)
             fname = _slug(o.name) + ".3mf"
             job.set(0.9, f"Writing {fname} ({res.stats['triangles']:,} triangles)")
+            credits = " ".join(elev.info.get("attribution", []))
             write_3mf(outdir / fname, res.parts, res.filaments, o.name, o.layout,
-                      description=f"{o.lat:.5f}, {o.lon:.5f} - {o.width_m:.0f} x {o.height_m:.0f} m - {res.stats['scale']}",
+                      description=(f"{o.lat:.5f}, {o.lon:.5f} - {o.width_m:.0f} x {o.height_m:.0f} m - "
+                                   f"{res.stats['scale']}. Elevation data: {credits} "
+                                   "Map data (c) OpenStreetMap contributors (ODbL)."
+                                   + "".join(f" LICENCE RESTRICTION: {w}" for w in elev.info.get("licence_warnings", []))),
                       thumbnail=thumb)
             size = (outdir / fname).stat().st_size
             base_file = base_size = None
@@ -148,7 +154,9 @@ def _run_job(job: Job) -> None:
                 "color_changes": res.color_changes, "notes": res.notes, "tips": res.tips or [],
                 "data": {k: v for k, v in elev.info.items() if k in ("tiles", "points", "projects", "coverage",
                                                                        "items", "failed_tiles", "errors",
-                                                                       "ept_nodes", "us_source")},
+                                                                       "ept_nodes", "us_source", "sources",
+                                                                       "attribution", "skipped",
+                                                                       "licence_warnings")},
             }
             job.state = "done"
             job.set(1.0, "Done")
@@ -201,19 +209,28 @@ class AreaIn(BaseModel):
     height_m: float = Field(gt=0)
     grid_cells: int = 600
     us_source: str = "usgs"
+    source: str = "lidar"
 
 
 @app.post("/api/coverage")
 def coverage(a: AreaIn) -> dict:
     aoi = AOI(a.lat, a.lon, a.width_m, a.height_m)
     grid = Grid.for_aoi(aoi, max(50, min(a.grid_cells, config.MAX_GRID_CELLS)))
+    from . import providers  # noqa: F401 - registers elevation providers
+    from .dem import describe
     from .pointcloud import find_sources
-    from .usgs3dep import in_us
+    from .providers.north_america import Hrdem
 
     out = {"grid": {"nx": grid.nx, "ny": grid.ny, "step_m": round(grid.step, 3)}}
     bbox = aoi.lonlat_bbox(margin=grid.step * 2)
-    if not INDEX.ready and not in_us(bbox):
+    area_km2 = a.width_m * a.height_m / 1e6
+    out["dem_sources"] = describe(bbox, area_km2)
+    if not INDEX.ready and Hrdem().covers(bbox):  # Canadian point clouds need the tile index
         out.update({"ready": False, "message": INDEX.message})
+        return out
+    if a.source != "lidar":
+        out.update({"ready": True, "tiles": 0, "ept_projects": 0, "max_tiles": config.MAX_TILES,
+                    "area_km2": round(area_km2, 2), "errors": [], "projects": []})
         return out
     tiles, projects, errors = find_sources(bbox, INDEX.get() if INDEX.ready else None, a.us_source,
                                            config.MAX_TILES + 1)

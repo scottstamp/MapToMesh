@@ -37,16 +37,19 @@ class Colors(BaseModel):
 
 class Options(BaseModel):
     # area (centre + ground size in metres, local transverse Mercator)
-    # Canada (NRCan) and the US incl. Alaska, Hawaii, Puerto Rico (USGS 3DEP)
-    lat: float = Field(..., ge=17.0, le=84.0)
-    lon: float = Field(..., ge=-180.0, le=-50.0)
+    # anywhere: point clouds / national models where available, Copernicus 30 m elsewhere
+    lat: float = Field(..., ge=-84.0, le=84.0)
+    lon: float = Field(..., ge=-180.0, le=180.0)
     width_m: float = Field(..., gt=20, le=200_000)
     height_m: float = Field(..., gt=20, le=200_000)
     shape: Literal["rectangle", "rounded", "circle", "hexagon"] = "rectangle"
     corner_radius_mm: float = Field(12.0, ge=0, le=500)
 
     # data
-    source: Literal["lidar", "hrdem"] = "lidar"
+    # "lidar": classified point clouds where available, elevation models (best resolution first,
+    # down to Copernicus 30 m) for the rest; "dem": elevation models only (faster for big areas;
+    # "hrdem" is the old name of that mode)
+    source: Literal["lidar", "dem", "hrdem"] = "lidar"
     # US point clouds: USGS's own Entwine collection on AWS (complete, current) or the Microsoft
     # Planetary Computer COPC snapshot (to ~2022, with gaps); Canada always uses NRCan
     us_source: Literal["usgs", "planetary"] = "usgs"
@@ -116,4 +119,4 @@ class Options(BaseModel):
     name: str = Field("MapToMesh", max_length=80)
 
     def elevation_key(self) -> str:
-        return f"v7|{self.source}|{self.us_source}|{self.lat:.6f}|{self.lon:.6f}|{self.width_m:.1f}|{self.height_m:.1f}|{self.grid_cells}"
+        return f"v9|{'dem' if self.source == 'hrdem' else self.source}|{self.us_source}|{self.lat:.6f}|{self.lon:.6f}|{self.width_m:.1f}|{self.height_m:.1f}|{self.grid_cells}"

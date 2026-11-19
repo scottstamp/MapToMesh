@@ -65,20 +65,7 @@ def get_elevation(opts: Options, progress: ProgressFn, cancel: threading.Event) 
         elev = Elevation(opts.source, grid, arrays, info)
         progress(1.0, "Elevation data (disk cache)")
     else:
-        if opts.source == "lidar":
-            from .lidar_index import INDEX
-            from .pointcloud import fetch_lidar
-            r = fetch_lidar(aoi, grid, INDEX.get(), progress, cancel, max_tiles=config.MAX_TILES,
-                            us_source=opts.us_source)
-            arrays = {"ground": r.ground, "water": r.water_frac, "building": r.building, "bridge": r.bridge,
-                      "veg": r.veg, "unclass": r.unclass, "bld_cls": r.bld_classified, "veg_cls": r.veg_classified,
-                      "density": r.density.astype(np.float32), "covered": r.covered}
-            info = r.info
-        else:
-            from .hrdem import fetch_hrdem
-            r = fetch_hrdem(aoi, grid, progress, cancel)
-            arrays = {"dtm": r["dtm"], "dsm": r["dsm"]}
-            info = r["info"]
+        arrays, info = _fetch_elevation(opts, aoi, grid, progress, cancel)
         info["grid"] = {"nx": grid.nx, "ny": grid.ny, "step_m": grid.step}
         np.savez_compressed(path, info=np.frombuffer(json.dumps(info).encode(), dtype=np.uint8), **arrays)
         elev = Elevation(opts.source, grid, arrays, info)
@@ -87,6 +74,85 @@ def get_elevation(opts: Options, progress: ProgressFn, cancel: threading.Event) 
         while len(_MEM) > 4:
             _MEM.popitem(last=False)
     return elev
+
+
+def _fetch_elevation(opts: Options, aoi: AOI, grid: Grid, progress: ProgressFn,
+                     cancel: threading.Event) -> tuple[dict, dict]:
+    """Best available elevation for the area, as per-vertex arrays:
+
+    1. classified LiDAR point clouds (unless ``source`` is an elevation-models-only mode),
+    2. elevation models for everything the point clouds don't cover, highest resolution first,
+       down to Copernicus 30 m (``maptomesh.dem.best_dems``).
+
+    Elevation-model areas are expressed like an unclassified point cloud: the DTM is the ground
+    and a DSM, where there is one, provides "class 1" heights that the surface builder turns into
+    buildings (OSM footprints) and trees, exactly as for LiDAR projects without classification."""
+    from . import providers  # noqa: F401 - registers the elevation providers
+    from .dem import best_dems
+    from .pointcloud import empty_result, fetch_lidar, provider_credit, provider_licence_note
+
+    sub = lambda a, b: (lambda f, m: progress(a + (b - a) * f, m))  # noqa: E731
+    if opts.source == "lidar":
+        from .lidar_index import INDEX
+        r = fetch_lidar(aoi, grid, INDEX.get() if INDEX.ready else None, sub(0.0, 0.8), cancel,
+                        max_tiles=config.MAX_TILES, us_source=opts.us_source, allow_empty=True)
+    else:
+        r = empty_result(grid)
+    info = r.info
+    ground, unclass = r.ground.copy(), r.unclass.copy()
+    water, density = r.water_frac.copy(), r.density.astype(np.float32)
+    bld_cls, veg_cls, covered = r.bld_classified.copy(), r.veg_classified.copy(), r.covered.copy()
+    sources = []
+    credits = []
+    warnings = [w for w in (provider_licence_note(k) for k in r.info.get("providers", [])) if w]
+    n = covered.size
+    if r.info.get("points"):
+        label = ", ".join(provider_credit(k)[0] for k in r.info.get("providers", [])) or "LiDAR"
+        sources.append({"label": f"LiDAR point clouds: {label}", "share": float(covered.mean()), "lidar": True})
+        credits += [provider_credit(k)[1] for k in r.info.get("providers", [])]
+    need = ~covered
+    if need.any():
+        lo = 0.8 if opts.source == "lidar" else 0.0
+        comp = best_dems(aoi, grid, need=need, ref=np.where(covered, ground, np.nan),
+                         progress=sub(lo, 1.0), cancel=cancel)
+        take = need & np.isfinite(comp.dtm)
+        ground[take] = comp.dtm[take]
+        water[take] = 0.0
+        raised = take & np.isfinite(comp.dsm) & (comp.dsm > comp.dtm + 1.0)
+        unclass[raised] = comp.dsm[raised]
+        bld_cls[take] = False
+        veg_cls[take] = False
+        density[take] = np.maximum(density[take], 1.0)  # data, not a void (voids become water)
+        covered |= take
+        for u in comp.used:
+            sources.append({"label": u["label"], "share": u["share"] * need.sum() / n, "res_m": u["res_m"],
+                            "offset_m": u["offset_m"], "detail": u["detail"], "dsm": u["dsm"]})
+            credits.append(u["attribution"])
+            warnings += u.get("licence_notes", [])
+        info.setdefault("errors", [])
+        info["errors"] = (info["errors"] + comp.errors)[:8]
+        info["skipped"] = info.get("skipped", []) + comp.skipped
+        if not covered.any():
+            raise RuntimeError("No elevation data covers this area." + (f" {comp.errors[0]}" if comp.errors else ""))
+    info["sources"] = sources
+    info["attribution"] = [c for i, c in enumerate(credits) if c and c not in credits[:i]]
+    info["licence_warnings"] = [w for i, w in enumerate(warnings) if w and w not in warnings[:i]]
+    info["coverage"] = float(covered.mean())
+    arrays = {"ground": ground, "water": water, "building": r.building, "bridge": r.bridge,
+              "veg": r.veg, "unclass": unclass, "bld_cls": bld_cls, "veg_cls": veg_cls,
+              "density": density, "covered": covered}
+    return arrays, info
+
+
+def _source_notes(info: dict) -> list[str]:
+    srcs = info.get("sources") or []
+    notes = [f"Licence restriction: {w}" for w in info.get("licence_warnings", [])]
+    if len(srcs) > 1 or (srcs and not srcs[0].get("lidar")):
+        parts = [f"{s['label']} {100 * s['share']:.0f}%" for s in srcs if s["share"] >= 0.0005]
+        notes.append("Elevation: " + "; ".join(parts) + ".")
+    for s in info.get("skipped", []) or []:
+        notes.append(s)
+    return notes
 
 
 # ---------------------------------------------------------------- surface
@@ -205,85 +271,67 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
     osm_bld = osm.get("buildings")
     hint = None
 
-    if elev.source == "lidar":
-        G = a["ground"]
-        cov = a["covered"].astype(bool)
-        dens = a["density"]
-        if cov.mean() < 0.999:
-            notes.append(f"{100 * (1 - cov.mean()):.1f}% of the area has no LiDAR coverage (interpolated).")
-        W = remove_small(a["water"] >= 0.3, cells(30))
-        if opts.voids_as_water:
-            k = max(3, int(np.ceil(4.0 / step)) | 1)
-            void = cov & (ndimage.uniform_filter(dens.astype(np.float32), size=k) == 0)
-            W |= remove_small(void, cells(600))
-        if osm_water is not None:
-            W |= osm_water
-        hint = a["water"] >= 0.5
-        Gf = _smooth_steep(smooth(fill_nan(G), opts.smoothing), step, opts.cliff_smoothing)
-        measured = np.where(np.isfinite(G) & (a["water"] < 0.3), G, np.nan)
+    # every source arrives as point-cloud-style arrays (elevation models look like a project
+    # without classification: DTM = ground, DSM = class 1)
+    G = a["ground"]
+    cov = a["covered"].astype(bool)
+    dens = a["density"]
+    notes += _source_notes(elev.info)
+    if cov.mean() < 0.999:
+        notes.append(f"{100 * (1 - cov.mean()):.1f}% of the area has no elevation data (interpolated).")
+    W = remove_small(a["water"] >= 0.3, cells(30))
+    if opts.voids_as_water:
+        k = max(3, int(np.ceil(4.0 / step)) | 1)
+        void = cov & (ndimage.uniform_filter(dens.astype(np.float32), size=k) == 0)
+        W |= remove_small(void, cells(600))
+    if osm_water is not None:
+        W |= osm_water
+    hint = a["water"] >= 0.5
+    Gf = _smooth_steep(smooth(fill_nan(G), opts.smoothing), step, opts.cliff_smoothing)
+    measured = np.where(np.isfinite(G) & (a["water"] < 0.3), G, np.nan)
 
-        def above(v, d):
-            return np.isfinite(v) & (np.nan_to_num(v, nan=-1e9) > Gf + d)
+    def above(v, d):
+        return np.isfinite(v) & (np.nan_to_num(v, nan=-1e9) > Gf + d)
 
-        bld_v, veg_v = a["building"].copy(), a["veg"].copy()
-        # route unclassified (0/1) returns depending on what the owning project classifies
-        U = a["unclass"]
-        bcls, vcls = a["bld_cls"].astype(bool), a["veg_cls"].astype(bool)
-        Uf = despike(np.where(np.isfinite(U), U, Gf), np.isfinite(U), thresh=12.0, size=5)
-        um = above(Uf, 2.0) & np.isfinite(U)
-        to_veg = um & bcls & ~vcls        # buildings classified -> class 1 is mostly trees
-        maybe_bld = um & ~bcls & vcls     # trees classified -> class 1 is buildings + clutter
-        unknown = um & ~bcls & ~vcls      # nothing classified
-        both = um & bcls & vcls           # both classified -> class 1 is leftovers, e.g. skyscrapers
-        cand = maybe_bld | unknown
-        has_osm = osm_bld is not None and osm_bld.any()
-        near = ndimage.binary_dilation(osm_bld, iterations=max(1, int(round(2.0 / step)))) if has_osm else None
-        if both.any() and has_osm:
-            # classifiers often leave the tallest towers unclassified (Chicago 2017: class 6 tops out
-            # at ~120 m, Willis Tower is class 1); inside a mapped footprint that is the building
-            bld_v = np.where(both & near, np.fmax(bld_v, Uf), bld_v)
-        if cand.any():
-            show = opts.surface != "terrain"  # bare terrain uses no buildings
-            if has_osm:
-                is_b = cand & near
-                if show:
-                    notes.append("Some LiDAR here has no building class; OpenStreetMap footprints identified buildings.")
-            else:
-                is_b = _planar_components(Uf, cand, step) & cand
-                if show:
-                    notes.append("Some LiDAR here has no building class; a roof-flatness heuristic was used "
-                                 "(OpenStreetMap footprints give better results).")
-            bld_v = np.where(is_b, np.fmax(bld_v, Uf), bld_v)
-            to_veg |= unknown & ~is_b
-        veg_v = np.where(to_veg, np.fmax(veg_v, Uf), veg_v)
-        Bm, Bv = _close_and_fill(bld_v, above(bld_v, 2.0), cells(12))
-        BRm, BRv = _close_and_fill(a["bridge"], above(a["bridge"], 1.0), cells(20))
-        vfin = np.isfinite(veg_v)
-        V0 = despike(np.where(vfin, veg_v, Gf), vfin, thresh=10.0, size=5)
-        vmask = vfin & (V0 > Gf + 1.5) & ~Bm
-        Vm, Vv = _close_and_fill(V0, vmask, cells(25))
-        Vm &= ~Bm
-    else:
-        dtm, dsm = a["dtm"], a["dsm"]
-        cov = np.isfinite(dtm)
-        if cov.mean() < 0.999:
-            notes.append(f"{100 * (1 - cov.mean()):.1f}% of the area has no HRDEM coverage (interpolated).")
-        Gf = _smooth_steep(smooth(fill_nan(dtm), opts.smoothing), step, opts.cliff_smoothing)
-        measured = None
-        Df = fill_nan(np.where(np.isfinite(dsm), dsm, dtm))
-        W = osm_water.copy() if osm_water is not None else zeros.copy()
-        raised = remove_small((Df - Gf > 2.5) & ~W, cells(12))
-        if osm_bld is not None and osm_bld.any():
-            near = ndimage.binary_dilation(osm_bld, iterations=max(1, int(round(2.0 / step))))
-            Bm = raised & near
-            Vm = remove_small(raised & ~Bm, cells(25))
-            notes.append("HRDEM has no classification: buildings come from OpenStreetMap footprints, "
-                         "other raised objects are treated as trees.")
+    bld_v, veg_v = a["building"].copy(), a["veg"].copy()
+    # route unclassified (0/1) returns depending on what the owning project classifies
+    U = a["unclass"]
+    bcls, vcls = a["bld_cls"].astype(bool), a["veg_cls"].astype(bool)
+    Uf = despike(np.where(np.isfinite(U), U, Gf), np.isfinite(U), thresh=12.0, size=5)
+    um = above(Uf, 2.0) & np.isfinite(U)
+    to_veg = um & bcls & ~vcls        # buildings classified -> class 1 is mostly trees
+    maybe_bld = um & ~bcls & vcls     # trees classified -> class 1 is buildings + clutter
+    unknown = um & ~bcls & ~vcls      # nothing classified
+    both = um & bcls & vcls           # both classified -> class 1 is leftovers, e.g. skyscrapers
+    cand = maybe_bld | unknown
+    has_osm = osm_bld is not None and osm_bld.any()
+    near = ndimage.binary_dilation(osm_bld, iterations=max(1, int(round(2.0 / step)))) if has_osm else None
+    if both.any() and has_osm:
+        # classifiers often leave the tallest towers unclassified (Chicago 2017: class 6 tops out
+        # at ~120 m, Willis Tower is class 1); inside a mapped footprint that is the building
+        bld_v = np.where(both & near, np.fmax(bld_v, Uf), bld_v)
+    if cand.any():
+        show = opts.surface != "terrain"  # bare terrain uses no buildings
+        if has_osm:
+            is_b = cand & near
+            if show:
+                notes.append("Part of the data has no building class: OpenStreetMap footprints identified "
+                             "buildings, other raised objects count as trees.")
         else:
-            Bm, Vm = raised, zeros
-            notes.append("HRDEM has no classification: all raised objects use the building colour.")
-        Bv = Vv = Df
-        BRm, BRv = zeros, Gf
+            is_b = _planar_components(Uf, cand, step) & cand
+            if show:
+                notes.append("Part of the data has no building class; a roof-flatness heuristic was used "
+                             "(OpenStreetMap footprints give better results).")
+        bld_v = np.where(is_b, np.fmax(bld_v, Uf), bld_v)
+        to_veg |= unknown & ~is_b
+    veg_v = np.where(to_veg, np.fmax(veg_v, Uf), veg_v)
+    Bm, Bv = _close_and_fill(bld_v, above(bld_v, 2.0), cells(12))
+    BRm, BRv = _close_and_fill(a["bridge"], above(a["bridge"], 1.0), cells(20))
+    vfin = np.isfinite(veg_v)
+    V0 = despike(np.where(vfin, veg_v, Gf), vfin, thresh=10.0, size=5)
+    vmask = vfin & (V0 > Gf + 1.5) & ~Bm
+    Vm, Vv = _close_and_fill(V0, vmask, cells(25))
+    Vm &= ~Bm
 
     # --- water: clean the mask, one flat level per water body
     W = remove_small(W, cells(60))

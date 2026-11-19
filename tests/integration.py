@@ -49,7 +49,7 @@ CASES: dict[str, dict] = {
                                  surface="terrain", osm_roads="medium", color_mode="landcover",
                                  base_separate=True, base_mm=1.0, name="Flatrock streams"),
     # same harbour area from the HRDEM COG mosaic (DSM-DTM split by OSM footprints)
-    "stj_hrdem": dict(lat=47.5660, lon=-52.6950, width_m=3200, height_m=2400, grid_cells=600, source="hrdem",
+    "stj_hrdem": dict(lat=47.5660, lon=-52.6950, width_m=3200, height_m=2400, grid_cells=600, source="dem",
                       color_mode="landcover", osm_roads="major", name="St Johns HRDEM"),
     # base plate printed separately: model must start at z=0, base colour not in its filament list
     "stj_base_separate": dict(lat=47.5660, lon=-52.6950, width_m=3200, height_m=2400, grid_cells=500,
@@ -78,6 +78,37 @@ CASES: dict[str, dict] = {
     "us_grand_canyon_ept": dict(lat=36.0570, lon=-112.1180, width_m=4000, height_m=4000, grid_cells=500,
                                 us_source="usgs", surface="terrain", color_mode="elevation", name="Grand Canyon"),
     # regressions: buildings unclassified (Ottawa 2020), trees unclassified (Hamilton 2021)
+    # outside North America: best available source per area, fallbacks down to Copernicus 30 m
+    "fr_paris_ign": dict(lat=48.8530, lon=2.3499, width_m=2000, height_m=1500, grid_cells=600,
+                         color_mode="landcover", surface="buildings", osm_roads="medium", name="Paris"),
+    "nl_amsterdam_ahn": dict(lat=52.3731, lon=4.8922, width_m=2000, height_m=1500, grid_cells=600,
+                             color_mode="landcover", surface="buildings", osm_roads="medium", name="Amsterdam"),
+    "ch_matterhorn": dict(lat=45.9763, lon=7.6586, width_m=4000, height_m=4000, grid_cells=500, surface="terrain",
+                          color_mode="elevation", name="Matterhorn"),
+    "uk_london_ea": dict(lat=51.5055, lon=-0.0754, width_m=2000, height_m=1500, grid_cells=600,
+                         color_mode="landcover", surface="buildings", osm_roads="medium", name="London"),
+    "uk_snowdon_wales": dict(lat=53.0685, lon=-4.0763, width_m=3000, height_m=3000, grid_cells=500,
+                             surface="terrain", color_mode="elevation", name="Snowdon"),
+    "at_hallstatt_bev": dict(lat=47.5622, lon=13.6493, width_m=3000, height_m=3000, grid_cells=500,
+                             color_mode="landcover", surface="terrain", name="Hallstatt"),
+    "de_cologne_nrw": dict(lat=50.9413, lon=6.9583, width_m=2000, height_m=1500, grid_cells=600,
+                           color_mode="landcover", surface="buildings", osm_roads="medium", name="Cologne"),
+    "pl_krakow_flai": dict(lat=50.0614, lon=19.9366, width_m=2000, height_m=1500, grid_cells=500,
+                           color_mode="landcover", surface="buildings", osm_roads="medium", name="Krakow"),
+    "nz_wellington_linz": dict(lat=-41.2865, lon=174.7762, width_m=3000, height_m=3000, grid_cells=500,
+                               color_mode="landcover", surface="buildings", osm_roads="medium", name="Wellington"),
+    "au_brisbane_qld": dict(lat=-27.4698, lon=153.0251, width_m=3000, height_m=3000, grid_cells=500,
+                            color_mode="landcover", surface="terrain", osm_roads="medium", name="Brisbane"),
+    "jp_fuji_gsi": dict(lat=35.3606, lon=138.7274, width_m=8000, height_m=8000, grid_cells=500, surface="terrain",
+                        color_mode="elevation", name="Fuji"),
+    "hk_central_cedd": dict(lat=22.2820, lon=114.1588, width_m=3000, height_m=3000, grid_cells=500,
+                            color_mode="landcover", surface="buildings", osm_roads="medium", name="Hong Kong"),
+    "no_lofoten_arcticdem": dict(lat=67.9320, lon=13.0890, width_m=4000, height_m=4000, grid_cells=500,
+                                 color_mode="landcover", surface="terrain", name="Reine"),
+    "es_teide_ign": dict(lat=28.2724, lon=-16.6425, width_m=10000, height_m=10000, grid_cells=500,
+                         surface="terrain", color_mode="elevation", name="Teide"),
+    "global_everest_copernicus": dict(lat=27.9881, lon=86.9250, width_m=20000, height_m=20000, grid_cells=400,
+                                      surface="terrain", color_mode="elevation", name="Everest"),
     "ottawa_landcover": dict(lat=45.4236, lon=-75.7009, width_m=2000, height_m=1500, shape="rounded", grid_cells=700,
                              frame=True, osm_roads="medium", color_mode="landcover", name="Ottawa"),
     "hamilton_bands": dict(lat=43.2385, lon=-79.8950, width_m=3000, height_m=2598, shape="hexagon", grid_cells=500,
@@ -93,6 +124,22 @@ EXPECT = {
     "us_seattle_ept": {"projects": ["USGS WA_KingCo"], "min_relief_mm": 15.0},   # Columbia Center ~284 m
     # ~1 km of relief; no water in this area (sparse, unsurveyed parts must not become "void" water)
     "us_grand_canyon_ept": {"projects": ["USGS AZ_GrandCanyonNP"], "min_relief_mm": 25.0, "max_water_share": 0.005},
+    # "sources": substrings of the elevation sources that must supply part of the model
+    "fr_paris_ign": {"projects": ["IGN LiDAR HD"]},
+    "nl_amsterdam_ahn": {"sources": ["AHN4"]},
+    "ch_matterhorn": {"sources": ["swiss"], "min_relief_mm": 40.0},
+    "uk_london_ea": {"sources": ["Environment Agency"]},
+    "uk_snowdon_wales": {"sources": ["Welsh Government"]},
+    "at_hallstatt_bev": {"sources": ["BEV"]},
+    "de_cologne_nrw": {"sources": ["NRW"]},
+    "pl_krakow_flai": {"projects": ["GUGiK"]},
+    "nz_wellington_linz": {"sources": ["LINZ"]},
+    "au_brisbane_qld": {"sources": ["Queensland"]},
+    "jp_fuji_gsi": {"sources": ["GSI"], "min_relief_mm": 50.0},
+    "hk_central_cedd": {"sources": ["CEDD"]},
+    "no_lofoten_arcticdem": {"sources": ["ArcticDEM"]},
+    "es_teide_ign": {"sources": ["IGN MDT05"]},
+    "global_everest_copernicus": {"sources": ["Copernicus"]},
 }
 
 
@@ -208,6 +255,11 @@ def run_case(base: str, name: str, body: dict, timeout: float = 1800) -> dict:
         if not any(g.startswith(prefix) for g in got):
             print(f"  expected data from {prefix!r}, got projects {got}")
             ok = False
+    used = [x["label"] for x in res.get("data", {}).get("sources", []) if x.get("share", 0) > 0.01]
+    for sub in exp.get("sources", []):
+        if not any(sub in u for u in used):
+            print(f"  expected elevation from {sub!r}, got {used}")
+            ok = False
     if res["stats"]["relief_mm"] < exp.get("min_relief_mm", 0):
         print(f"  relief {res['stats']['relief_mm']} mm < {exp['min_relief_mm']} mm (tall buildings missing?)")
         ok = False
@@ -227,9 +279,9 @@ def run_case(base: str, name: str, body: dict, timeout: float = 1800) -> dict:
         "case": name, "ok": ok and stl.ok and prev.ok, "seconds": round(elapsed, 1),
         "triangles": res["stats"]["triangles"], "parts": res["stats"]["parts"], "mb": round(len(data) / 1e6, 1),
         "size_mm": res["stats"]["size_mm"], "relief_mm": res["stats"]["relief_mm"],
-        "lidar": f"{res['data'].get('points', 0) / 1e6:.1f}M pts/{res['data'].get('tiles', '-')} tiles"
-                 + (f"+{res['data']['ept_nodes']} nodes" if res["data"].get("ept_nodes") else "")
-        if res["data"].get("points") else ",".join(res["data"].get("items", [])),
+        "lidar": (f"{res['data'].get('points', 0) / 1e6:.1f}M pts/{res['data'].get('tiles', '-')} tiles"
+                  + (f"+{res['data']['ept_nodes']} nodes" if res["data"].get("ept_nodes") else "")
+                  if res["data"].get("points") else "no point clouds"),
         "notes": res["notes"],
         "water": water,
         "swaps": res["stats"].get("colour_changes_est"),

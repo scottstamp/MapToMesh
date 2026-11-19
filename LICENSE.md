@@ -39,6 +39,15 @@ selling prints.
   (<https://www.usgs.gov/information-policies-and-instructions/copyrights-and-credits>), served
   from the AWS Open Data registry or by Microsoft Planetary Computer. No attribution is
   required; "USGS 3DEP" is appreciated.
+- Elevation elsewhere: national and regional mapping agencies (IGN France, swisstopo, AHN, Ordnance
+  Survey / Environment Agency / Welsh and Scottish Governments, BEV, German state surveys, LINZ,
+  Geoscience Australia, Queensland, GSI Japan, ...) and the Copernicus DEM, each under its own open
+  licence. Every generated model lists the exact credit lines its sources require (in MapToMesh's
+  result panel and the 3MF description). A few collections restrict commercial use (e.g. some
+  Scottish LiDAR phases); a model that uses one shows a licence warning, and prints of that area
+  may not be sellable - check the warning before selling. The Copernicus DEM requires: "produced using Copernicus WorldDEM-30 © DLR
+  e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the
+  European Union and ESA; all rights reserved".
 - Water, rivers, roads and building footprints: OpenStreetMap data under the Open Database
   License 1.0 (<https://opendatacommons.org/licenses/odbl/1-0/>), via OpenFreeMap / OpenMapTiles
   vector tiles. Models and prints are Produced Works; credit "(c) OpenStreetMap contributors"

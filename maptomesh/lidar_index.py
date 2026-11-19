@@ -125,6 +125,9 @@ class Tile:
     project: str
     year: int
     bbox: tuple[float, float, float, float]
+    crs: str | None = None   # used when the file carries no CRS (e.g. "EPSG:2180+EPSG:9651")
+    provider: str = "nrcan"  # point-cloud provider key (for credits)
+    class_map: dict | None = None  # source class -> ASPRS class (e.g. GeoSN uses 20 for non-ground)
 
 
 class TileIndex:

@@ -133,13 +133,16 @@ class LidarResult:
     info: dict
 
 
-def _file_crs(reader: CopcReader) -> tuple[CRS | None, float]:
+def _file_crs(reader: CopcReader, fallback: str | None = None) -> tuple[CRS | None, float]:
     """Horizontal CRS of a file and the factor taking its Z values to metres (many 3DEP
-    projects use US survey feet; a horizontal-only CRS in feet implies heights in feet)."""
+    projects use US survey feet; a horizontal-only CRS in feet implies heights in feet).
+    ``fallback`` (e.g. "EPSG:3794") is used when the file has no CRS record."""
     try:
         crs = reader.header.parse_crs()
     except Exception:  # noqa: BLE001
         crs = None
+    if crs is None and fallback:
+        crs = CRS.from_user_input(fallback)
     if crs is None:
         return None, 1.0
     zf = 1.0
@@ -221,7 +224,7 @@ def _process_tile(tile: Tile, aoi: AOI, grid: Grid, resolution: float, cancel: t
     sel = (DecompressionSelection.base() | DecompressionSelection.Z
            | DecompressionSelection.CLASSIFICATION | DecompressionSelection.FLAGS)
     with CopcReader.open(tile.url, http_num_threads=8, decompression_selection=sel) as r:
-        crs, zf = _file_crs(r)
+        crs, zf = _file_crs(r, tile.crs)
         if crs is None:
             return None, "no CRS"
         to_file = Transformer.from_crs(aoi.crs, crs, always_xy=True)
@@ -244,6 +247,11 @@ def _process_tile(tile: Tile, aoi: AOI, grid: Grid, resolution: float, cancel: t
         if len(pts) == 0:
             return (footprint, None), "empty"
         cls = np.asarray(pts.classification, dtype=np.uint8)
+        if tile.class_map:
+            lut = np.arange(256, dtype=np.uint8)
+            for src_c, dst_c in tile.class_map.items():
+                lut[int(src_c)] = int(dst_c)
+            cls = lut[cls]
         keep = _keep(cls, pts)
         x = np.asarray(pts.x)[keep]
         y = np.asarray(pts.y)[keep]
@@ -339,6 +347,57 @@ def _plane_fit_ground(a: _Acc, shape: tuple[int, int], step: float) -> np.ndarra
     return out.ravel()
 
 
+class PointCloudProvider:
+    """Classified COPC point clouds outside the built-in NRCan / USGS sources. Subclasses set the
+    attributes and return ``Tile`` objects (COPC URLs; ``Tile.crs`` when the files have no CRS)."""
+    key: str = ""
+    label: str = ""
+    attribution: str = ""
+    licence: str = ""
+    regions: tuple = ()      # lon/lat boxes (w, s, e, n)
+    sample: tuple = ()       # (lat, lon, size_m) for tests/probe_sources.py
+    licence_note: str = ""   # restriction shown to the user whenever this provider's data is used
+
+    def covers(self, bbox) -> bool:
+        w, s, e, n = bbox
+        return any(w <= rx1 and e >= rx0 and s <= ry1 and n >= ry0 for rx0, ry0, rx1, ry1 in self.regions)
+
+    def tiles(self, bbox, max_items: int) -> list[Tile]:
+        raise NotImplementedError
+
+
+POINTCLOUD_PROVIDERS: list[PointCloudProvider] = []
+
+# credits for the built-in sources (registered providers carry their own)
+BUILTIN_CREDITS = {
+    "nrcan": ("NRCan CanElevation LiDAR (Canada)",
+              "Contains information licensed under the Open Government Licence - Canada (NRCan CanElevation)."),
+    "usgs": ("USGS 3DEP LiDAR (US)", "USGS 3D Elevation Program (public domain)."),
+}
+
+
+def provider_licence_note(key: str) -> str:
+    for p in POINTCLOUD_PROVIDERS:
+        if p.key == key:
+            return p.licence_note
+    return ""
+
+
+def provider_credit(key: str) -> tuple[str, str]:
+    """(label, attribution) of a point-cloud provider key."""
+    if key in BUILTIN_CREDITS:
+        return BUILTIN_CREDITS[key]
+    for p in POINTCLOUD_PROVIDERS:
+        if p.key == key:
+            return p.label, p.attribution
+    return key, ""
+
+
+def register_pointcloud(p: PointCloudProvider) -> PointCloudProvider:
+    POINTCLOUD_PROVIDERS.append(p)
+    return p
+
+
 def find_sources(bbox: tuple[float, float, float, float], index: TileIndex | None, us_source: str = "usgs",
                  max_items: int = 5000) -> tuple[list[Tile], list, list[str]]:
     """LiDAR covering ``bbox`` (lon/lat): COPC tiles (NRCan, Planetary Computer), AWS Entwine
@@ -353,24 +412,56 @@ def find_sources(bbox: tuple[float, float, float, float], index: TileIndex | Non
                 projects = usgs_ept.INDEX.query(bbox)
         except Exception as e:  # noqa: BLE001 - keep whatever the other provider has
             errors.append(f"USGS 3DEP search failed: {e}")
+    for p in POINTCLOUD_PROVIDERS:
+        if p.covers(bbox):
+            try:
+                found = p.tiles(bbox, max_items)
+                for t in found:
+                    t.provider = p.key
+                tiles += found
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{p.label} search failed: {type(e).__name__}: {e}")
     return tiles, projects, errors
+
+
+def empty_result(grid: Grid, info: dict | None = None) -> LidarResult:
+    """No point clouds at all (elevation models fill everything)."""
+    shape = grid.vshape
+    nan = lambda: np.full(shape, np.nan)  # noqa: E731
+    return LidarResult(nan(), np.zeros(shape), nan(), nan(), nan(), nan(), np.zeros(shape, bool),
+                       np.zeros(shape, bool), np.zeros(shape, np.float32), np.zeros(shape, bool),
+                       {"tiles": 0, "points": 0, "projects": [], "errors": [], "failed_tiles": 0, "coverage": 0.0,
+                        "providers": [], **(info or {})})
 
 
 def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: ProgressFn,
                 cancel: threading.Event | None = None, max_tiles: int = 2500,
-                workers: int = 6, us_source: str = "usgs") -> LidarResult:
+                workers: int = 6, us_source: str = "usgs", allow_empty: bool = False) -> LidarResult:
+    """Classified point clouds on the grid. With ``allow_empty`` an area without point clouds,
+    or one over the tile limit, returns an empty result (and a note) instead of raising, so that
+    elevation models can take over."""
     cancel = cancel or threading.Event()
     bbox = aoi.lonlat_bbox(margin=grid.step * 2)
     tiles, projects, search_errors = find_sources(bbox, index, us_source, max_tiles + 1)
+
+    def give_up(msg: str, note: str | None = None) -> LidarResult:
+        if not allow_empty:
+            raise RuntimeError(msg)
+        return empty_result(grid, {"errors": search_errors[:5], "skipped": [note] if note else []})
+
     if not tiles and not projects:
-        raise RuntimeError("No LiDAR point clouds (NRCan CanElevation or USGS 3DEP) cover this area. "
-                           "Enable the coverage overlay, or switch the source to HRDEM (Canada)."
-                           + (f" {search_errors[0]}" if search_errors else ""))
+        return give_up("No LiDAR point clouds (NRCan CanElevation or USGS 3DEP) cover this area. "
+                       "Enable the coverage overlay, or use elevation models only."
+                       + (f" {search_errors[0]}" if search_errors else ""))
     if len(tiles) > max_tiles:
-        raise RuntimeError(f"{len(tiles)} LiDAR tiles intersect this area (limit {max_tiles}). "
-                           "Pick a smaller area or use the HRDEM source.")
+        return give_up(f"{len(tiles)} LiDAR tiles intersect this area (limit {max_tiles}). "
+                       "Pick a smaller area or use elevation models only.",
+                       f"{len(tiles)} LiDAR tiles is over the {max_tiles} limit: used elevation models instead.")
     if projects and aoi.width_m * aoi.height_m > max_tiles * 1e6:
-        raise RuntimeError(f"Area over {max_tiles} km2: pick a smaller area for USGS 3DEP point clouds.")
+        return give_up(f"Area over {max_tiles} km2: pick a smaller area for USGS 3DEP point clouds.",
+                       f"Area over {max_tiles} km2 for USGS point clouds: used elevation models instead.")
+    provider_of = {t.project: t.provider for t in tiles}
+    provider_of.update({p.label: "usgs" for p in projects})
     # octree LOD giving ~1 point per (step/2)^2 at most
     resolution = max(grid.step * 0.7, 0.25)
     hit0, miss0, req0 = RANGE_CACHE.counters()
@@ -402,6 +493,8 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: Progres
         if cancel.is_set():
             raise Cancelled()
     if not jobs:
+        if allow_empty:
+            return empty_result(grid, {"errors": errors[:5]})
         raise RuntimeError("No LiDAR point clouds cover this area." + (f" {errors[0]}" if errors else ""))
     npts = 0
     done = 0
@@ -442,6 +535,9 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: Progres
                 f.cancel()
             raise
     if failed == len(jobs):
+        if allow_empty:
+            return empty_result(grid, {"errors": errors[-5:],
+                                       "skipped": ["Every LiDAR request failed: used elevation models instead."]})
         raise RuntimeError("All LiDAR requests failed: " + errors[-1])
 
     for label in ept_labels:
@@ -453,6 +549,7 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: Progres
     brd = np.full(n, np.nan); veg = np.full(n, np.nan); unc = np.full(n, np.nan); dens = np.zeros(n)
     bcls = np.zeros(n, bool); vcls = np.zeros(n, bool); cov = np.zeros(shape, bool)
     proj_info = []
+    used_providers: list[str] = []
     order = sorted(accs, key=lambda p: years.get(p, 0))
     for p in order:
         a = accs[p]
@@ -474,6 +571,9 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: Progres
                           "vegetation_classified": bool(has_v), "ground_classified": bool(has_ground_class)})
         dens[has] = a.total[has]
         cov |= a.covered
+        prov = provider_of.get(p, "nrcan")
+        if has.any() and prov not in used_providers:
+            used_providers.append(prov)
     rs = lambda a: a.reshape(shape)  # noqa: E731
     info = {
         "tiles": len(tiles),
@@ -485,6 +585,7 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: Progres
         "failed_tiles": failed,
         "coverage": float(cov.mean()),
         "query_resolution_m": resolution,
+        "providers": used_providers,
     }
     hit1, miss1, req1 = RANGE_CACHE.counters()
     info["downloaded_mb"] = round((miss1 - miss0) / 1e6, 1)

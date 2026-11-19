@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MapToMesh — Canadian LiDAR to 3MF</title>
+  <title>MapToMesh — LiDAR to 3D-printable maps</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
         integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
   <link rel="stylesheet" href="/static/style.css">
@@ -19,15 +19,18 @@
 <body>
 <aside id="sidebar">
   <header>
-    <h1>MapToMesh</h1>
-    <p class="sub">NRCan CanElevation + USGS 3DEP LiDAR → 3D-printable 3MF</p>
+    <div class="title-row">
+      <h1>MapToMesh</h1>
+      <a href="#" id="aboutLink" class="about-link">About / Donate</a>
+    </div>
+    <p class="sub">LiDAR &amp; elevation data → 3D-printable 3MF, anywhere on Earth</p>
     <div id="indexStatus" class="status"></div>
   </header>
 
   <section>
     <h2>1 · Area</h2>
     <div class="search">
-      <input id="search" type="search" placeholder="Search a place in Canada or the US…" autocomplete="off">
+      <input id="search" type="search" placeholder="Search a place…" autocomplete="off">
       <ul id="searchResults"></ul>
     </div>
     <label>Shape
@@ -55,8 +58,8 @@
     <h2>2 · Elevation data</h2>
     <label>Source
       <select autocomplete="off" id="source">
-        <option value="lidar">LiDAR point clouds (COPC, classified: NRCan + USGS 3DEP)</option>
-        <option value="hrdem">HRDEM 1 m mosaic (Canada only, faster for big areas)</option>
+        <option value="lidar">Best available: LiDAR point clouds, then elevation models</option>
+        <option value="dem">Elevation models only (faster for big areas)</option>
       </select>
     </label>
     <label title="Where point clouds for US areas come from (Canada always uses NRCan CanElevation)">US LiDAR source
@@ -256,6 +259,44 @@
   <div id="topview" hidden><img id="topImg" alt=""></div>
 </main>
 
+<dialog id="aboutDialog" aria-labelledby="aboutTitle">
+  <div class="about">
+    <button type="button" class="about-close" id="aboutClose" aria-label="Close">×</button>
+    <h2 id="aboutTitle">Welcome to MapToMesh</h2>
+    <p class="about-lead">Turn real LiDAR elevation data into 3D-printable, multi-colour terrain and city models.</p>
+    <ul>
+      <li>Pick any area <b>on Earth</b>: a coastline, a mountain, your neighbourhood. Canada, the US and France
+        get classified LiDAR point clouds; much of Europe, Japan, New Zealand and parts of Australia get
+        0.5-5 m elevation models; everywhere else uses the 30 m Copernicus model.</li>
+      <li>Elevation comes from public LiDAR surveys (NRCan CanElevation and USGS 3DEP); water, roads and
+        building outlines come from OpenStreetMap.</li>
+      <li>You get a <b>3MF file with one part per colour</b>, ready for Bambu Studio, OrcaSlicer or PrusaSlicer,
+        with flat water, clean shorelines and an optional frame, label and separate base plate.</li>
+    </ul>
+    <p class="about-steps"><b>Get started:</b> search a place or drag the box on the map, pick the size and
+      colours, then press <i>Generate 3MF</i>.</p>
+    <p>Free for personal use, and you can sell prints of the models you make (credit the map data, see the
+      <a href="https://github.com/scottstamp/MapToMesh/blob/main/LICENSE.md" target="_blank" rel="noopener">license</a>).
+      Source code and issues: <a href="https://github.com/scottstamp/MapToMesh" target="_blank" rel="noopener">github.com/scottstamp/MapToMesh</a></p>
+
+    <div class="donate">
+      <h3>Help keep it running</h3>
+      <p>MapToMesh is free, but hosting it isn't: every model is built on the server, and the elevation and
+        map data it downloads take bandwidth and storage. If it saved you time, or you're printing something
+        you love, a donation helps keep it online and free for everyone. Thank you!</p>
+      <a class="paypal" href="https://www.paypal.me/scottstamp" target="_blank" rel="noopener">Donate with PayPal</a>
+      <div class="crypto">
+        <div class="addr"><span class="coin">Ethereum</span><code>0x19B9CFdd9E601e87b523F1FDE3a4bf50879B0C12</code>
+          <button type="button" class="copy" data-copy="0x19B9CFdd9E601e87b523F1FDE3a4bf50879B0C12">Copy</button></div>
+        <div class="addr"><span class="coin">Bitcoin</span><code>bc1qd4mk6kgcuxxzcxnhea63hawm3qtg5cg4p07tk7</code>
+          <button type="button" class="copy" data-copy="bc1qd4mk6kgcuxxzcxnhea63hawm3qtg5cg4p07tk7">Copy</button></div>
+        <div class="addr"><span class="coin">Solana</span><code>umC5Mb7LKDqFshouCxhYQtawQ7rr4njCw3x7GCgG8ik</code>
+          <button type="button" class="copy" data-copy="umC5Mb7LKDqFshouCxhYQtawQ7rr4njCw3x7GCgG8ik">Copy</button></div>
+      </div>
+    </div>
+    <button type="button" class="primary" id="aboutStart">Start mapping</button>
+  </div>
+</dialog>
 <script type="module" src="/static/app.js"></script>
 </body>
 </html>

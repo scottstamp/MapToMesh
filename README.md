@@ -1,13 +1,17 @@
 # MapToMesh
 
-Generate 3D-printable, multi-colour **3MF** topographic / city models of anywhere in Canada and
-the US from **LiDAR point clouds** - **NRCan CanElevation** and **USGS 3DEP** (USGS's Entwine
-collection on AWS, or Microsoft Planetary Computer) - with an OpenStreetMap-based area picker.
+Generate 3D-printable, multi-colour **3MF** topographic / city models of **anywhere on Earth**,
+with an OpenStreetMap-based area picker. Each area uses the best elevation data available:
+classified **LiDAR point clouds** where they exist (Canada, the US, France, Switzerland, Poland,
+Slovenia, ...), 0.5–10 m national **elevation models** across much of Europe, Japan, New Zealand
+and parts of Australia, and the **Copernicus 30 m** model everywhere else (see
+[Elevation sources](#elevation-sources)).
 
 - Pick an area on an OpenStreetMap map (rectangle, rounded rectangle, circle, hexagon); the
   LiDAR coverage is shown as an overlay.
-- Elevation comes straight from the classified point clouds (ground, buildings, bridges, trees,
-  water) – or from the HRDEM 1 m mosaics for large areas.
+- Elevation comes straight from classified point clouds (ground, buildings, bridges, trees,
+  water) where available; gaps and other areas are filled from the highest-resolution elevation
+  model that covers them.
 - Colour by **land cover** (ground / water / buildings / roads & bridges / trees), by
   **elevation bands**, or single colour. Optional frame, base thickness, vertical exaggeration,
   max height, physical size / scale, and splitting into tiles for small print beds.
@@ -35,10 +39,11 @@ On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and co
    centre) or type the width/height. Drag the red outline to move it, or the white handles on its
    corners/edges to resize it (the opposite side stays put). The info box lists how many
    LiDAR tiles / which acquisition projects cover the area.
-2. **Elevation data** – *LiDAR point clouds* (default; NRCan in Canada, USGS 3DEP in the US,
-   both merged on the border) or *HRDEM 1 m mosaic* (Canada only). *US LiDAR source*: USGS 3DEP
-   on AWS (default; every project, kept current) or Microsoft Planetary Computer (a COPC snapshot
-   to about 2022 with gaps). Surface:
+2. **Elevation data** – *Best available* (default: point clouds, then elevation models, highest
+   resolution first) or *Elevation models only* (faster for big areas). The info box lists the
+   point-cloud projects and the elevation models that will fill the rest. *US LiDAR source*: USGS
+   3DEP on AWS (default; every project, kept current) or Microsoft Planetary Computer (a COPC
+   snapshot to about 2022 with gaps). Surface:
    bare terrain, terrain + buildings & bridges, or full surface including trees. *Detail* is the
    number of grid cells along the long side; the hint shows metres and millimetres per cell.
    *Cliff smoothing* only affects steep slopes; raise it if sea cliffs or bluffs still look rough.
@@ -87,6 +92,77 @@ On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and co
 The result shows an estimated number of filament changes. Slots are ordered light to dark (slicers
 that change in slot order then flush light into dark, which needs the least purge) and the result
 lists slicer tips (layer heights to use, flushing into infill/objects).
+
+## Elevation sources
+
+For every area MapToMesh combines sources, best first:
+
+1. **Classified LiDAR point clouds** (COPC / Entwine, read remotely: only the part of the octree
+   inside the area, at the detail the grid needs).
+2. **Elevation models** for everything the point clouds don't cover, highest resolution first.
+   Each one only fills what is still missing, and is shifted by its median height difference to
+   what is already placed (national height datums differ from each other by up to a metre or two),
+   so seams don't step. A provider whose download would be too large for the area is skipped in
+   favour of the next one.
+3. **Copernicus DEM 30 m** everywhere else (also sea and lakes outside the other sources).
+
+Elevation-model areas go through the same surface builder as point clouds: the terrain model is
+the ground and a surface model, where there is one, supplies "unclassified" heights that become
+buildings (OSM footprints) and trees. Terrain-only sources give bare terrain plus OSM features.
+The result panel lists the share of each source and the **credits** their licences require
+(also written into the 3MF description). The sources below allow commercial use of derived
+products (prints) with attribution; the few restricted collections that are used as a last resort
+come with a licence warning on the model (see *Limits*).
+
+| Region | Source | Data | Resolution |
+|---|---|---|---|
+| Global | Copernicus DEM 30 m (global) | surface model | 30 m |
+| Canada, US | NRCan CanElevation (Canada) | classified point cloud (COPC) | point cloud |
+| Canada, US | USGS 3DEP (US): AWS Entwine or Planetary Computer | classified point cloud | point cloud |
+| Canada, US | NRCan HRDEM 1-2 m (Canada) | terrain + surface | 1 m |
+| Canada, US | USGS 3DEP 10 m (US) | terrain | 10 m |
+| France, Benelux, Switzerland | IGN LiDAR HD (France) | classified point cloud (COPC) | point cloud |
+| France, Benelux, Switzerland | swisstopo swissSURFACE3D (Switzerland) | classified point cloud (COPC) | point cloud |
+| France, Benelux, Switzerland | IGN LiDAR HD 0.5 m (France) | terrain + surface | 0.5 m |
+| France, Benelux, Switzerland | swisstopo swissALTI3D 0.5 m (Switzerland) | terrain + surface | 0.5 m |
+| France, Benelux, Switzerland | AHN4 0.5 m (Netherlands) | terrain + surface | 0.5 m |
+| France, Benelux, Switzerland | Luxembourg LiDAR 2024 0.5 m | terrain + surface | 0.5 m |
+| France, Benelux, Switzerland | Digitaal Hoogtemodel Vlaanderen II 1 m (Flanders) | terrain + surface | 1 m |
+| France, Benelux, Switzerland | IGN RGE ALTI 1 m (France) | terrain | 1 m |
+| UK, Ireland, Spain, Italy | Scottish Remote Sensing Portal LiDAR 0.5-1 m (Scotland) | terrain + surface | 0.5 m |
+| UK, Ireland, Spain, Italy | South Tyrol LiDAR DTM/DSM 0.5 m (Italy, valleys) | terrain + surface | 0.5 m |
+| UK, Ireland, Spain, Italy | Welsh Government LiDAR 1 m 2020-23 (Wales) | terrain + surface | 1 m |
+| UK, Ireland, Spain, Italy | Environment Agency LiDAR 1 m (England) | terrain + surface | 1 m |
+| UK, Ireland, Spain, Italy | GSI / OPW open LiDAR 1-2 m (Ireland, partial) | terrain + surface | 1 m |
+| UK, Ireland, Spain, Italy | South Tyrol DTM/DSM 2.5 m (Italy) | terrain + surface | 2.5 m |
+| UK, Ireland, Spain, Italy | IGN MDT05 5 m (Spain) | terrain | 5 m |
+| Central Europe | Slovenia LiDAR (GURS CLSS / ARSO LSS, COPC mirror) | classified point cloud (COPC) | point cloud |
+| Central Europe | Poland LiDAR (GUGiK, COPC mirror) | classified point cloud (COPC) | point cloud |
+| Central Europe | Wallonia LiDAR 2021-2022 (SPW, COPC mirror) | classified point cloud (COPC) | point cloud |
+| Central Europe | Saxony LiDAR (GeoSN, COPC mirror) | classified point cloud (COPC) | point cloud |
+| Central Europe | BEV ALS 1 m (Austria) | terrain + surface | 1 m |
+| Central Europe | LGLN DGM1 1 m (Lower Saxony) | terrain + surface | 1 m |
+| Central Europe | Geobasis NRW DGM1/DOM1 1 m (North Rhine-Westphalia) | terrain + surface | 1 m |
+| Central Europe | LVermGeo DGM1/DOM1 1 m (Rhineland-Palatinate) | terrain + surface | 1 m |
+| Central Europe | LAiV DGM1/DOM1 1 m (Mecklenburg-Western Pomerania) | terrain + surface | 1 m |
+| Central Europe | Bayerische Vermessungsverwaltung DGM1 1 m (Bavaria) | terrain | 1 m |
+| Central Europe | LGB DGM1 1 m (Brandenburg, Berlin) | terrain | 1 m |
+| Central Europe | GeoSN DGM1 1 m (Saxony) | terrain | 1 m |
+| Nordics, Baltics, Arctic | Maa- ja Ruumiamet 1 m (Estonia) | terrain | 1 m |
+| Nordics, Baltics, Arctic | NLS 2 m (Finland) | terrain | 2 m |
+| Nordics, Baltics, Arctic | ArcticDEM 2 m (Arctic, surface model) | surface model | 2 m |
+| Nordics, Baltics, Arctic | ÍslandsDEM 10 m (Iceland) | surface model | 10 m |
+| Australia, New Zealand | LINZ LiDAR 1 m (New Zealand) | terrain + surface | 1 m |
+| Australia, New Zealand | Queensland LiDAR 1 m | terrain | 1 m |
+| Australia, New Zealand | Geoscience Australia LiDAR 5 m | terrain | 5 m |
+| Australia, New Zealand | LINZ contour DEM 8 m (New Zealand) | terrain | 8 m |
+| Japan, Hong Kong | CEDD LiDAR 2020 0.5 m (Hong Kong) | terrain + surface | 0.5 m |
+| Japan, Hong Kong | GSI 1-10 m (Japan) | terrain | 1 m |
+
+`tests/probe_sources.py` smoke-tests every provider on a sample area
+(`python tests/probe_sources.py --list` lists them). Research notes, endpoints and the sources
+that were left out (portals, logins, non-commercial licences, unreachable services) are in
+[docs/plans/international-sources.md](docs/plans/international-sources.md).
 
 ## How it works
 
@@ -165,6 +241,7 @@ web/ (Leaflet + three.js)  ──HTTP──>  maptomesh/server.py (FastAPI, back
 ```bash
 .venv/Scripts/python tests/test_mesh_unit.py                    # offline mesh/raster checks
 .venv/Scripts/python tests/test_partition.py                    # offline iso-line partition checks
+.venv/Scripts/python tests/probe_sources.py                    # every elevation provider, needs internet
 .venv/Scripts/python run.py --no-browser --port 8765            # in another terminal
 .venv/Scripts/python tests/integration.py                       # end-to-end, needs internet
 .venv/Scripts/python tests/validate_3mf.py some_model.3mf       # independent 3MF checker
@@ -174,7 +251,9 @@ The integration suite focuses on **St_Johns_2020_2** (downtown + harbour, a 10 k
 elevation-band model split into 4 tiles, Cape Spear running off the eastern edge of the data,
 Signal Hill full surface at high detail, and the HRDEM comparison), plus Ottawa and Hamilton
 regressions, the Chicago Loop (Planetary Computer), Niagara Falls (NRCan + USGS in one model),
-Seattle and the Grand Canyon (USGS on AWS). Each output is re-parsed and every part is checked for open edges, duplicate edges,
+Seattle and the Grand Canyon (USGS on AWS), and one area per international source family (Paris,
+Amsterdam, the Matterhorn, London, Snowdon, Hallstatt, Cologne, Krakow, Wellington, Brisbane, Fuji,
+Hong Kong, Lofoten, Teide, Everest) - each checks that the expected source supplied the data. Each output is re-parsed and every part is checked for open edges, duplicate edges,
 degenerate triangles and positive volume. Thumbnails land in `cache/integration/`.
 
 ## Configuration
@@ -184,11 +263,22 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 | `MAPTOMESH_CACHE` | `./cache` (tile index, elevation/OSM caches, outputs) |
 | `MAPTOMESH_VECTOR_TILES` | `https://tiles.openfreemap.org/planet` (any OpenMapTiles TileJSON) |
 | `MAPTOMESH_DATA_CACHE_GB` | `10` (size limit of the LiDAR / DEM range cache) |
+| `MAPTOMESH_SERVICE_CACHE_GB` | `2` (size limit of cached elevation-service responses) |
 
 ## Limits and known behaviour
 
-- Up to 2,500 LiDAR tiles per request (≈ 2,500 km²); use HRDEM for anything larger.
-- Areas outside LiDAR coverage are interpolated and reported in the result notes.
+- Up to 2,500 LiDAR tiles per request (≈ 2,500 km²); larger areas use elevation models. Each
+  elevation model has its own area limit (e.g. Hong Kong 25 km², German 1 m state tiles
+  20–120 km²); beyond it the next source is used.
+- Not covered at high resolution (Copernicus 30 m there): southern Norway (Kartverket was not
+  reachable from North America when this was built), Sweden and Denmark (need an account / API
+  token), most of Asia, Africa and South America.
+- **Licence warnings**: a few collections carry restrictions - Scotland's LiDAR phases II/III
+  (the survey contractor retains the commercial copyright) and Historic Environment Scotland
+  sets (Non-Commercial Government Licence). They are only used where no unrestricted data
+  exists, and a model that uses them shows a licence warning (result panel, notes and the 3MF
+  description).
+- Spain's national 5 m model comes in whole metres (stepped at large scales).
 - USGS 3DEP on Planetary Computer is a snapshot (projects up to about 2022) with gaps - e.g.
   Seattle, Miami, Manhattan, the Grand Canyon have no tiles there (the default AWS source has
   them). With Planetary Computer selected the map shows its tiles only when zoomed in. HRDEM is
@@ -198,7 +288,6 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
   ~28 MB); everything is cached afterwards.
 - Waterfalls are not modelled specially: a river and the pool below the falls form one water
   body whose level is smoothed between the two.
-- HRDEM has no classification: buildings come from OSM footprints, other raised objects count as trees.
 - On hilly terrain with trees/roads/buildings at every elevation, most layers still need every
   colour: a colour must be printed wherever its surface is visible. Fewer colours (e.g. trees in
   the ground colour) is the main lever there; the estimate in the result panel shows the effect.
@@ -211,12 +300,14 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
   [AWS Open Data registry](https://registry.opendata.aws/usgs-lidar/) (Entwine, footprints by
   Hobu) or [Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/dataset/3dep-lidar-copc)
   (subject to its terms of use).
+- Elsewhere: national and regional mapping agencies and Copernicus (see
+  [Elevation sources](#elevation-sources)); each model lists the exact credit lines.
 - Map tiles, roads, water and building footprints: © OpenStreetMap contributors (ODbL), served by
   [OpenFreeMap](https://openfreemap.org/); place search by Nominatim.
 - Please respect the tile and Nominatim usage policies; everything is cached locally.
-- Selling prints? The data sources allow it with credit: "Contains information licensed under
-  the Open Government Licence – Canada" (Canadian elevation) and "© OpenStreetMap contributors"
-  (e.g. in the listing or on a label). USGS data needs no credit, but "USGS 3DEP" is appreciated.
+- Selling prints? Every source used allows it with credit: copy the **Credits** shown with the
+  model (also in the 3MF description) plus "© OpenStreetMap contributors" into the listing or a
+  label.
 
 ## License
 

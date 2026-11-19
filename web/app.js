@@ -135,7 +135,7 @@ function enforceAspect(changed) {
 const map = L.map('map', { zoomControl: true }).setView([state.center.lat, state.center.lon], 14);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · LiDAR: <a href="https://open.canada.ca/data/en/dataset/7069387e-9986-4297-9f55-0288e9676947">NRCan CanElevation</a> (OGL-Canada) · <a href="https://www.usgs.gov/3d-elevation-program">USGS 3DEP</a> (<a href="https://registry.opendata.aws/usgs-lidar/">AWS</a> / <a href="https://planetarycomputer.microsoft.com/dataset/3dep-lidar-copc">Planetary Computer</a>)',
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · Elevation: NRCan, USGS, national mapping agencies, Copernicus (credits listed with each model)',
 }).addTo(map);
 
 const selection = L.polygon([], { color: '#c8553d', weight: 2, fillOpacity: 0.12 }).addTo(map);
@@ -378,16 +378,18 @@ async function checkCoverage() {
     const r = await fetch('/api/coverage', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ lat: state.center.lat, lon: state.center.lon, width_m: w, height_m: h,
-        grid_cells: parseInt($('gridCells').value), us_source: $('usSource').value }),
+        grid_cells: parseInt($('gridCells').value), us_source: $('usSource').value, source: $('source').value }),
     });
     const d = await r.json();
     box.className = 'info';
     if (!d.ready) { box.textContent = `LiDAR index loading… ${d.message || ''}`; return; }
+    // elevation models that fill whatever the point clouds don't cover (best resolution first)
+    const dems = (d.dem_sources || []).filter((x) => x.usable).map((x) => x.label);
+    const demText = dems.length ? `Elevation models: ${dems.join(' → ')}` : '';
     if (!d.tiles && !d.ept_projects) {
-      box.className = 'info warn';
-      box.textContent = 'No LiDAR point-cloud tiles here (NRCan / USGS 3DEP on Planetary Computer). In Canada try the HRDEM source, or move the area onto the shaded coverage.'
-        + (d.errors && d.errors.length ? `
-${d.errors[0]}` : '');
+      box.className = 'info';
+      box.innerText = ($('source').value === 'lidar' ? 'No LiDAR point clouds here.\n' : '') + demText
+        + (d.errors && d.errors.length ? `\n${d.errors[0]}` : '');
       return;
     }
     const projects = d.projects.map((p) => `${p.name}${p.year ? ' (' + p.year + ')' : ''}` + (p.tiles != null ? `: ${p.tiles}` : '')).join('\n');
@@ -398,8 +400,8 @@ ${d.errors[0]}` : '');
     const big = d.tiles > 300 || (d.ept_projects && d.area_km2 > 300);
     box.className = tooBig ? 'info err' : big ? 'info warn' : 'info';
     box.innerText = parts.join(' + ') +
-      (tooBig ? ` — over the ${d.max_tiles} limit, pick a smaller area` : big ? ' — large request' : '') +
-      `\n${projects}`;
+      (tooBig ? ` — over the ${d.max_tiles} limit: elevation models will be used` : big ? ' — large request' : '') +
+      `\n${projects}` + (demText ? `\nGaps: ${demText}` : '');
   } catch (e) { box.textContent = ''; }
 }
 
@@ -427,7 +429,7 @@ $('search').addEventListener('input', () => {
   const q = $('search').value.trim();
   if (q.length < 3) { $('searchResults').innerHTML = ''; return; }
   searchTimer = setTimeout(async () => {
-    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&countrycodes=ca,us&limit=6&q=${encodeURIComponent(q)}`;
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=6&q=${encodeURIComponent(q)}`;
     try {
       const res = await (await fetch(url, { headers: { 'Accept-Language': navigator.language || 'en' } })).json();
       $('searchResults').innerHTML = '';
@@ -466,6 +468,10 @@ const OPTION_IDS = { shape: 'shape', corner_radius_mm: 'cornerMm', source: 'sour
   tiles_y: 'tilesY', flatten_water: 'flattenWater', water_recess_mm: 'waterRecess', shore_slope_deg: 'shoreSlope', voids_as_water: 'voidsWater',
   osm_water: 'osmWater', osm_streams: 'osmStreams', river_min_width_mm: 'riverMin', osm_roads: 'osmRoads', road_min_width_mm: 'roadMin', road_emboss_mm: 'roadEmboss',
   color_mode: 'colorMode', min_region_mm2: 'minRegion', color_depth_mm: 'colorDepth', swap_patch_budget_mm2: 'swapBudget', elevation_water: 'elevWater', layout: 'layout', name: 'name' };
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
 
 // visible label of a form field (its <label>'s own text, without option texts)
 function fieldLabel(el) {
@@ -660,7 +666,8 @@ async function poll() {
       return;
     }
     if (j.state === 'error' || j.state === 'cancelled') {
-      finish(); $('progressMsg').textContent = j.state === 'error' ? `Error: ${j.error}` : 'Cancelled'; return;
+      finish(); $('progressMsg').textContent = j.state === 'error' ? `Error: ${j.error}` : 'Cancelled';
+      return;
     }
   } catch (e) { /* transient */ }
   state.pollTimer = setTimeout(poll, 700);
@@ -675,7 +682,8 @@ function showResult(j) {
   const cc = r.color_changes.length
     ? `<h2>Single-extruder colour changes</h2><ul class="filaments">${r.color_changes.map((c) => `<li><span class="swatch" style="background:${c.color}"></span>at Z = ${c.z_mm.toFixed(2)} mm${c.elevation_m != null ? ` (${c.elevation_m} m)` : ''}</li>`).join('')}</ul><p class="hint">Add a filament change / pause at these heights (round to your layer height).</p>`
     : '';
-  const notes = [...(r.notes || []), ...(r.data.failed_tiles ? [`${r.data.failed_tiles} tile(s) failed to download.`] : [])];
+  const notes = [...(r.notes || []).filter((n) => !n.startsWith('Licence restriction:')),  // own row below
+    ...(r.data.failed_tiles ? [`${r.data.failed_tiles} tile(s) failed to download.`] : [])];
   const projects = (r.data.projects || []).map((p) => p.name + (p.year ? ` (${p.year})` : '')).join(', ');
   $('result').innerHTML = `
     <h2>Result</h2>
@@ -694,6 +702,9 @@ function showResult(j) {
       <dt>Mesh</dt><dd>${s.triangles.toLocaleString()} triangles, ${s.parts} parts</dd>
       ${s.colour_changes_est != null ? `<dt>Colour changes</dt><dd>≈ ${s.colour_changes_est.toLocaleString()} at 0.2 mm layers (max ${s.max_colours_per_layer} colours in a layer)</dd>` : ''}
       ${r.data.points ? `<dt>LiDAR</dt><dd>${(r.data.points / 1e6).toFixed(1)} M points from ${[r.data.tiles ? `${r.data.tiles} tiles` : '', r.data.ept_nodes ? `${r.data.ept_nodes} USGS octree nodes (AWS)` : ''].filter(Boolean).join(' + ')}</dd>` : ''}
+      ${(r.data.sources || []).length ? `<dt>Data sources</dt><dd>${r.data.sources.filter((s) => s.share >= 0.0005).map((s) => `${escapeHtml(s.label)} ${(100 * s.share).toFixed(0)}%`).join('<br>')}</dd>` : ''}
+      ${(r.data.licence_warnings || []).length ? `<dt>Licence</dt><dd class="licence-warn">⚠ ${r.data.licence_warnings.map(escapeHtml).join('<br>⚠ ')}</dd>` : ''}
+      ${(r.data.attribution || []).length ? `<dt>Credits</dt><dd class="credits">${r.data.attribution.map(escapeHtml).join('<br>')}<br>Map data © OpenStreetMap contributors (ODbL)</dd>` : ''}
       ${projects ? `<dt>Projects</dt><dd>${projects}</dd>` : ''}
       ${r.data.items ? `<dt>HRDEM</dt><dd>${r.data.items.join(', ')}</dd>` : ''}
     </dl>
@@ -793,6 +804,30 @@ function selectTab(name) {
 }
 document.querySelectorAll('#tabs button').forEach((b) => b.addEventListener('click', () => selectTab(b.dataset.tab)));
 
+// ------------------------------------------------------------------ about / donate
+const ABOUT_KEY = 'maptomesh.about.seen.v1';
+const aboutDialog = $('aboutDialog');
+function openAbout() { if (!aboutDialog.open) aboutDialog.showModal(); }
+aboutDialog.addEventListener('close', () => localStorage.setItem(ABOUT_KEY, '1'));
+aboutDialog.addEventListener('click', (e) => { if (e.target === aboutDialog) aboutDialog.close(); });  // backdrop
+$('aboutClose').onclick = () => aboutDialog.close();
+$('aboutStart').onclick = () => aboutDialog.close();
+$('aboutLink').onclick = (e) => { e.preventDefault(); openAbout(); };
+aboutDialog.querySelectorAll('.copy').forEach((btn) => {
+  btn.onclick = async () => {
+    const text = btn.dataset.copy;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (err) {  // no clipboard API (non-secure context): select the address instead
+      const sel = window.getSelection(); const r = document.createRange();
+      r.selectNodeContents(btn.previousElementSibling); sel.removeAllRanges(); sel.addRange(r);
+      document.execCommand('copy');
+    }
+    btn.textContent = 'Copied'; btn.classList.add('done');
+    setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1600);
+  };
+});
+
 // ------------------------------------------------------------------ wiring
 buildColorInputs();
 loadSettings();
@@ -805,6 +840,8 @@ scheduleUsCoverage();
 
 // reopen a finished job from the URL (?job=<id>)
 const jobParam = new URLSearchParams(location.search).get('job');
+// first visit: introduce the tool (not over a shared result link - the About link is always there)
+if (!jobParam && !localStorage.getItem(ABOUT_KEY)) openAbout();
 if (jobParam) {
   fetch(`/api/jobs/${jobParam}`).then((r) => (r.ok ? r.json() : null)).then((j) => {
     if (j && j.state === 'done') { state.jobId = j.id; applyOptions(j.options); showResult(j); }
@@ -820,6 +857,7 @@ $('colorMode').onchange = () => { fillPresets(); updateDerived(); saveSettings()
 $('preset').onchange = applyPreset;
 $('bandCount').oninput = () => { renderBandInputs(); saveSettings(); };
 $('usSource').addEventListener('change', () => { scheduleUsCoverage(); scheduleCoverage(); });
+$('source').addEventListener('change', scheduleCoverage);
 $('showCoverage').onchange = () => {
   scheduleUsCoverage();
   if (!coverageLayer) return;
