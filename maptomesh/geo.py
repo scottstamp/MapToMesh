@@ -29,15 +29,17 @@ class AOI:
 
     @cached_property
     def crs(self) -> CRS:
-        # Local transverse Mercator: true scale at the AOI centre.
+        # Local transverse Mercator: true scale at the AOI centre. The datum matters: without one,
+        # PROJ converts CRSs on other datums (OSGB36, RD/Amersfoort, CH1903+, HK1980, ...) to it
+        # without a datum shift, which put their data 100-300 m off OpenStreetMap.
         return CRS.from_proj4(
             f"+proj=tmerc +lat_0={self.lat} +lon_0={self.lon} +k=1 +x_0=0 +y_0=0 "
-            "+ellps=GRS80 +units=m +no_defs"
+            "+datum=WGS84 +units=m +no_defs"
         )
 
     @cached_property
     def to_lonlat(self) -> Transformer:
-        return Transformer.from_crs(self.crs, CRS.from_epsg(4617), always_xy=True)
+        return Transformer.from_crs(self.crs, CRS.from_epsg(4326), always_xy=True)
 
     def outline_local(self, margin: float = 0.0, n: int = 16) -> np.ndarray:
         """Densified rectangle boundary in local metres (n points per side)."""
