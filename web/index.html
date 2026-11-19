@@ -31,7 +31,7 @@
       <ul id="searchResults"></ul>
     </div>
     <label>Shape
-      <select id="shape">
+      <select autocomplete="off" id="shape">
         <option value="rectangle">Rectangle</option>
         <option value="rounded">Rounded rectangle</option>
         <option value="circle">Circle</option>
@@ -39,14 +39,14 @@
       </select>
     </label>
     <div class="row">
-      <label>Width (km)<input id="widthKm" type="number" step="0.05" min="0.05" value="1.5"></label>
-      <label>Height (km)<input id="heightKm" type="number" step="0.05" min="0.05" value="1.5"></label>
+      <label>Width (km)<input autocomplete="off" id="widthKm" type="number" step="0.05" min="0.05" value="1.5"></label>
+      <label>Height (km)<input autocomplete="off" id="heightKm" type="number" step="0.05" min="0.05" value="1.5"></label>
     </div>
     <div class="row">
       <button id="drawBtn" class="secondary" title="Drag on the map to draw the area">✎ Draw on map</button>
       <button id="centerBtn" class="secondary" title="Centre the area on the current map view">⌖ Centre on view</button>
     </div>
-    <label class="check"><input id="showCoverage" type="checkbox" checked> Show LiDAR coverage
+    <label class="check"><input autocomplete="off" id="showCoverage" type="checkbox" checked> Show LiDAR coverage
       <span id="usCovHint" class="hint"></span></label>
     <div id="coverageInfo" class="info"></div>
   </section>
@@ -54,123 +54,123 @@
   <section>
     <h2>2 · Elevation data</h2>
     <label>Source
-      <select id="source">
+      <select autocomplete="off" id="source">
         <option value="lidar">LiDAR point clouds (COPC, classified: NRCan + USGS 3DEP)</option>
         <option value="hrdem">HRDEM 1 m mosaic (Canada only, faster for big areas)</option>
       </select>
     </label>
     <label title="Where point clouds for US areas come from (Canada always uses NRCan CanElevation)">US LiDAR source
-      <select id="usSource">
+      <select autocomplete="off" id="usSource">
         <option value="usgs">USGS 3DEP on AWS (Entwine, complete and current)</option>
         <option value="planetary">Microsoft Planetary Computer (COPC snapshot to ~2022)</option>
       </select>
     </label>
     <label>Surface
-      <select id="surface">
+      <select autocomplete="off" id="surface">
         <option value="terrain">Bare terrain</option>
         <option value="buildings" selected>Terrain + buildings &amp; bridges</option>
         <option value="full">Full surface (incl. trees)</option>
       </select>
     </label>
     <label>Detail: <b id="gridCellsOut"></b> cells on long side
-      <input id="gridCells" type="range" min="150" max="2000" step="50" value="600">
+      <input autocomplete="off" id="gridCells" type="range" min="150" max="2000" step="50" value="600">
     </label>
     <div id="detailInfo" class="hint"></div>
     <label>Terrain smoothing <b id="smoothingOut"></b>
-      <input id="smoothing" type="range" min="0" max="4" step="0.25" value="0">
+      <input autocomplete="off" id="smoothing" type="range" min="0" max="4" step="0.25" value="0">
     </label>
     <label title="Extra smoothing applied only on steep slopes (cliffs, bluffs), where LiDAR ground is sparse and noisy">
       Cliff smoothing <b id="cliffOut"></b>
-      <input id="cliffSmoothing" type="range" min="0" max="4" step="0.25" value="1">
+      <input autocomplete="off" id="cliffSmoothing" type="range" min="0" max="4" step="0.25" value="1">
     </label>
   </section>
 
   <section>
     <h2>3 · Print</h2>
     <div class="row">
-      <label>Size, long side (mm)<input id="sizeMm" type="number" min="20" max="2000" step="5" value="200"></label>
-      <label>Scale<input id="scaleOut" type="text" readonly></label>
+      <label>Size, long side (mm)<input autocomplete="off" id="sizeMm" type="number" min="20" max="2000" step="5" value="200"></label>
+      <label>Scale<input autocomplete="off" id="scaleOut" type="text" readonly></label>
     </div>
     <div class="row">
-      <label>Base (mm)<input id="baseMm" type="number" min="0.4" step="0.2" value="3"></label>
-      <label>Min. terrain (mm)<input id="floorMm" type="number" min="0.2" step="0.1" value="1.5"
+      <label>Base (mm)<input autocomplete="off" id="baseMm" max="50" type="number" min="0.4" step="0.2" value="3"></label>
+      <label>Min. terrain (mm)<input autocomplete="off" id="floorMm" max="50" type="number" min="0.2" step="0.1" value="1.5"
               title="Thickness of the lowest terrain above the base"></label>
     </div>
     <label class="check" title="The model starts on top of the base and the base plate becomes its own single-colour file, freeing a filament slot. Glue them together after printing.">
-      <input id="baseSeparate" type="checkbox"> Print base plate separately (separate file)</label>
+      <input autocomplete="off" id="baseSeparate" type="checkbox"> Print base plate separately (separate file)</label>
     <div id="lipOpts">
       <label class="check" title="A raised lip around the separate base locates the model (like a tray)">
-        <input id="baseLip" type="checkbox" checked> Locating lip on the base plate</label>
+        <input autocomplete="off" id="baseLip" type="checkbox" checked> Locating lip on the base plate</label>
       <div class="row">
-        <label>Lip height (mm)<input id="lipH" type="number" min="0.2" step="0.2" value="1.2"></label>
-        <label>Lip width (mm)<input id="lipW" type="number" min="0.4" step="0.2" value="1.6"></label>
-        <label>Clearance (mm)<input id="lipC" type="number" min="0" step="0.05" value="0.2"></label>
+        <label>Lip height (mm)<input autocomplete="off" id="lipH" max="10" type="number" min="0.2" step="0.2" value="1.2"></label>
+        <label>Lip width (mm)<input autocomplete="off" id="lipW" max="10" type="number" min="0.4" step="0.2" value="1.6"></label>
+        <label>Clearance (mm)<input autocomplete="off" id="lipC" max="2" type="number" min="0" step="0.05" value="0.2"></label>
       </div>
     </div>
     <label>Vertical exaggeration: <b id="zExOut"></b>×
-      <input id="zEx" type="range" min="0.5" max="10" step="0.1" value="1">
+      <input autocomplete="off" id="zEx" type="range" min="0.5" max="10" step="0.1" value="1">
     </label>
     <div class="row">
-      <label>Max height (mm)<input id="maxHeight" type="number" min="1" step="1" placeholder="none"></label>
-      <label id="cornerWrap">Corner radius (mm)<input id="cornerMm" type="number" min="0" step="1" value="12"></label>
+      <label>Max height (mm)<input autocomplete="off" id="maxHeight" max="500" type="number" min="1" step="1" placeholder="none"></label>
+      <label id="cornerWrap">Corner radius (mm)<input autocomplete="off" id="cornerMm" max="500" type="number" min="0" step="1" value="12"></label>
     </div>
-    <label class="check"><input id="frame" type="checkbox"> Frame / border</label>
+    <label class="check"><input autocomplete="off" id="frame" type="checkbox"> Frame / border</label>
     <div class="row" id="frameOpts">
-      <label>Width (mm)<input id="frameW" type="number" min="1" step="0.5" value="6"></label>
-      <label>Height above base (mm)<input id="frameH" type="number" min="0" step="0.5" value="2"></label>
+      <label>Width (mm)<input autocomplete="off" id="frameW" max="100" type="number" min="1" step="0.5" value="6"></label>
+      <label>Height above base (mm)<input autocomplete="off" id="frameH" max="200" type="number" min="0" step="0.5" value="2"></label>
     </div>
     <div id="labelOpts">
-      <label class="check"><input id="label" type="checkbox"> Label on the frame (name, scale bar, north arrow)</label>
+      <label class="check"><input autocomplete="off" id="label" type="checkbox"> Label on the frame (name, scale bar, north arrow)</label>
       <div id="labelMore">
-        <label>Label text<input id="labelText" type="text" placeholder="model name"></label>
+        <label>Label text<input autocomplete="off" id="labelText" type="text" placeholder="model name"></label>
         <div class="row">
-          <label class="check"><input id="labelScale" type="checkbox" checked> Scale bar</label>
-          <label class="check"><input id="labelNorth" type="checkbox" checked> North arrow</label>
+          <label class="check"><input autocomplete="off" id="labelScale" type="checkbox" checked> Scale bar</label>
+          <label class="check"><input autocomplete="off" id="labelNorth" type="checkbox" checked> North arrow</label>
         </div>
       </div>
     </div>
     <h2 style="margin-top:14px">Printer</h2>
     <div class="row">
       <label title="Colour boundaries, water surfaces and band heights are aligned to this layer grid">
-        Layer height (mm)<input id="layerH" type="number" min="0.04" step="0.02" value="0.2"></label>
-      <label>First layer (mm)<input id="firstLayer" type="number" min="0.04" step="0.02" value="0.2"></label>
+        Layer height (mm)<input autocomplete="off" id="layerH" max="1" type="number" min="0.04" step="0.02" value="0.2"></label>
+      <label>First layer (mm)<input autocomplete="off" id="firstLayer" max="1" type="number" min="0.04" step="0.02" value="0.2"></label>
     </div>
     <div class="row">
       <label title="Buildings smaller than this are enlarged, gaps narrower than this are closed, thinner tree slivers dropped (about your nozzle width)">
-        Min feature (mm)<input id="minFeature" type="number" min="0" step="0.05" value="0.5"></label>
+        Min feature (mm)<input autocomplete="off" id="minFeature" max="5" type="number" min="0" step="0.05" value="0.5"></label>
       <label title="Near-flat surfaces are merged into larger triangles as long as they stay within this distance of the terrain">
-        Simplify (mm)<input id="simplify" type="number" min="0" step="0.01" value="0.05"></label>
+        Simplify (mm)<input autocomplete="off" id="simplify" max="0.5" type="number" min="0" step="0.01" value="0.05"></label>
     </div>
     <div class="row">
-      <label>Split into tiles: X<input id="tilesX" type="number" min="1" max="8" value="1"></label>
-      <label>Y<input id="tilesY" type="number" min="1" max="8" value="1"></label>
+      <label>Split into tiles: X<input autocomplete="off" id="tilesX" type="number" min="1" max="8" value="1"></label>
+      <label>Y<input autocomplete="off" id="tilesY" type="number" min="1" max="8" value="1"></label>
     </div>
     <div id="tileInfo" class="hint"></div>
   </section>
 
   <section>
     <h2>4 · Water &amp; roads</h2>
-    <label class="check"><input id="flattenWater" type="checkbox" checked> Flatten water bodies</label>
-    <label class="check"><input id="voidsWater" type="checkbox" checked> Treat LiDAR voids as water</label>
-    <label class="check"><input id="osmWater" type="checkbox" checked> Use OpenStreetMap water</label>
+    <label class="check"><input autocomplete="off" id="flattenWater" type="checkbox" checked> Flatten water bodies</label>
+    <label class="check"><input autocomplete="off" id="voidsWater" type="checkbox" checked> Treat LiDAR voids as water</label>
+    <label class="check"><input autocomplete="off" id="osmWater" type="checkbox" checked> Use OpenStreetMap water</label>
     <div class="row">
       <label>OSM rivers &amp; streams
-        <select id="osmStreams">
+        <select autocomplete="off" id="osmStreams">
           <option value="all" selected>Rivers + streams</option>
           <option value="rivers">Rivers only</option>
           <option value="none">None</option>
         </select>
       </label>
       <label title="Narrow rivers and streams are widened to at least this printed width so they stay continuous">
-        Min river width (mm)<input id="riverMin" type="number" min="0.2" step="0.1" value="0.8"></label>
+        Min river width (mm)<input autocomplete="off" id="riverMin" max="10" type="number" min="0.2" step="0.1" value="0.8"></label>
     </div>
     <div class="row">
-      <label>Water recess (mm)<input id="waterRecess" type="number" min="0" step="0.1" value="0.6"></label>
+      <label>Water recess (mm)<input autocomplete="off" id="waterRecess" max="20" type="number" min="0" step="0.1" value="0.6"></label>
       <label title="Cliffs and banks descend to the water at most this steep, ending in one even edge along the shoreline (90 = vertical walls)">
-        Max shore slope (°)<input id="shoreSlope" type="number" min="20" max="90" step="5" value="70"></label>
+        Max shore slope (°)<input autocomplete="off" id="shoreSlope" type="number" min="20" max="90" step="5" value="70"></label>
     </div>
     <label>OpenStreetMap roads
-      <select id="osmRoads">
+      <select autocomplete="off" id="osmRoads">
         <option value="none">None</option>
         <option value="major">Major roads</option>
         <option value="medium" selected>Major + residential</option>
@@ -178,56 +178,56 @@
       </select>
     </label>
     <div class="row">
-      <label>Min road width (mm)<input id="roadMin" type="number" min="0.1" step="0.1" value="0.6"></label>
-      <label>Road emboss (mm)<input id="roadEmboss" type="number" step="0.1" value="0"></label>
+      <label>Min road width (mm)<input autocomplete="off" id="roadMin" max="10" type="number" min="0.1" step="0.1" value="0.6"></label>
+      <label>Road emboss (mm)<input autocomplete="off" id="roadEmboss" max="5" min="-5" type="number" step="0.1" value="0"></label>
     </div>
   </section>
 
   <section>
     <h2>5 · Colours</h2>
     <label>Mode
-      <select id="colorMode">
+      <select autocomplete="off" id="colorMode">
         <option value="single">Single colour</option>
         <option value="landcover" selected>Land cover (water / buildings / roads / trees)</option>
         <option value="elevation">Elevation bands</option>
       </select>
     </label>
     <div id="presetRow" class="row">
-      <label>Preset<select id="preset"></select></label>
+      <label>Preset<select autocomplete="off" id="preset"></select></label>
     </div>
     <div id="colorsSingle" class="colors"></div>
     <div id="colorsLandcover" class="colors"></div>
     <div id="colorsElevation">
       <div class="row">
-        <label>Bands<input id="bandCount" type="number" min="2" max="10" value="5"></label>
+        <label>Bands<input autocomplete="off" id="bandCount" type="number" min="2" max="10" value="5"></label>
         <label>Split
-          <select id="bandMode"><option value="equal">Equal height</option><option value="quantile">Equal area</option></select>
+          <select autocomplete="off" id="bandMode"><option value="equal">Equal height</option><option value="quantile">Equal area</option></select>
         </label>
       </div>
       <div id="bandColors" class="colors"></div>
-      <label>Custom thresholds (m, comma-separated)<input id="bandThresholds" type="text" placeholder="auto"></label>
-      <label class="check"><input id="elevWater" type="checkbox" checked> Separate flat water colour (needs AMS / multi-material)</label>
+      <label>Custom thresholds (m, comma-separated)<input autocomplete="off" id="bandThresholds" type="text" placeholder="auto"></label>
+      <label class="check"><input autocomplete="off" id="elevWater" type="checkbox" checked> Separate flat water colour (needs AMS / multi-material)</label>
     </div>
     <div id="colorsCommon" class="colors"></div>
     <div id="waterColorWrap" class="colors"></div>
     <div id="depthWrap">
       <label>Colour depth (mm)
-        <input id="colorDepth" type="number" min="0" step="0.2" value="1"
+        <input autocomplete="off" id="colorDepth" max="50" type="number" min="0" step="0.2" value="1"
                title="Water, roads, trees and building bases are only coloured this deep below the surface; everything underneath is ground colour, so most layers need no filament swaps. 0 = full-height colour columns.">
       </label>
       <label title="Small patches (a lone pond, a hilltop house...) that are the only reason their colour is needed in some layers are recoloured to ground, best savings first, up to this total area. 0 = off.">
         Drop swap-only patches, up to (mm²)
-        <input id="swapBudget" type="number" min="0" step="10" value="50">
+        <input autocomplete="off" id="swapBudget" max="5000" type="number" min="0" step="10" value="50">
       </label>
     </div>
-    <label>Merge colour islands smaller than (mm²)<input id="minRegion" type="number" min="0" step="0.1" value="1"></label>
+    <label>Merge colour islands smaller than (mm²)<input autocomplete="off" id="minRegion" max="100" type="number" min="0" step="0.1" value="1"></label>
   </section>
 
   <section>
     <h2>6 · Output</h2>
-    <label>Name<input id="name" type="text" value="MapToMesh"></label>
+    <label>Name<input autocomplete="off" id="name" type="text" value="MapToMesh"></label>
     <label>3MF layout
-      <select id="layout">
+      <select autocomplete="off" id="layout">
         <option value="parts">One object, one part per colour (Bambu/Orca/Prusa)</option>
         <option value="objects">Separate objects</option>
       </select>
@@ -235,6 +235,7 @@
   </section>
 
   <div id="actions">
+    <div id="settingsNote" class="info warn" hidden></div>
     <button id="generateBtn" class="primary">Generate 3MF</button>
     <button id="cancelBtn" class="secondary" hidden>Cancel</button>
     <div id="progress" hidden><div id="bar"></div></div>

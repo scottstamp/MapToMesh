@@ -456,6 +456,68 @@ const FIELDS = ['shape', 'widthKm', 'heightKm', 'source', 'surface', 'gridCells'
   'colorDepth', 'swapBudget', 'elevWater',
   'name', 'layout', 'showCoverage'];
 
+// option name (server) -> form element id
+const OPTION_IDS = { shape: 'shape', corner_radius_mm: 'cornerMm', source: 'source', us_source: 'usSource', surface: 'surface', grid_cells: 'gridCells',
+  smoothing: 'smoothing', cliff_smoothing: 'cliffSmoothing', base_separate: 'baseSeparate', base_lip: 'baseLip',
+  lip_height_mm: 'lipH', lip_width_mm: 'lipW', lip_clearance_mm: 'lipC', label: 'label', label_text: 'labelText',
+  label_scale_bar: 'labelScale', label_north: 'labelNorth', layer_height_mm: 'layerH', first_layer_mm: 'firstLayer',
+  min_feature_mm: 'minFeature', simplify_mm: 'simplify', size_mm: 'sizeMm', base_mm: 'baseMm', floor_mm: 'floorMm', z_exaggeration: 'zEx',
+  max_height_mm: 'maxHeight', frame: 'frame', frame_width_mm: 'frameW', frame_height_mm: 'frameH', tiles_x: 'tilesX',
+  tiles_y: 'tilesY', flatten_water: 'flattenWater', water_recess_mm: 'waterRecess', shore_slope_deg: 'shoreSlope', voids_as_water: 'voidsWater',
+  osm_water: 'osmWater', osm_streams: 'osmStreams', river_min_width_mm: 'riverMin', osm_roads: 'osmRoads', road_min_width_mm: 'roadMin', road_emboss_mm: 'roadEmboss',
+  color_mode: 'colorMode', min_region_mm2: 'minRegion', color_depth_mm: 'colorDepth', swap_patch_budget_mm2: 'swapBudget', elevation_water: 'elevWater', layout: 'layout', name: 'name' };
+
+// visible label of a form field (its <label>'s own text, without option texts)
+function fieldLabel(el) {
+  const lab = el.closest('label');
+  if (!lab) return el.id;
+  const t = [...lab.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join(' ').replace(/\s+/g, ' ').trim();
+  return t || el.id;
+}
+function rangeText(el) {
+  return el.min !== '' && el.max !== '' ? `${el.min} to ${el.max}` : el.min !== '' ? `at least ${el.min}` : `at most ${el.max}`;
+}
+// a saved value still fits the field (inputs change between versions: ranges, options)
+function fitsField(el, v) {
+  if (el.type === 'checkbox') return typeof v === 'boolean';
+  if (el.type === 'number' || el.type === 'range') {
+    if (v === '' || v === null) return el.type === 'number';
+    const x = parseFloat(v);
+    if (!Number.isFinite(x)) return false;
+    return !(el.min !== '' && x < parseFloat(el.min)) && !(el.max !== '' && x > parseFloat(el.max));
+  }
+  if (el.tagName === 'SELECT') return [...el.options].some((o) => o.value === String(v));
+  return true;
+}
+function showSettingsNote(msg) {
+  const el = $('settingsNote');
+  el.hidden = !msg;
+  el.innerText = msg || '';
+}
+// out-of-range number fields (hidden ones too: the server checks every option)
+function invalidFields() {
+  const bad = [];
+  for (const id of new Set([...FIELDS, ...Object.values(OPTION_IDS)])) {
+    const el = $(id);
+    if (!el || el.type !== 'number' || el.value === '') continue;
+    if (el.validity.badInput || el.validity.rangeUnderflow || el.validity.rangeOverflow) {
+      bad.push(`${fieldLabel(el)}: ${el.value} (allowed ${rangeText(el)})`);
+    }
+  }
+  return bad;
+}
+// FastAPI / pydantic validation errors -> "Simplify (mm): must be less than or equal to 0.5 (got 1)"
+function describeError(d) {
+  if (typeof d.detail === 'string') return d.detail;
+  if (!Array.isArray(d.detail)) return JSON.stringify(d.detail ?? d);
+  return d.detail.map((e) => {
+    const key = (e.loc || []).slice(-1)[0];
+    const el = OPTION_IDS[key] && $(OPTION_IDS[key]);
+    const msg = String(e.msg || '').replace(/^Input should be /, 'must be ');
+    return `${el ? fieldLabel(el) : key}: ${msg}` + ('input' in e ? ` (got ${JSON.stringify(e.input)})` : '');
+  }).join('\n');
+}
+
 function saveSettings() {
   const s = { center: state.center, zoom: map.getZoom(), mapCenter: map.getCenter(), colors: {} };
   for (const f of FIELDS) { const el = $(f); s[f] = el.type === 'checkbox' ? el.checked : el.value; }
@@ -466,10 +528,15 @@ function loadSettings() {
   let s;
   try { s = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (e) { s = null; }
   if (!s) return;
+  const reset = [];
   for (const f of FIELDS) {
     if (!(f in s)) continue;
     const el = $(f);
+    if (!fitsField(el, s[f])) { reset.push(`${fieldLabel(el)} (${JSON.stringify(s[f])})`); continue; }
     if (el.type === 'checkbox') el.checked = s[f]; else el.value = s[f];
+  }
+  if (reset.length) {
+    showSettingsNote(`Reset to defaults, the saved values no longer fit: ${reset.join(', ')}.`);
   }
   if (s.center) state.center = s.center;
   const bands = Object.keys(s.colors || {}).filter((k) => k.startsWith('band')).sort((a, b) => a.slice(4) - b.slice(4)).map((k) => s.colors[k]);
@@ -530,16 +597,7 @@ function applyOptions(o) {
     else el.value = v;
   };
   state.center = { lat: o.lat, lon: o.lon };
-  const fields = { shape: 'shape', corner_radius_mm: 'cornerMm', source: 'source', us_source: 'usSource', surface: 'surface', grid_cells: 'gridCells',
-    smoothing: 'smoothing', cliff_smoothing: 'cliffSmoothing', base_separate: 'baseSeparate', base_lip: 'baseLip',
-    lip_height_mm: 'lipH', lip_width_mm: 'lipW', lip_clearance_mm: 'lipC', label: 'label', label_text: 'labelText',
-    label_scale_bar: 'labelScale', label_north: 'labelNorth', layer_height_mm: 'layerH', first_layer_mm: 'firstLayer',
-    min_feature_mm: 'minFeature', simplify_mm: 'simplify', size_mm: 'sizeMm', base_mm: 'baseMm', floor_mm: 'floorMm', z_exaggeration: 'zEx',
-    max_height_mm: 'maxHeight', frame: 'frame', frame_width_mm: 'frameW', frame_height_mm: 'frameH', tiles_x: 'tilesX',
-    tiles_y: 'tilesY', flatten_water: 'flattenWater', water_recess_mm: 'waterRecess', shore_slope_deg: 'shoreSlope', voids_as_water: 'voidsWater',
-    osm_water: 'osmWater', osm_streams: 'osmStreams', river_min_width_mm: 'riverMin', osm_roads: 'osmRoads', road_min_width_mm: 'roadMin', road_emboss_mm: 'roadEmboss',
-    color_mode: 'colorMode', min_region_mm2: 'minRegion', color_depth_mm: 'colorDepth', swap_patch_budget_mm2: 'swapBudget', elevation_water: 'elevWater', layout: 'layout', name: 'name' };
-  for (const [k, id] of Object.entries(fields)) if (k in o) set(id, o[k]);
+  for (const [k, id] of Object.entries(OPTION_IDS)) if (k in o) set(id, o[k]);
   $('widthKm').value = +(o.width_m / 1000).toFixed(3);
   $('heightKm').value = +(o.height_m / 1000).toFixed(3);
   const c = o.colors || {};
@@ -557,6 +615,12 @@ function applyOptions(o) {
 }
 
 async function generate() {
+  const bad = invalidFields();
+  if (bad.length) {
+    showSettingsNote(`Fix these settings first:\n${bad.join('\n')}`);
+    return;
+  }
+  showSettingsNote('');
   saveSettings();
   const body = buildOptions();
   $('generateBtn').disabled = true;
@@ -567,7 +631,7 @@ async function generate() {
   try {
     const r = await fetch('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const d = await r.json();
-    if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : JSON.stringify(d.detail));
+    if (!r.ok) throw new Error(describeError(d));
     state.jobId = d.id;
     poll();
   } catch (e) {
