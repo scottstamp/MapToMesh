@@ -53,7 +53,9 @@ On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and co
    printable width. Rivers and streams use the OpenStreetMap centrelines (LiDAR only sees
    scattered water returns on narrow streams), widened to at least *Min river width* so they
    stay continuous; their surface follows the channel downhill and roads stay on top where they
-   cross. They are a separate "Rivers" part in the water colour.
+   cross. They are a separate "Rivers" part in the water colour. *Max shore slope* (default
+   70 degrees, 90 = vertical walls): cliffs and banks descend to the water at most this steep and
+   end in one even edge (the water recess) along the shoreline.
 5. **Colours** – presets or individual colour pickers. Islands smaller than the given area are
    merged into their surroundings to avoid pointless filament swaps. *Colour depth*: water, roads,
    trees and buildings are thin colour skins on one ground-coloured body, so a layer only carries
@@ -104,8 +106,14 @@ web/ (Leaflet + three.js)  ──HTTP──>  maptomesh/server.py (FastAPI, back
   plane fitted through the ground points of its cell and neighbours, evaluated at the vertex. A
   plain average depends on where in the cell the points happen to fall, which on a 60 m sea cliff
   produces saw-tooth faces. Slopes steeper than ~20 degrees are additionally despiked and smoothed
-  (*Cliff smoothing*, 0 = off); gentler terrain keeps full detail. Shorelines are clean vertical
-  walls whose height follows the real cliff foot.
+  (*Cliff smoothing*, 0 = off); gentler terrain keeps full detail.
+- **Shorelines**: lake and sea outlines are smoothed at about the minimum feature size (LiDAR
+  water edges wobble from cell to cell; rivers keep a tight outline). A grid sample next to a
+  cliff that drops straight into the sea can be anywhere on the face, so the land used to end in
+  a wall whose height jumped from vertex to vertex (jagged cliff tops). The land near water is
+  now capped by a ramp that rises from the exact water outline at *Max shore slope*: cliffs
+  descend smoothly with contours parallel to the shore, the cell diagonals follow the ramp, and
+  the shore edge is the same height everywhere.
 - **Inconsistent classification across projects** is handled explicitly: per project the app
   detects whether buildings (6) and vegetation (3–5) are classified (remembered in
   `cache/project_classes.json`) and routes class 1 accordingly – e.g. Ottawa 2020 leaves

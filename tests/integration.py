@@ -82,6 +82,7 @@ def water_levels(path: Path) -> dict | None:
     root = ET.fromstring(zipfile.ZipFile(path).read("3D/3dmodel.model"))
     tops, all_area = [], 0.0
     water_area = 0.0
+    wet_v, land_v = [], []
     for obj in root.find("m:resources", ns).findall("m:object", ns):
         mesh = obj.find("m:mesh", ns)
         if mesh is None:
@@ -95,7 +96,12 @@ def water_levels(path: Path) -> dict | None:
         level = (p[up][:, 0, 2] == p[up][:, 1, 2]) & (p[up][:, 1, 2] == p[up][:, 2, 2])
         zl = p[up][:, 0, 2]
         name = obj.get("name") or ""
-        if name.split(" - ")[-1] in ("Base",) or "(fill)" in name:
+        part = name.split(" - ")[-1]
+        if part in ("Water", "Rivers"):
+            wet_v.append(v)
+        elif part == "Ground" or part.startswith("Band "):
+            land_v.append(v)
+        if part in ("Base",) or "(fill)" in name:
             continue
         all_area += a.sum()
         if name.split(" - ")[-1] == "Water":
@@ -108,8 +114,23 @@ def water_levels(path: Path) -> dict | None:
     a = np.concatenate([t[0] for t in tops])
     lv = np.concatenate([t[1] for t in tops])
     og = np.concatenate([t[2] for t in tops])
-    return {"flat_share": float(a[lv].sum() / max(a.sum(), 1e-12)), "area_share": water_area / max(all_area, 1e-9),
-            "on_layer_grid": float(a[og].sum() / max(a[lv].sum(), 1e-12))}
+    out = {"flat_share": float(a[lv].sum() / max(a.sum(), 1e-12)), "area_share": water_area / max(all_area, 1e-9),
+           "on_layer_grid": float(a[og].sum() / max(a[lv].sum(), 1e-12))}
+    if wet_v and land_v:
+        # shore edge: land top minus water top at the outline points both parts share
+        def top_by_xy(vs):
+            v = np.concatenate(vs)
+            key = np.round(v[:, 0] * 1e4).astype(np.int64) * 10_000_000 + np.round(v[:, 1] * 1e4).astype(np.int64)
+            order = np.lexsort((-v[:, 2], key))
+            first = np.r_[True, key[order][1:] != key[order][:-1]]
+            return key[order][first], v[order][first, 2]
+        kw, zw = top_by_xy(wet_v)
+        kl, zl = top_by_xy(land_v)
+        common, iw, il = np.intersect1d(kw, kl, return_indices=True)
+        if len(common):
+            h = zl[il] - zw[iw]
+            out["shore_mm"] = [round(float(x), 2) for x in np.percentile(h, [50, 95, 100])]
+    return out
 
 
 def _min_z(path: Path) -> float:
@@ -160,6 +181,11 @@ def run_case(base: str, name: str, body: dict, timeout: float = 1800) -> dict:
     if water is not None and (water["flat_share"] < 0.95 or water["on_layer_grid"] < 0.99):
         print(f"  water surface not flat: {water}")
         ok = False
+    # land meets water at one uniform edge (shore ramp): no tall, jagged walls at cliff feet
+    wall = max(body.get("layer_height_mm", 0.2), body.get("water_recess_mm", 0.6))
+    if water is not None and "shore_mm" in water and body.get("shore_slope_deg", 70) < 89.5             and water["shore_mm"][1] > wall + 0.25:
+        print(f"  shore edge too tall: {water['shore_mm']} mm (expected about {wall} mm)")
+        ok = False
     return {
         "case": name, "ok": ok and stl.ok and prev.ok, "seconds": round(elapsed, 1),
         "triangles": res["stats"]["triangles"], "parts": res["stats"]["parts"], "mb": round(len(data) / 1e6, 1),
@@ -193,7 +219,8 @@ def main() -> None:
             if r.get("water"):
                 w = r["water"]
                 print(f"     water: {w['flat_share']:.1%} of water surface perfectly level, "
-                      f"{w['on_layer_grid']:.1%} of it on the layer grid, water = {w['area_share']:.0%} of top area")
+                      f"{w['on_layer_grid']:.1%} of it on the layer grid, water = {w['area_share']:.0%} of top area"
+                      + (f", shore edge p50/p95/max {w['shore_mm']} mm" if "shore_mm" in w else ""))
             for note in r["notes"]:
                 print(f"     note: {note}")
         else:

@@ -83,6 +83,9 @@ class Options(BaseModel):
     # water
     flatten_water: bool = True
     water_recess_mm: float = Field(0.6, ge=0, le=20)
+    # steepest printed slope where land meets water: cliffs descend to a uniform shore edge
+    # along the (smooth) water outline instead of ending in a jagged wall; 90 = vertical walls
+    shore_slope_deg: float = Field(70.0, ge=20, le=90)
     voids_as_water: bool = True
     osm_water: bool = True
     osm_streams: Literal["none", "rivers", "all"] = "all"  # OSM river/stream centrelines as water

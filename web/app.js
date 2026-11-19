@@ -378,7 +378,7 @@ const FIELDS = ['shape', 'widthKm', 'heightKm', 'source', 'surface', 'gridCells'
   'baseLip', 'lipH', 'lipW', 'lipC', 'label', 'labelText', 'labelScale', 'labelNorth', 'layerH', 'firstLayer',
   'minFeature', 'simplify', 'sizeMm', 'baseMm', 'floorMm',
   'zEx', 'maxHeight', 'cornerMm', 'frame', 'frameW', 'frameH', 'tilesX', 'tilesY', 'flattenWater', 'voidsWater', 'osmWater',
-  'waterRecess', 'osmStreams', 'riverMin', 'osmRoads', 'roadMin', 'roadEmboss', 'colorMode', 'bandCount', 'bandMode', 'bandThresholds', 'minRegion',
+  'waterRecess', 'shoreSlope', 'osmStreams', 'riverMin', 'osmRoads', 'roadMin', 'roadEmboss', 'colorMode', 'bandCount', 'bandMode', 'bandThresholds', 'minRegion',
   'colorDepth', 'swapBudget', 'elevWater',
   'name', 'layout', 'showCoverage'];
 
@@ -430,6 +430,7 @@ function buildOptions() {
     frame: $('frame').checked, frame_width_mm: num('frameW', 6), frame_height_mm: num('frameH', 2),
     tiles_x: parseInt($('tilesX').value) || 1, tiles_y: parseInt($('tilesY').value) || 1,
     flatten_water: $('flattenWater').checked, water_recess_mm: num('waterRecess', 0.6),
+    shore_slope_deg: num('shoreSlope', 70),
     voids_as_water: $('voidsWater').checked, osm_water: $('osmWater').checked,
     osm_streams: $('osmStreams').value, river_min_width_mm: num('riverMin', 0.8),
     osm_roads: $('osmRoads').value, road_min_width_mm: num('roadMin', 0.6), road_emboss_mm: num('roadEmboss', 0),
@@ -461,7 +462,7 @@ function applyOptions(o) {
     label_scale_bar: 'labelScale', label_north: 'labelNorth', layer_height_mm: 'layerH', first_layer_mm: 'firstLayer',
     min_feature_mm: 'minFeature', simplify_mm: 'simplify', size_mm: 'sizeMm', base_mm: 'baseMm', floor_mm: 'floorMm', z_exaggeration: 'zEx',
     max_height_mm: 'maxHeight', frame: 'frame', frame_width_mm: 'frameW', frame_height_mm: 'frameH', tiles_x: 'tilesX',
-    tiles_y: 'tilesY', flatten_water: 'flattenWater', water_recess_mm: 'waterRecess', voids_as_water: 'voidsWater',
+    tiles_y: 'tilesY', flatten_water: 'flattenWater', water_recess_mm: 'waterRecess', shore_slope_deg: 'shoreSlope', voids_as_water: 'voidsWater',
     osm_water: 'osmWater', osm_streams: 'osmStreams', river_min_width_mm: 'riverMin', osm_roads: 'osmRoads', road_min_width_mm: 'roadMin', road_emboss_mm: 'roadEmboss',
     color_mode: 'colorMode', min_region_mm2: 'minRegion', color_depth_mm: 'colorDepth', swap_patch_budget_mm2: 'swapBudget', elevation_water: 'elevWater', layout: 'layout', name: 'name' };
   for (const [k, id] of Object.entries(fields)) if (k in o) set(id, o[k]);

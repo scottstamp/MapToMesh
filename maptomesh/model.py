@@ -420,13 +420,84 @@ def _indicator(mask: np.ndarray, min_cells: int, sigma: float = 0.7) -> np.ndarr
     return ndimage.gaussian_filter(f, sigma, mode="nearest") if sigma > 0 else f
 
 
-def _cut_water(part: Partition, lakes: np.ndarray, rivers: np.ndarray, min_cells: int,
-               land: Partition | None = None) -> None:
-    """One outline for all water (label WATER), then the river share of it relabelled RIVER."""
+def _iso_distance(diag: np.ndarray, f: np.ndarray, th: float, reach: float) -> np.ndarray:
+    """Signed distance (cells) from every vertex to the ``th`` iso-line of the piecewise-linear
+    field ``f`` on the grid triangulated like ``Partition(R, C, diag)`` - the exact line the
+    partition cuts along. Positive where ``f < th``; NaN farther than ``reach`` cells."""
+    from scipy.spatial import cKDTree
+
+    W1 = f.shape[1]
+    fv = f.ravel()
+    out = np.full(fv.shape, np.nan)
+    wg = f >= th
+    wet = wg.ravel()
+    c4 = (wg[:-1, :-1], wg[:-1, 1:], wg[1:, :-1], wg[1:, 1:])
+    rr, cc = np.nonzero((c4[0] | c4[1] | c4[2] | c4[3]) & ~(c4[0] & c4[1] & c4[2] & c4[3]))
+    if not len(rr):
+        return out.reshape(f.shape)
+    v00 = rr * W1 + cc
+    v01, v10 = v00 + 1, v00 + W1
+    v11 = v10 + 1
+    a = diag[rr, cc][:, None]
+    tris = np.concatenate([np.where(a, np.column_stack([v00, v01, v11]), np.column_stack([v00, v01, v10])),
+                           np.where(a, np.column_stack([v00, v11, v10]), np.column_stack([v01, v11, v10]))])
+    sw = wet[tris]
+    t = tris[sw.any(axis=1) & ~sw.all(axis=1)]
+    fa = fv[t]
+    xy = np.stack([t % W1, t // W1], axis=-1).astype(np.float64)        # (x = col, y = row)
+    pts = []
+    for i, j in ((0, 1), (1, 2), (2, 0)):
+        cr = wet[t[:, i]] != wet[t[:, j]]
+        u = np.where(cr, (th - fa[:, i]) / np.where(cr, fa[:, j] - fa[:, i], 1.0), np.nan)
+        pts.append(xy[:, i] + u[:, None] * (xy[:, j] - xy[:, i]))
+    P = np.stack(pts, axis=1)                                            # (M, 3, 2), NaN: no crossing
+    first2 = np.argsort(~np.isfinite(P[:, :, 0]), axis=1, kind="stable")[:, :2]
+    seg = np.take_along_axis(P, first2[:, :, None], axis=1)              # the iso segment per triangle
+    w = np.linspace(0.0, 1.0, 12)[None, :, None]                         # <= 0.13 cells apart
+    tree = cKDTree((seg[:, :1] * (1 - w) + seg[:, 1:] * w).reshape(-1, 2))
+    coarse = ndimage.distance_transform_edt(~wg) + ndimage.distance_transform_edt(wg)
+    idx = np.nonzero(coarse.ravel() <= reach + 1.5)[0]
+    dist, _ = tree.query(np.column_stack([idx % W1, idx // W1]).astype(np.float64),
+                         distance_upper_bound=reach + 1.5)
+    out[idx] = np.where(np.isfinite(dist), np.where(wet[idx], -dist, dist), np.nan)
+    return out.reshape(f.shape)
+
+
+def _shore_cap(diag: np.ndarray, ind: np.ndarray, wtop: np.ndarray, wall: float, k: float,
+               hmax: float) -> np.ndarray:
+    """Upper bound (mm) for land near water: ``wall`` above the water surface exactly on the water
+    outline, rising inland at ``k`` mm per cell. Land surfaces capped by it descend to one uniform
+    shore edge along the smooth outline - sampled on the grid, a cliff that meets the water
+    otherwise ends in a wall whose height jumps from vertex to vertex (jagged cliff tops). On the
+    water side the cap continues below the water, so the land's edge is interpolated to exactly
+    ``wall`` above the water."""
+    reach = max(2.0, (hmax - float(np.min(wtop)) - wall) / k + 2.0)
+    d = _iso_distance(diag, ind, 0.5, reach)
+    return np.where(np.isfinite(d), wtop + wall + k * np.nan_to_num(d), np.inf)
+
+
+def _water_indicator(lakes: np.ndarray, rivers: np.ndarray, min_cells: int, sigma: float) -> np.ndarray | None:
+    """Field whose 0.5 iso-line is the water outline. Lake and sea shores are smoothed with
+    ``sigma`` (cells; about the printable feature size - LiDAR water edges wobble from cell to
+    cell, which printed as a ragged coast), rivers keep a tight outline so narrow streams
+    survive."""
     wet = lakes | rivers
     if not wet.any():
-        return
+        return None
     ind = _indicator(wet, min_cells)
+    if sigma > 0.7 + 1e-6 and lakes.any():
+        wide = _indicator(wet, min_cells, sigma)
+        ind = np.maximum(wide, _indicator(rivers, min_cells)) if rivers.any() else wide
+    return ind
+
+
+def _cut_water(part: Partition, lakes: np.ndarray, rivers: np.ndarray, min_cells: int,
+               land: Partition | None = None, sigma: float = 0.7) -> np.ndarray | None:
+    """One outline for all water (label WATER), then the river share of it relabelled RIVER.
+    Returns the indicator field whose 0.5 iso-line is the water outline."""
+    ind = _water_indicator(lakes, rivers, min_cells, sigma)
+    if ind is None:
+        return None
     part.step(ind, 0.5, above=WATER)
     if land is not None:
         land.step(ind, 0.5, above=WATER)
@@ -436,7 +507,8 @@ def _cut_water(part: Partition, lakes: np.ndarray, rivers: np.ndarray, min_cells
                      - ndimage.gaussian_filter(lakes.astype(np.float64), 1.0, mode="nearest"))
             part.step(split, 0.0123, above=RIVER, only=WATER)
         else:
-            part.step(np.ones(wet.shape), 0.0, above=RIVER, only=WATER)
+            part.step(np.ones(ind.shape), 0.0, above=RIVER, only=WATER)
+    return ind
 
 
 def _drop_swap_patches(masks: dict[int, np.ndarray], tops: dict[int, np.ndarray], ground: np.ndarray,
@@ -686,6 +758,10 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
     hmin, hmax = float(Sm[inside_v].min()), float(Sm[inside_v].max())
     lowest = base + min(0.3, opts.floor_mm)
     zcap = base + opts.max_height_mm if opts.max_height_mm else np.inf
+    # land meets water at most this steep, ending one uniform edge above the water surface
+    shore_k = (float(np.tan(np.radians(opts.shore_slope_deg))) * cell_mm
+               if opts.shore_slope_deg < 89.5 else 0.0)
+    shore_wall = max(lh, opts.water_recess_mm)
 
     def zmm(h: np.ndarray) -> np.ndarray:
         return np.minimum((P(h) - hmin) * zscale + base + opts.floor_mm, zcap)
@@ -693,8 +769,22 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
     S_mm = np.round(zmm(surf.surface), 3)
 
     # --- triangulation follows ridges of the printed surface
-    a00, a01, a10, a11 = S_mm[:-1, :-1], S_mm[:-1, 1:], S_mm[1:, :-1], S_mm[1:, 1:]
-    part = Partition(R, C, np.abs(a00 - a11) <= np.abs(a01 - a10))
+    def diagonals(Z: np.ndarray) -> np.ndarray:
+        a00, a01, a10, a11 = Z[:-1, :-1], Z[:-1, 1:], Z[1:, :-1], Z[1:, 1:]
+        return np.abs(a00 - a11) <= np.abs(a01 - a10)
+
+    min_cells = max(1, int(round(opts.min_region_mm2 / (cell_mm * cell_mm))))
+    shore_sigma = min(6.0, max(0.7, 0.8 * opts.min_feature_mm / cell_mm))
+    diag = diagonals(S_mm)
+    wet_cut = opts.color_mode == "landcover" or (opts.color_mode == "elevation" and opts.elevation_water)
+    if shore_k > 0 and wet_cut:
+        # the shore ramp reshapes cliffs: choose the cell diagonals along the ramped surface
+        # (approximate: the final water masks differ slightly)
+        ind0 = _water_indicator(P(surf.masks[WATER]), P(surf.masks[RIVER]), min_cells, shore_sigma)
+        if ind0 is not None:
+            w0 = np.maximum(zmm(surf.level) - opts.water_recess_mm, lowest)
+            diag = diagonals(np.minimum(S_mm, _shore_cap(diag, ind0, w0, shore_wall, shore_k, float(S_mm.max()))))
+    part = Partition(R, C, diag)
     progress(0.05, "Cutting outline")
     if opts.frame:
         part.step(shape_field(opts.shape, R, C, nx, ny, corner_cells, grow=frame_cells), 0.0, below=DROPPED)
@@ -710,7 +800,6 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
     defs: list[tuple[str, str, str, set, FieldSpec, FieldSpec]] = []
     color_changes: list[dict] = []
     flat = lambda a: np.ascontiguousarray(a, dtype=np.float64).ravel()  # noqa: E731
-    min_cells = max(1, int(round(opts.min_region_mm2 / (cell_mm * cell_mm))))
 
     if opts.color_mode == "single":
         part.finish(MODEL)
@@ -718,15 +807,17 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         default, label_color = MODEL, {MODEL: col.single}
     elif opts.color_mode == "landcover":
         G_mm = np.round(zmm(surf.ground_land), 3)
-        fields = {
-            GROUND: G_mm,
-            BUILDING: np.maximum(np.round(zmm(surf.roof), 3), G_mm),
-            VEG: np.maximum(np.round(zmm(surf.canopy), 3), G_mm) if opts.surface == "full" else G_mm,
-            WATER: np.maximum(np.round(zmm(surf.level), 3) - opts.water_recess_mm, lowest),
-        }
-        bridge_mm = np.round(zmm(surf.bridge), 3)
-        road = np.where(P(surf.bridge_mask), np.maximum(bridge_mm, G_mm), G_mm) + opts.road_emboss_mm
-        fields[ROAD] = np.maximum(road, lowest)
+        roof_mm, canopy_mm = np.round(zmm(surf.roof), 3), np.round(zmm(surf.canopy), 3)
+        bridge_mm, bridge_v = np.round(zmm(surf.bridge), 3), P(surf.bridge_mask)
+
+        def land_fields(G: np.ndarray) -> dict:
+            road = np.where(bridge_v, np.maximum(bridge_mm, G), G) + opts.road_emboss_mm
+            return {GROUND: G, BUILDING: np.maximum(roof_mm, G),
+                    VEG: np.maximum(canopy_mm, G) if opts.surface == "full" else G,
+                    ROAD: np.maximum(road, lowest)}
+
+        fields = land_fields(G_mm)
+        fields[WATER] = np.maximum(np.round(zmm(surf.level), 3) - opts.water_recess_mm, lowest)
         fields[RIVER] = fields[WATER]
         names = {GROUND: "Ground", BUILDING: "Buildings", WATER: "Water", ROAD: "Roads", VEG: "Trees",
                  RIVER: "Rivers"}
@@ -758,7 +849,12 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         # all water (lakes, sea, rivers) is cut as ONE region, then divided into lake / river
         # inside it - separate outlines would leave slivers of land between a river and LiDAR
         # water patches or a lake it runs into
-        _cut_water(part, cmasks[WATER], cmasks[RIVER], min_cells, land=land)
+        ind = _cut_water(part, cmasks[WATER], cmasks[RIVER], min_cells, land=land, sigma=shore_sigma)
+        if ind is not None and shore_k > 0:
+            # on the water side G_mm drops below the water: only the shore edge interpolates it
+            G_mm = np.minimum(G_mm, _shore_cap(diag, ind, fields[WATER], shore_wall, shore_k,
+                                               float(G_mm.max())))
+            fields.update(land_fields(G_mm))
         for i, lab in enumerate((BUILDING, ROAD, VEG), start=2):  # priority order
             m = cmasks[lab]
             if m.any():
@@ -777,7 +873,7 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
             # layer only carries the colours whose visible surface is within ~d of it (plus
             # building walls). The skin/body interface is the ground surface minus d, rounded down
             # to 0.5 mm terraces: shared by all classes and mostly flat (cheap to triangulate).
-            I = FieldSpec(flat(_terraced(G_mm + min(0.0, opts.road_emboss_mm), d, base, lg)))
+            I = FieldSpec(flat(_terraced(np.maximum(G_mm, lowest) + min(0.0, opts.road_emboss_mm), d, base, lg)))
             # one ground-coloured body under all land (outline + water cut only)
             defs.append(("body", "Body", col.ground, {GROUND}, I, FieldSpec(base)))
         for lab in (GROUND, BUILDING, WATER, RIVER, ROAD, VEG):
@@ -810,10 +906,16 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         water_sep = opts.elevation_water and wmask.any()
         if water_sep:  # flat, recessed water in its own colour; bands cover the land only
             progress(0.08, "Cutting water")
-            _cut_water(part, P(surf.masks[WATER]), P(surf.masks[RIVER]), min_cells)
+            ind = _cut_water(part, P(surf.masks[WATER]), P(surf.masks[RIVER]), min_cells, sigma=shore_sigma)
+            wtop = np.maximum(np.round(zmm(surf.level), 3) - opts.water_recess_mm, lowest)
+            wet_e = P(surf.masks[WATER] | surf.masks[RIVER])
+            _, (wi, wj) = ndimage.distance_transform_edt(~wet_e, return_indices=True)
+            wtop = np.maximum(np.where(P(surf.masks[WATER])[wi, wj], lg.snap(wtop), wtop), lowest)
         # with separate water the bands only cover land: use the land surface continued over
         # the water so shores are clean walls (see Surface.surface_land)
         Sb_mm = np.round(zmm(surf.surface_land), 3) if water_sep else S_mm
+        if water_sep and ind is not None and shore_k > 0:
+            Sb_mm = np.minimum(Sb_mm, _shore_cap(diag, ind, wtop, shore_wall, shore_k, float(Sb_mm.max())))
         progress(0.1, "Cutting elevation contours")
         for k in range(nb - 1, 0, -1):
             part.step(flat(Sb_mm), lo_mm[k], above=BAND0 + k)
@@ -823,10 +925,6 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         present_w = [lab for lab in (WATER, RIVER)
                      if water_sep and ((part.tri_label == lab).any() or (part.p_label == lab).any())]
         if present_w:
-            wtop = np.maximum(np.round(zmm(surf.level), 3) - opts.water_recess_mm, lowest)
-            wet_e = P(surf.masks[WATER] | surf.masks[RIVER])
-            _, (wi, wj) = ndimage.distance_transform_edt(~wet_e, return_indices=True)
-            wtop = np.maximum(np.where(P(surf.masks[WATER])[wi, wj], lg.snap(wtop), wtop), lowest)
             d = opts.color_depth_mm
             for lab in present_w:
                 nm = "Water" if lab == WATER else "Rivers"
@@ -875,7 +973,7 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         if use_lip:
             # tray: the base reaches past the model (+frame) by clearance + lip, and a raised lip
             # around it locates the model without pins or glue jigs
-            basep = Partition(R, C, np.abs(a00 - a11) <= np.abs(a01 - a10))
+            basep = Partition(R, C, diag)
             basep.step(shape_field(opts.shape, R, C, nx, ny, corner_cells, grow=lip_out), 0.0, below=DROPPED)
             basep.step(shape_field(opts.shape, R, C, nx, ny, corner_cells, grow=lip_in), 0.0, below=LIP)
             basep.finish(GROUND)

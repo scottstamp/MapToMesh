@@ -157,7 +157,11 @@
       <label title="Narrow rivers and streams are widened to at least this printed width so they stay continuous">
         Min river width (mm)<input id="riverMin" type="number" min="0.2" step="0.1" value="0.8"></label>
     </div>
-    <label>Water recess (mm)<input id="waterRecess" type="number" min="0" step="0.1" value="0.6"></label>
+    <div class="row">
+      <label>Water recess (mm)<input id="waterRecess" type="number" min="0" step="0.1" value="0.6"></label>
+      <label title="Cliffs and banks descend to the water at most this steep, ending in one even edge along the shoreline (90 = vertical walls)">
+        Max shore slope (°)<input id="shoreSlope" type="number" min="20" max="90" step="5" value="70"></label>
+    </div>
     <label>OpenStreetMap roads
       <select id="osmRoads">
         <option value="none">None</option>
