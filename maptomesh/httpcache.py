@@ -18,6 +18,7 @@ renewed once when the host rejects an expired one), so cached blocks outlive the
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import io
 import os
 import sqlite3
@@ -30,6 +31,9 @@ from . import config
 
 BLOCK = 64 * 1024
 REVALIDATE_S = 30 * 86400
+TOUCH_S = 3600            # LRU timestamps are refreshed at most this often (no write per cache hit)
+PREFETCH_PIECE = 4 << 20  # prefetch() splits ranges into requests of at most this size
+PREFETCH_GAP = 4 * BLOCK  # ... and merges ranges closer than this
 
 # (url prefix, signer(url, refresh) -> signed url)
 _SIGNERS: list = []
@@ -151,23 +155,46 @@ class RangeCache:
                 return b""
         b0, b1 = start // BLOCK, (start + n - 1) // BLOCK
         con = self._conn()
-        rows = con.execute("SELECT block, data FROM blocks WHERE url_id = ? AND block BETWEEN ? AND ?",
+        rows = con.execute("SELECT block, data, used FROM blocks WHERE url_id = ? AND block BETWEEN ? AND ?",
                            (uid, b0, b1)).fetchall()
-        have = {b: d for b, d in rows}
+        have = {b: d for b, d, _ in rows}
         missing = [b for b in range(b0, b1 + 1) if b not in have]
         if missing:
             have.update(self._fetch(url, uid, missing, session))
         now = time.time()
-        if rows:
-            con.execute(f"UPDATE blocks SET used = ? WHERE url_id = ? AND block IN ({','.join('?' * len(rows))})",
-                        (now, uid, *[b for b, _ in rows]))
+        stale = [b for b, _, used in rows if used < now - TOUCH_S]   # LRU order only needs hours
+        if stale:
+            con.execute(f"UPDATE blocks SET used = ? WHERE url_id = ? AND block IN ({','.join('?' * len(stale))})",
+                        (now, uid, *stale))
             con.commit()
         buf = b"".join(have[b] for b in range(b0, b1 + 1) if b in have)
         off = start - b0 * BLOCK
         out = buf[off:off + n]
         with self._lock:
-            self.hit_bytes += sum(len(d) for b, d in rows)
+            self.hit_bytes += sum(len(d) for _, d, _ in rows)
         return out
+
+    def prefetch(self, url: str, ranges: list[tuple[int, int]], workers: int = 8) -> None:
+        """Download the (start, length) byte ranges of ``url`` that aren't cached yet, in parallel.
+
+        For readers that fetch one small range after another (GDAL reading a COG through
+        ``CachedHttpFile``): asking for everything they're about to read first turns a long chain
+        of round trips into a few concurrent requests; their own reads then hit the cache."""
+        if not ranges:
+            return
+        merged: list[list[int]] = []
+        for s, n in sorted((s, n) for s, n in ranges if n > 0):
+            if merged and s <= merged[-1][1] + PREFETCH_GAP:
+                merged[-1][1] = max(merged[-1][1], s + n)
+            else:
+                merged.append([s, s + n])
+        pieces = [(p, min(PREFETCH_PIECE, e - p)) for s, e in merged for p in range(s, e, PREFETCH_PIECE)]
+        if len(pieces) == 1:
+            self.read(url, *pieces[0])
+            return
+        with cf.ThreadPoolExecutor(max_workers=min(workers, len(pieces))) as ex:
+            for fut in [ex.submit(self.read, url, s, n) for s, n in pieces]:
+                fut.result()
 
     def _fetch(self, url: str, uid: int, blocks: list[int], session) -> dict[int, bytes]:
         # contiguous runs -> one ranged GET each

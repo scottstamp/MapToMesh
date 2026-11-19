@@ -112,6 +112,39 @@ def _open(url: str, **kw):
     return rasterio.open(url, **kw)
 
 
+def _prefetch_blocks(url: str, src, band: int, aoi: AOI, grid: Grid, crs, max_blocks: int = 20_000) -> None:
+    """Fetch the COG tiles the warp is about to read, in parallel (GDAL reads them one at a time
+    through ``CachedHttpFile``, about 6 MB/s instead of the link's speed). Only warms the range
+    cache: tiles missed here (or a failure) are simply read by GDAL as before."""
+    from rasterio.warp import transform_bounds
+    from rasterio.windows import from_bounds
+    from .httpcache import RANGE_CACHE
+
+    try:
+        h = grid.step / 2   # the destination's pixel edges (pixel centres sit on the vertices)
+        b = (grid.x0 - h, grid.y0 - h, grid.x0 + grid.nx * grid.step + h, grid.y0 + grid.ny * grid.step + h)
+        w, s, e, n = transform_bounds(_dst_crs(aoi), crs, *b, densify_pts=21)
+        win = from_bounds(w, s, e, n, transform=src.transform)
+        bh, bw = src.block_shapes[band - 1]
+        pad = 2   # resampling kernel
+        r0 = max(0, int(math.floor(win.row_off)) - pad) // bh
+        r1 = min(src.height - 1, int(math.ceil(win.row_off + win.height)) + pad) // bh
+        c0 = max(0, int(math.floor(win.col_off)) - pad) // bw
+        c1 = min(src.width - 1, int(math.ceil(win.col_off + win.width)) + pad) // bw
+        if r1 < r0 or c1 < c0 or (r1 - r0 + 1) * (c1 - c0 + 1) > max_blocks:
+            return
+        ranges = []
+        for by in range(r0, r1 + 1):
+            for bx in range(c0, c1 + 1):
+                off = src.get_tag_item(f"BLOCK_OFFSET_{bx}_{by}", "TIFF", bidx=band)
+                size = src.get_tag_item(f"BLOCK_SIZE_{bx}_{by}", "TIFF", bidx=band)
+                if off and size and int(size) > 0:   # 0 / missing: sparse (empty) tile
+                    ranges.append((int(off), int(size)))
+        RANGE_CACHE.prefetch(url, ranges)
+    except Exception:  # noqa: BLE001 - an optimisation only
+        return
+
+
 def read_cog(url: str, aoi: AOI, grid: Grid, src_crs=None, nodata=None, band: int = 1,
              scale: float = 1.0) -> np.ndarray:
     """Window of a (Cloud-Optimized) GeoTIFF on the vertex grid, from the coarsest overview that is
@@ -133,6 +166,8 @@ def read_cog(url: str, aoi: AOI, grid: Grid, src_crs=None, nodata=None, band: in
                 level = k
     kw = {"overview_level": level} if level >= 0 else {}
     with _open(url, **kw) as src:
+        if url.startswith("http"):
+            _prefetch_blocks(url, src, band, aoi, grid, _crs(src_crs) or src.crs)
         nd = nodata if nodata is not None else src.nodata
         reproject(source=rasterio.band(src, band), destination=dst, src_crs=_crs(src_crs) or src.crs,
                   src_nodata=nd, dst_nodata=np.nan, dst_transform=_dst_transform(grid), dst_crs=_dst_crs(aoi),

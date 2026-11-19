@@ -554,7 +554,7 @@ def _iso_distance(diag: np.ndarray, f: np.ndarray, th: float, reach: float) -> n
     coarse = ndimage.distance_transform_edt(~wg) + ndimage.distance_transform_edt(wg)
     idx = np.nonzero(coarse.ravel() <= reach + 1.5)[0]
     dist, _ = tree.query(np.column_stack([idx % W1, idx // W1]).astype(np.float64),
-                         distance_upper_bound=reach + 1.5)
+                         distance_upper_bound=reach + 1.5, workers=-1)   # all cores
     out[idx] = np.where(np.isfinite(dist), np.where(wet[idx], -dist, dist), np.nan)
     return out.reshape(f.shape)
 

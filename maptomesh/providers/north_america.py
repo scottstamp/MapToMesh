@@ -27,24 +27,26 @@ class Hrdem(DemProvider):
     sample = (47.5615, -52.7126, 3000)
 
     def fetch(self, aoi, grid, progress, cancel):
+        from concurrent.futures import ThreadPoolExecutor
         from ..hrdem import COLLECTIONS, stac_items
         bbox = aoi.lonlat_bbox(margin=grid.step * 2)
         dtm = np.full(grid.vshape, np.nan)
         dsm = np.full(grid.vshape, np.nan)
         used = []
-        for coll in COLLECTIONS:
-            items = stac_items(bbox, coll)
-            for k, it in enumerate(items):
-                for name, arr in (("dtm", dtm), ("dsm", dsm)):
+        with ThreadPoolExecutor(max_workers=2) as ex:   # an item's DTM and DSM side by side
+            for coll in COLLECTIONS:
+                items = stac_items(bbox, coll)
+                for k, it in enumerate(items):
                     if cancel.is_set():
                         raise RuntimeError("Cancelled")
-                    href = it["assets"].get(name, {}).get("href")
-                    if href:
-                        progress(k / max(len(items), 1), f"HRDEM {it['id']} {name.upper()}")
-                        merge_fill(arr, read_cog(href, aoi, grid))
-                used.append(it["id"])
-            if np.isfinite(dtm).mean() > 0.98:
-                break
+                    progress(k / max(len(items), 1), f"HRDEM {it['id']}")
+                    futs = [(arr, ex.submit(read_cog, it["assets"][name]["href"], aoi, grid))
+                            for name, arr in (("dtm", dtm), ("dsm", dsm)) if it["assets"].get(name, {}).get("href")]
+                    for arr, fut in futs:
+                        merge_fill(arr, fut.result())
+                    used.append(it["id"])
+                if np.isfinite(dtm).mean() > 0.98:
+                    break
         return DemArrays(dtm, dsm, ", ".join(used))
 
 
