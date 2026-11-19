@@ -14,9 +14,11 @@ buildings and are used as ground.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import threading
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -121,13 +123,65 @@ def _offset(ref: np.ndarray, vals: np.ndarray, step: float, surface_only: bool =
     return off
 
 
+_WANT_DSM: ContextVar[bool] = ContextVar("maptomesh_want_dsm", default=True)
+
+
+def want_dsm() -> bool:
+    """False while filling a ground-only job (bare terrain not coloured by land cover): providers
+    then skip their surface model (DSM), often half of the download. Read it in ``fetch`` itself:
+    context variables don't follow into worker threads."""
+    return _WANT_DSM.get()
+
+
 def best_dems(aoi: AOI, grid: Grid, need: np.ndarray | None = None, ref: np.ndarray | None = None,
               progress: ProgressFn = lambda f, m: None, cancel: threading.Event | None = None,
-              providers=None, min_share: float = 0.0005) -> Composite:
+              providers=None, min_share: float = 0.0005, dsm: bool = True) -> Composite:
     """Fill the vertices in ``need`` (all if None) from the best providers covering the AOI.
 
     ``ref`` is higher-priority elevation already known elsewhere (e.g. LiDAR ground): fallbacks
-    are offset to it where both exist."""
+    are offset to it where both exist. ``dsm=False``: providers skip surface models."""
+    token = _WANT_DSM.set(dsm)
+    try:
+        return _best_dems(aoi, grid, need, ref, progress, cancel, providers, min_share)
+    finally:
+        _WANT_DSM.reset(token)
+
+
+def _gap_blocks(remaining: np.ndarray, step: float, block_m: float = 256.0, max_rects: int = 48) -> tuple:
+    """Rectangles (r0, r1, c0, c1, vertex indices, half-open) covering the ``remaining`` cells in
+    blocks of ``block_m`` plus one block of margin (so the fill overlaps data already placed, for
+    the datum offset). () when they'd cover most of the grid anyway, or be too many."""
+    from scipy import ndimage
+    H, W = remaining.shape
+    b = max(8, int(round(block_m / step)))
+    nby, nbx = -(-H // b), -(-W // b)
+    pad = np.zeros((nby * b, nbx * b), bool)
+    pad[:H, :W] = remaining
+    blk = ndimage.binary_dilation(pad.reshape(nby, b, nbx, b).any(axis=(1, 3)), structure=np.ones((3, 3), bool))
+    if blk.mean() > 0.5:
+        return ()
+    rects, open_runs = [], {}
+    for by in range(nby + 1):   # runs of blocks per row, merged downwards while the span repeats
+        runs = set()
+        if by < nby:
+            row = np.concatenate([[False], blk[by], [False]])
+            d = np.flatnonzero(np.diff(row.astype(np.int8)))
+            runs = {(int(a), int(e)) for a, e in zip(d[::2], d[1::2])}
+        for span in [sp for sp in open_runs if sp not in runs]:
+            rects.append((open_runs.pop(span), by) + span)
+        for span in runs:
+            open_runs.setdefault(span, by)
+        if len(rects) > max_rects:
+            return ()
+    out = []
+    for rb0, rb1, cb0, cb1 in rects:
+        r1, c1 = min(rb1 * b + 1, H), min(cb1 * b + 1, W)
+        out.append((min(rb0 * b, r1 - 2), r1, min(cb0 * b, c1 - 2), c1))   # at least 2 x 2 vertices
+    return tuple(out)
+
+
+def _best_dems(aoi: AOI, grid: Grid, need, ref, progress: ProgressFn, cancel, providers,
+               min_share: float) -> Composite:
     from .pointcloud import Cancelled
 
     cancel = cancel or threading.Event()
@@ -152,8 +206,10 @@ def best_dems(aoi: AOI, grid: Grid, need: np.ndarray | None = None, ref: np.ndar
             continue
         progress(k / max(len(cands), 1), f"Elevation model: {p.label}")
         t0 = time.time()
+        blocks = _gap_blocks(remaining, grid.step)
         try:
-            arr = p.fetch(aoi, grid, lambda f, m: progress((k + f) / max(len(cands), 1), m), cancel)
+            arr = p.fetch(aoi, dataclasses.replace(grid, read_blocks=blocks) if blocks else grid,
+                          lambda f, m: progress((k + f) / max(len(cands), 1), m), cancel)
         except Cancelled:
             raise
         except Exception as e:  # noqa: BLE001 - try the next fallback
@@ -162,6 +218,13 @@ def best_dems(aoi: AOI, grid: Grid, need: np.ndarray | None = None, ref: np.ndar
             out.errors.append(f"{p.label}: {type(e).__name__}: {str(e)[:200]}")
             continue
         d = arr.dtm
+        if blocks:   # nothing from outside the rectangles (a provider may fill holes there: no data)
+            inside = np.zeros(d.shape, bool)
+            for r0, r1, c0, c1 in blocks:
+                inside[r0:r1, c0:c1] = True
+            d = np.where(inside, d, np.nan)
+            if arr.dsm is not None:
+                arr.dsm = np.where(inside, arr.dsm, np.nan)
         valid = np.isfinite(d) & (np.abs(d) < 9000)
         d = np.where(valid, d, np.nan)
         take = remaining & valid

@@ -836,7 +836,7 @@ function showResult(j) {
   $('miniDownload').href = `/api/jobs/${id}/model.3mf`; $('miniDownload').hidden = false;
   $('miniDetails').hidden = false;
   $('topImg').src = `/api/jobs/${id}/thumbnail.png?${Date.now()}`;
-  viewer.load(`/api/jobs/${id}/preview.bin`);
+  viewer.load(`/api/jobs/${id}/preview.bin?lod=${PREVIEW_LOD}`);
   selectTab('view');
 }
 
@@ -978,7 +978,10 @@ const viewer = {
     if ($('viewer').hidden) { this.pending = url; return; }
     this.init(); this.resize();
     $('viewerMsg').hidden = false; $('viewerMsg').textContent = 'Loading preview…';
-    const buf = await (await fetch(url)).arrayBuffer();
+    $('viewerNote').hidden = true;
+    const r = await fetch(url);
+    if (!r.ok) { $('viewerMsg').textContent = 'Preview not available.'; return; }
+    const buf = await r.arrayBuffer();   // gzip-encoded on the wire: the browser inflates it
     const hlen = new DataView(buf).getUint32(0, true);
     const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, hlen)));
     const base = 4 + hlen;
@@ -987,8 +990,10 @@ const viewer = {
     this.group.rotation.x = -Math.PI / 2; // 3MF is Z-up
     for (const p of header.parts) {
       const g = new THREE.BufferGeometry();
-      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(buf, base + p.vOffset, p.vCount * 3), 3));
-      g.setIndex(new THREE.BufferAttribute(new Uint32Array(buf, base + p.tOffset, p.tCount * 3), 1));
+      const [pos, idx] = header.version === 2 ? decodePart(buf, base, p, header)
+        : [new Float32Array(buf, base + p.vOffset, p.vCount * 3), new Uint32Array(buf, base + p.tOffset, p.tCount * 3)];
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      g.setIndex(new THREE.BufferAttribute(idx, 1));
       const mat = new THREE.MeshStandardMaterial({ color: p.color, roughness: 0.85, metalness: 0.0 });
       // smooth terrain, crisp walls / building edges
       const mesh = new THREE.Mesh(toCreasedNormals(g, Math.PI / 5), mat);
@@ -1015,8 +1020,31 @@ const viewer = {
     }
     this.camera.near = d / 100; this.camera.far = d * 20; this.camera.updateProjectionMatrix();
     $('viewerMsg').hidden = true;
+    if (header.simplified) {
+      const m = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} M` : `${Math.round(n / 1e3)} k`);
+      $('viewerNote').textContent = `Preview simplified to ${m(header.triangles)} of ${m(header.triangles_full)} triangles; the 3MF has full detail`;
+      $('viewerNote').hidden = false;
+    }
   },
 };
+
+// preview format 2 (maptomesh/export.py preview_bytes): uint16 positions quantised over the model's
+// bounding box, int32 index deltas
+function decodePart(buf, base, p, header) {
+  const q = new Uint16Array(buf, base + p.vOffset, p.vCount * 3);
+  const pos = new Float32Array(q.length);
+  const [lx, ly, lz] = header.lo, [sx, sy, sz] = header.scale;
+  for (let i = 0; i < q.length; i += 3) {
+    pos[i] = lx + q[i] * sx; pos[i + 1] = ly + q[i + 1] * sy; pos[i + 2] = lz + q[i + 2] * sz;
+  }
+  const d = new Int32Array(buf, base + p.tOffset, p.tCount * 3);
+  const idx = new Uint32Array(d.length);
+  let acc = 0;
+  for (let i = 0; i < d.length; i++) { acc += d[i]; idx[i] = acc; }
+  return [pos, idx];
+}
+// phones and low-memory devices get the lighter preview
+const PREVIEW_LOD = COARSE || MOBILE.matches || (navigator.deviceMemory && navigator.deviceMemory <= 4) ? 'low' : 'high';
 
 // ------------------------------------------------------------------ tabs
 function selectTab(name) {

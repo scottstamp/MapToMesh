@@ -154,6 +154,12 @@ def read_cog(url: str, aoi: AOI, grid: Grid, src_crs=None, nodata=None, band: in
     from rasterio.warp import reproject
 
     H, W = grid.vshape
+    if grid.read_blocks:   # only the rectangles under the gaps (Grid.read_blocks)
+        out = np.full((H, W), np.nan)
+        for r0, r1, c0, c1 in grid.read_blocks:
+            sub = Grid(int(c1 - c0 - 1), int(r1 - r0 - 1), grid.step, grid.x0 + c0 * grid.step, grid.y0 + r0 * grid.step)
+            out[r0:r1, c0:c1] = read_cog(url, aoi, sub, src_crs, nodata, band, scale)
+        return out
     dst = np.full((H, W), np.nan, dtype=np.float32)
     with _open(url) as src0:
         res = abs(src0.res[0])

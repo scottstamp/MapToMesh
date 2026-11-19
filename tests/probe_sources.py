@@ -3,6 +3,7 @@
     python tests/probe_sources.py                 # every DEM and point-cloud provider
     python tests/probe_sources.py ign_rgealti ...  # selected provider keys
     python tests/probe_sources.py --list
+    python tests/probe_sources.py --no-dsm        # as a ground-only job: providers skip their DSM
 
 DEM providers: fetch the sample area at 200 cells and check the share of valid heights and that the
 values are plausible. Point-cloud providers: find tiles for the sample area, open the first one
@@ -80,6 +81,7 @@ def main() -> None:
     ap.add_argument("keys", nargs="*")
     ap.add_argument("--cells", type=int, default=200)
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--no-dsm", action="store_true", help="fetch as a ground-only job (no surface models)")
     a = ap.parse_args()
     if providers.IMPORT_ERRORS:
         print("import errors:", providers.IMPORT_ERRORS)
@@ -95,7 +97,14 @@ def main() -> None:
             print(f"SKIP {p.key}: no sample area")
             continue
         try:
-            ok, msg = probe_dem(p, a.cells) if kind == "dem" else probe_pc(p)
+            if kind == "dem" and a.no_dsm:
+                token = dem._WANT_DSM.set(False)
+                try:
+                    ok, msg = probe_dem(p, a.cells)
+                finally:
+                    dem._WANT_DSM.reset(token)
+            else:
+                ok, msg = probe_dem(p, a.cells) if kind == "dem" else probe_pc(p)
         except Exception as e:  # noqa: BLE001
             ok, msg = False, f"{type(e).__name__}: {str(e)[:300]}"
         results.append(ok)

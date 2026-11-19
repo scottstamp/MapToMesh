@@ -10,7 +10,7 @@ import math
 
 import numpy as np
 
-from ..dem import DemArrays, DemProvider, register
+from ..dem import DemArrays, DemProvider, register, want_dsm
 from ..dem_readers import merge_fill, read_cog
 from ..usgs3dep import US_REGIONS
 
@@ -41,13 +41,14 @@ class Hrdem(DemProvider):
                         raise RuntimeError("Cancelled")
                     progress(k / max(len(items), 1), f"HRDEM {it['id']}")
                     futs = [(arr, ex.submit(read_cog, it["assets"][name]["href"], aoi, grid))
-                            for name, arr in (("dtm", dtm), ("dsm", dsm)) if it["assets"].get(name, {}).get("href")]
+                            for name, arr in (("dtm", dtm), ("dsm", dsm))[:2 if want_dsm() else 1]
+                            if it["assets"].get(name, {}).get("href")]
                     for arr, fut in futs:
                         merge_fill(arr, fut.result())
                     used.append(it["id"])
                 if np.isfinite(dtm).mean() > 0.98:
                     break
-        return DemArrays(dtm, dsm, ", ".join(used))
+        return DemArrays(dtm, dsm if np.isfinite(dsm).any() else None, ", ".join(used))
 
 
 class Usgs3depSeamless(DemProvider):

@@ -8,7 +8,7 @@ Masks/labels live on the *cell* grid (ny, nx).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 
 import numpy as np
@@ -63,6 +63,10 @@ class Grid:
     step: float  # metres per cell
     x0: float  # x of vertex column 0
     y0: float  # y of vertex row 0
+    # Only these (r0, r1, c0, c1) vertex-index rectangles (half-open) are wanted; () = all. Set by
+    # best_dems when elevation models only fill scattered gaps, honoured by read_cog (COG sources
+    # read just the tiles under the gaps); other readers may ignore it.
+    read_blocks: tuple = field(default=(), compare=False, repr=False)
 
     @classmethod
     def for_aoi(cls, aoi: AOI, cells_long_side: int) -> "Grid":

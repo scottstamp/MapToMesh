@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import struct
 import time
 import zipfile
@@ -14,6 +13,7 @@ from xml.sax.saxutils import escape, quoteattr
 
 import numpy as np
 
+from . import native
 from .model import Part
 
 NS_CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
@@ -34,17 +34,17 @@ RELS = """<?xml version="1.0" encoding="UTF-8"?>
 
 CHUNK = 200_000
 NATIVE_LEVEL = 6   # deflate level of the native writer (the Python one uses zlib's default, 6)
+# vertex coordinates in the 3MF: 1 um, far below any printer's resolution (a 6.9 M-triangle model
+# showed no degenerate, flipped or merged triangles from the rounding); ~2% smaller than 0.1 um
+DECIMALS = 3
 
 # Optional Rust extension (native/): formats and compresses the model XML on all cores. Without it
 # (not built, or MAPTOMESH_NATIVE=0) the pure-Python writer below produces the same content.
-try:
-    import maptomesh_native as _native
-except ImportError:
-    _native = None
+_native = native.ext
 
 
 def native_enabled() -> bool:
-    return _native is not None and os.environ.get("MAPTOMESH_NATIVE", "1") != "0"
+    return native.enabled()
 
 
 # A zip entry is a list of segments: bytes, ("vertices", (n, 3) float array) or
@@ -60,7 +60,8 @@ def _segment_bytes(seg: Segment):
     for s in range(0, len(a), CHUNK):
         rows = a[s:s + CHUNK].tolist()
         if kind == "vertices":
-            yield "".join(f'     <vertex x="{x:.4f}" y="{y:.4f}" z="{z:.4f}"/>\n' for x, y, z in rows).encode()
+            yield "".join(f'     <vertex x="{x:.{DECIMALS}f}" y="{y:.{DECIMALS}f}" z="{z:.{DECIMALS}f}"/>\n'
+                          for x, y, z in rows).encode()
         else:
             yield "".join(f'     <triangle v1="{p}" v2="{q}" v3="{r}"/>\n' for p, q, r in rows).encode()
 
@@ -85,7 +86,7 @@ def write_zip(path: Path, entries: list[tuple[str, list[Segment]]]) -> Path:
     if native_enabled():
         _native.write_zip(str(path), [(n, [s if isinstance(s, bytes) else (s[0], np.ascontiguousarray(s[1]))
                                           for s in segs]) for n, segs in entries],
-                          NATIVE_LEVEL, time.localtime()[:6])
+                          NATIVE_LEVEL, time.localtime()[:6], DECIMALS)
     else:
         _write_zip_py(path, entries)
     return path
@@ -227,44 +228,86 @@ def _stl_bytes(name: str, v: np.ndarray, t: np.ndarray) -> bytes:
 
 
 def write_stl_zip(path: Path, parts: list[Part]) -> Path:
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
-        used = set()
-        for p in parts:
-            base = "".join(ch if ch.isalnum() or ch in "-_ " else "_" for ch in p.name).strip().replace(" ", "_")
-            fname = f"{base}_{p.color[1:]}.stl"
-            k = 2
-            while fname in used:
-                fname = f"{base}_{p.color[1:]}_{k}.stl"; k += 1
-            used.add(fname)
-            zf.writestr(fname, _stl_bytes(p.name, p.mesh.vertices, p.mesh.triangles))
-    return path
-
-
-def preview_bytes(parts: list[Part], max_triangles: int = 6_000_000) -> bytes:
-    """Compact binary for the three.js viewer:
-    uint32 header length | JSON header | per part: float32 positions, uint32 indices."""
-    header = {"parts": []}
-    blobs = []
-    offset = 0
-    total = sum(len(p.mesh.triangles) for p in parts)
-    if total > max_triangles:
-        header["truncated"] = True
+    entries: list[tuple[str, list[Segment]]] = []
+    used = set()
     for p in parts:
-        v = np.ascontiguousarray(p.mesh.vertices, dtype=np.float32)
-        t = np.ascontiguousarray(p.mesh.triangles, dtype=np.uint32)
-        if total > max_triangles:
-            keep = max(1, int(len(t) * max_triangles / total))
-            t = t[:: max(1, len(t) // keep)]
-        vb, tb = v.tobytes(), t.tobytes()
+        base = "".join(ch if ch.isalnum() or ch in "-_ " else "_" for ch in p.name).strip().replace(" ", "_")
+        fname = f"{base}_{p.color[1:]}.stl"
+        k = 2
+        while fname in used:
+            fname = f"{base}_{p.color[1:]}_{k}.stl"; k += 1
+        used.add(fname)
+        entries.append((fname, [_stl_bytes(p.name, p.mesh.vertices, p.mesh.triangles)]))
+    return write_zip(path, entries)
+
+
+# 3D-preview levels of detail (triangle budgets): browsers turn every triangle into three unshared
+# vertices for crisp-edged shading, so a 7 M-triangle model needs ~0.5 GB there; phones get "low"
+PREVIEW_LODS = {"high": 2_000_000, "low": 600_000}
+
+
+def _preview_triangles(parts: list[Part], budget: int) -> tuple[list[np.ndarray], bool]:
+    """Per-part triangle arrays with about ``budget`` triangles in total: meshoptimizer
+    simplification (native extension), else every k-th triangle (holes, but a bounded size)."""
+    total = sum(len(p.mesh.triangles) for p in parts)
+    if total <= budget:
+        return [p.mesh.triangles for p in parts], False
+    share = budget / total
+    if native_enabled():
+        from concurrent.futures import ThreadPoolExecutor
+
+        def one(p: Part) -> np.ndarray:
+            t = p.mesh.triangles
+            if len(t) <= 256:
+                return t
+            return _native.simplify(np.ascontiguousarray(p.mesh.vertices, dtype=np.float32),
+                                    np.ascontiguousarray(t, dtype=np.int32), max(128, int(len(t) * share)), 0.01)
+        with ThreadPoolExecutor(max_workers=min(8, len(parts))) as ex:   # the GIL is released inside
+            return list(ex.map(one, parts)), True
+    return [p.mesh.triangles[:: max(1, int(round(1 / share)))] for p in parts], True
+
+
+def preview_bytes(parts: list[Part], budget: int = PREVIEW_LODS["high"]) -> bytes:
+    """Compact binary for the three.js viewer (version 2), gzip-compressed:
+
+        uint32 header length | JSON header | per part: uint16 positions, int32 index deltas
+
+    Positions are quantised over the whole model's bounding box (value = lo + q * scale, about
+    3 um steps on a 200 mm model; shared corners of adjacent parts stay identical); indices are
+    stored as differences from the previous index (prefix-sum to decode), which compresses far
+    better than absolute indices. Models over ``budget`` triangles are simplified for display."""
+    import gzip
+
+    tris, simplified = _preview_triangles(parts, budget)
+    allv = [p.mesh.vertices for p in parts if len(p.mesh.vertices)]
+    lo = np.min([v.min(axis=0) for v in allv], axis=0).astype(np.float64) if allv else np.zeros(3)
+    hi = np.max([v.max(axis=0) for v in allv], axis=0).astype(np.float64) if allv else np.ones(3)
+    scale = np.maximum(hi - lo, 1e-9) / 65535.0
+    header = {"version": 2, "lo": lo.tolist(), "scale": scale.tolist(), "parts": [],
+              "triangles": int(sum(len(t) for t in tris)),
+              "triangles_full": int(sum(len(p.mesh.triangles) for p in parts)), "simplified": simplified}
+    blobs: list[bytes] = []
+    offset = 0
+    for p, t in zip(parts, tris):
+        t = np.asarray(t, dtype=np.int64)
+        used = np.zeros(len(p.mesh.vertices), bool)   # drop the vertices simplification left unused
+        used[t.ravel()] = True
+        remap = np.cumsum(used) - 1
+        v = p.mesh.vertices[used].astype(np.float64)
+        q = np.clip(np.round((v - lo) / scale), 0, 65535).astype("<u2")
+        flat = remap[t].ravel()
+        d = np.diff(flat, prepend=0).astype("<i4")
+        vb = q.tobytes()
+        vb += b"\0" * (-len(vb) % 4)                  # the int32 view needs 4-byte alignment
         header["parts"].append({"name": p.name, "color": p.color, "category": p.category,
-                                "vOffset": offset, "vCount": len(v), "tOffset": offset + len(vb), "tCount": len(t)})
-        blobs += [vb, tb]
-        offset += len(vb) + len(tb)
+                                "vOffset": offset, "vCount": len(q), "tOffset": offset + len(vb), "tCount": len(t)})
+        blobs += [vb, d.tobytes()]
+        offset += len(vb) + 4 * len(d)
     hj = json.dumps(header).encode()
     hj += b" " * ((4 - (len(hj) + 4) % 4) % 4)
     buf = io.BytesIO()
     buf.write(struct.pack("<I", len(hj)))
     buf.write(hj)
-    for b in blobs:
-        buf.write(b)
-    return buf.getvalue()
+    for blob in blobs:
+        buf.write(blob)
+    return gzip.compress(buf.getvalue(), compresslevel=6, mtime=0)

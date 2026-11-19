@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -66,7 +67,21 @@ class Job:
 
 
 JOBS: "OrderedDict[str, Job]" = OrderedDict()
-_RUN_LOCK = threading.Lock()  # one generation at a time (memory-heavy)
+# At most two jobs in flight: one builds (CPU and memory heavy, one at a time) while the next
+# downloads its data (network-bound), so a queue moves up to twice as fast without holding more
+# than two models' data in memory. MAPTOMESH_PIPELINE=1 runs jobs strictly one after another.
+_PIPELINE = threading.BoundedSemaphore(max(1, int(os.environ.get("MAPTOMESH_PIPELINE", "2"))))
+_BUILD_LOCK = threading.Lock()
+
+
+def _wait_for(lock, job: "Job", msg: str) -> None:
+    """Acquire ``lock`` (Lock / Semaphore), showing ``msg`` meanwhile; raise if the job is cancelled."""
+    if lock.acquire(blocking=False):
+        return
+    job.set(job.progress, msg)
+    while not lock.acquire(timeout=0.5):
+        if job.cancel.is_set():
+            raise RuntimeError("Cancelled")
 
 
 def _slug(s: str) -> str:
@@ -79,49 +94,55 @@ def _run_job(job: Job) -> None:
     from .model import build_parts, compute_surface, get_elevation
     from .osm import fetch_osm, rasterize_osm
 
-    with _RUN_LOCK:
+    try:
+        _wait_for(_PIPELINE, job, "Queued behind other models")
+    except RuntimeError:
+        job.state, job.error = "cancelled", "Cancelled"
+        return
+    try:
         if job.cancel.is_set():
-            job.state = "cancelled"
-            return
+            raise RuntimeError("Cancelled")
         job.state = "running"
         o = job.opts
+        stage = lambda a, b: (lambda f, m: job.set(a + (b - a) * f, m))  # noqa: E731
+        from .providers.north_america import Hrdem
+        in_canada = Hrdem().covers(AOI(o.lat, o.lon, o.width_m, o.height_m).lonlat_bbox())
+        if o.source == "lidar" and not INDEX.ready and in_canada:
+            job.set(0.0, "Waiting for LiDAR tile index")
+            INDEX.start()
+            while not INDEX.ready:
+                if INDEX.state == "error":
+                    raise RuntimeError(f"Tile index failed: {INDEX.error}")
+                if job.cancel.is_set():
+                    raise RuntimeError("Cancelled")
+                job.set(0.0, f"Preparing LiDAR index: {INDEX.message}")
+                time.sleep(0.5)
+        elev = get_elevation(o, stage(0.0, 0.65), job.cancel)
+        aoi = AOI(o.lat, o.lon, o.width_m, o.height_m)
+        g = elev.grid
+        mm_per_m = (o.size_mm / max(g.nx, g.ny)) / g.step
+        osm = None
+        want_water = o.osm_water
+        want_roads = o.osm_roads != "none" and (o.color_mode == "landcover" or o.road_emboss_mm != 0)
+        want_bld = o.surface != "terrain" or o.color_mode == "landcover"
+        want_bridges = o.surface != "terrain"   # bridge decks over water (OSM tags them)
+        if want_water or want_roads or want_bld or want_bridges:
+            job.set(0.66, "Fetching OpenStreetMap layers")
+            try:
+                data = fetch_osm(aoi, g, o.osm_roads if want_roads else ("bridges" if want_bridges else "none"),
+                                 want_water, want_bld, progress=stage(0.66, 0.72))
+                osm = rasterize_osm(data, aoi, g, mm_per_m, o.road_min_width_mm, o.road_width_scale,
+                                    o.osm_roads if want_roads else "none",
+                                    o.osm_streams if o.osm_water else "none",
+                                    o.river_min_width_mm)
+                job.set(0.72, f"OpenStreetMap: {len(data['features']):,} features from {data['tiles']} tiles")
+            except Exception as e:  # noqa: BLE001 - OSM is optional
+                job.log.append(f"Warning: OpenStreetMap unavailable ({e}); continuing without it")
+        if job.cancel.is_set():
+            raise RuntimeError("Cancelled")
+        # the build: one at a time; the next job's download overlaps it
+        _wait_for(_BUILD_LOCK, job, "Data ready; waiting for the model ahead to finish building")
         try:
-            stage = lambda a, b: (lambda f, m: job.set(a + (b - a) * f, m))  # noqa: E731
-            from .providers.north_america import Hrdem
-            in_canada = Hrdem().covers(AOI(o.lat, o.lon, o.width_m, o.height_m).lonlat_bbox())
-            if o.source == "lidar" and not INDEX.ready and in_canada:
-                job.set(0.0, "Waiting for LiDAR tile index")
-                INDEX.start()
-                while not INDEX.ready:
-                    if INDEX.state == "error":
-                        raise RuntimeError(f"Tile index failed: {INDEX.error}")
-                    if job.cancel.is_set():
-                        raise RuntimeError("Cancelled")
-                    job.set(0.0, f"Preparing LiDAR index: {INDEX.message}")
-                    time.sleep(0.5)
-            elev = get_elevation(o, stage(0.0, 0.65), job.cancel)
-            aoi = AOI(o.lat, o.lon, o.width_m, o.height_m)
-            g = elev.grid
-            mm_per_m = (o.size_mm / max(g.nx, g.ny)) / g.step
-            osm = None
-            want_water = o.osm_water
-            want_roads = o.osm_roads != "none" and (o.color_mode == "landcover" or o.road_emboss_mm != 0)
-            want_bld = o.surface != "terrain" or o.color_mode == "landcover"
-            want_bridges = o.surface != "terrain"   # bridge decks over water (OSM tags them)
-            if want_water or want_roads or want_bld or want_bridges:
-                job.set(0.66, "Fetching OpenStreetMap layers")
-                try:
-                    data = fetch_osm(aoi, g, o.osm_roads if want_roads else ("bridges" if want_bridges else "none"),
-                                     want_water, want_bld, progress=stage(0.66, 0.72))
-                    osm = rasterize_osm(data, aoi, g, mm_per_m, o.road_min_width_mm, o.road_width_scale,
-                                        o.osm_roads if want_roads else "none",
-                                        o.osm_streams if o.osm_water else "none",
-                                        o.river_min_width_mm)
-                    job.set(0.72, f"OpenStreetMap: {len(data['features']):,} features from {data['tiles']} tiles")
-                except Exception as e:  # noqa: BLE001 - OSM is optional
-                    job.log.append(f"Warning: OpenStreetMap unavailable ({e}); continuing without it")
-            if job.cancel.is_set():
-                raise RuntimeError("Cancelled")
             job.set(0.74, "Building surface")
             surf = compute_surface(elev, o, osm)
             res = build_parts(elev, surf, o, stage(0.75, 0.88))
@@ -163,18 +184,21 @@ def _run_job(job: Job) -> None:
             }
             job.state = "done"
             job.set(1.0, "Done")
-        except Exception as e:  # noqa: BLE001
-            if job.cancel.is_set():
-                job.state, job.error = "cancelled", "Cancelled"
-            else:
-                job.state, job.error = "error", str(e)
-                job.log.append(traceback.format_exc(limit=3))
         finally:
-            # keep parts in memory only for recent jobs
-            done = [j for j in JOBS.values() if j.parts is not None]
-            for j in done[:-3]:
-                j.parts = None
-                j.base_parts = None
+            _BUILD_LOCK.release()
+    except Exception as e:  # noqa: BLE001
+        if job.cancel.is_set():
+            job.state, job.error = "cancelled", "Cancelled"
+        else:
+            job.state, job.error = "error", str(e)
+            job.log.append(traceback.format_exc(limit=3))
+    finally:
+        _PIPELINE.release()
+        # keep parts in memory only for recent jobs
+        done = [j for j in list(JOBS.values()) if j.parts is not None]
+        for j in done[:-3]:
+            j.parts = None
+            j.base_parts = None
 
 
 # ---------------------------------------------------------------- API
@@ -349,13 +373,29 @@ def job_stl(jid: str):
     return FileResponse(path, media_type="application/zip", filename=name)
 
 
+_PREVIEW_LOCK = threading.Lock()
+
+
 @app.get("/api/jobs/{jid}/preview.bin")
-def job_preview(jid: str):
-    from .export import preview_bytes
-    j = _job(jid)
-    if j.state != "done" or j.parts is None:
-        raise HTTPException(409, "Preview not available")
-    return Response(preview_bytes(j.parts), media_type="application/octet-stream")
+def job_preview(jid: str, lod: str = "high"):
+    """The 3D-preview mesh (``export.preview_bytes``, gzip-encoded) at a level of detail. Built on
+    the first request and kept with the job's files (so it outlives the job in memory); a job's
+    preview never changes, so browsers may cache it for good."""
+    from .export import PREVIEW_LODS, preview_bytes
+    if lod not in PREVIEW_LODS or not _JOB_ID.match(jid):
+        raise HTTPException(404, "Unknown preview")
+    path = config.OUTPUT_DIR / jid / f"preview_{lod}.bin.gz"
+    if not path.exists():
+        j = _job(jid)
+        if j.state != "done" or j.parts is None:
+            raise HTTPException(409, "Preview not available")
+        with _PREVIEW_LOCK:
+            if not path.exists():
+                tmp = path.with_suffix(".tmp")
+                tmp.write_bytes(preview_bytes(j.parts, PREVIEW_LODS[lod]))
+                tmp.replace(path)
+    return FileResponse(path, media_type="application/octet-stream",
+                        headers={"Content-Encoding": "gzip", "Cache-Control": "public, max-age=31536000, immutable"})
 
 
 # ---------------------------------------------------------------- reviews

@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import requests
 
-from ..dem import DemArrays, DemProvider, register
+from ..dem import DemArrays, DemProvider, register, want_dsm
 from ..dem_readers import merge_fill, read_cog, read_geotiff_bytes, request_res, service_get, service_tiles, src_bbox
 from ..lidar_index import Tile
 from ..pointcloud import PointCloudProvider, register_pointcloud
@@ -122,7 +122,8 @@ def _subgrids(grid, n: int = 2):
             r0, r1, c0, c1 = rows[i], rows[i + 1], cols[j], cols[j + 1]
             if r1 > r0 and c1 > c0:
                 yield r0, r1, c0, c1, dataclasses.replace(grid, nx=int(c1 - c0), ny=int(r1 - r0),
-                                                          x0=grid.x0 + c0 * grid.step, y0=grid.y0 + r0 * grid.step)
+                                                          x0=grid.x0 + c0 * grid.step, y0=grid.y0 + r0 * grid.step,
+                                                          read_blocks=())   # parent-grid indices
 
 
 def _read_cogs_split(urls: dict, aoi, grid, cancel, progress, src_crs=None, nodata=None) -> dict:
@@ -257,7 +258,7 @@ class IgnLidarHdMnt(DemProvider):
         progress(0.0, "IGN LiDAR HD MNT")
         dtm = _ign_wms("IGNF_LIDAR-HD_MNT_ELEVATION.ELEVATIONGRIDCOVERAGE.LAMB93", self.res_m, aoi, grid, cancel)
         dsm = None
-        if np.isfinite(dtm).any():
+        if want_dsm() and np.isfinite(dtm).any():
             progress(0.5, "IGN LiDAR HD MNS")
             dsm = _ign_wms("IGNF_LIDAR-HD_MNS_ELEVATION.ELEVATIONGRIDCOVERAGE.LAMB93", self.res_m, aoi, grid, cancel)
             dsm = _dsm_where_missing(dtm, dsm)
@@ -382,7 +383,7 @@ class SwissAlti3d(DemProvider):
         detail = f"swissALTI3D {gsd:g} m {n_dtm} ({', '.join(sorted({it['id'].split('_')[1] for it in items}))})"
         dsm = None
         _cancelled(cancel)
-        ditems = _latest_per_tile(_swiss_items("ch.swisstopo.swisssurface3d-raster", bbox))
+        ditems = _latest_per_tile(_swiss_items("ch.swisstopo.swisssurface3d-raster", bbox)) if want_dsm() else []
         durls = [u for u in (_swiss_tif(it, 0.5) for it in ditems) if u]
         f = max(f for f in (1, 2, 4) if 0.5 * f <= max(grid.step / 2, 0.5))   # overview read_cog will use
         est_mb = len(durls) * (2000 / f) ** 2 * 4 / 1e6   # LZW float32: ~4 bytes/px (measured)
@@ -469,7 +470,7 @@ class Ahn4(DemProvider):
         dtm, n = _mosaic(urls, aoi, g, cancel, progress, "AHN4 DTM", f0=0.0, f1=0.5)
         dtm = _fill_holes(dtm, grid.step)   # the DTM is empty under buildings and water
         _cancelled(cancel)
-        durls = _hits(_ahn_index("dsm"), bbox)
+        durls = _hits(_ahn_index("dsm"), bbox) if want_dsm() else []
         dsm = None
         if durls:
             dsm, _ = _mosaic(durls, aoi, g, cancel, progress, "AHN4 DSM", f0=0.5, f1=1.0)
@@ -497,10 +498,12 @@ class Luxembourg2024(DemProvider):
     def fetch(self, aoi, grid, progress, cancel):
         progress(0.0, "Luxembourg LiDAR 2024 DTM + DSM")
         g = _datum_grid(aoi, grid, 2169)
-        got = _read_cogs_split({"DTM": LU_BASE + "MNT_Lidar2024.tif", "DSM": LU_BASE + "MNS_Lidar2024.tif"},
-                               aoi, g, cancel, progress, src_crs=2169, nodata=-9999.0)
+        cogs = {"DTM": LU_BASE + "MNT_Lidar2024.tif"}
+        if want_dsm():
+            cogs["DSM"] = LU_BASE + "MNS_Lidar2024.tif"
+        got = _read_cogs_split(cogs, aoi, g, cancel, progress, src_crs=2169, nodata=-9999.0)
         dtm = _fill_holes(got["DTM"], grid.step, max_m2=2e5)
-        dsm = _dsm_where_missing(dtm, got["DSM"]) if np.isfinite(dtm).any() else None
+        dsm = _dsm_where_missing(dtm, got["DSM"]) if "DSM" in got and np.isfinite(dtm).any() else None
         return DemArrays(dtm, dsm, "MNT/MNS_Lidar2024.tif (EPSG:2169)")
 
 
@@ -539,7 +542,7 @@ class FlandersDhmv2(DemProvider):
         dtm = _fl_wcs("DHMVII_DTM_1m", aoi, grid, cancel)
         dtm = _fill_holes(dtm, grid.step, max_m2=2e5)
         dsm = None
-        if np.isfinite(dtm).any():
+        if want_dsm() and np.isfinite(dtm).any():
             progress(0.5, "DHMV II DSM")
             dsm = _dsm_where_missing(dtm, _fl_wcs("DHMVII_DSM_1m", aoi, grid, cancel))
         return DemArrays(dtm, dsm, "WCS DHMVII_DTM_1m / DHMVII_DSM_1m (EPSG:31370)")

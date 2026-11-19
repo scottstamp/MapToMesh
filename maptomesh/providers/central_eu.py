@@ -45,7 +45,7 @@ import numpy as np
 import requests
 
 from .. import config
-from ..dem import DemArrays, DemProvider, register
+from ..dem import DemArrays, DemProvider, register, want_dsm
 from ..dem_readers import merge_fill, read_cog, read_service, reproject_array, request_res, service_get, src_bbox
 from ..lidar_index import Tile
 from ..pointcloud import Cancelled, PointCloudProvider, register_pointcloud
@@ -265,7 +265,7 @@ class BevAustria(DemProvider):
         used = []
         steps = len(cells) * 2
         for k, (e, n) in enumerate(cells):
-            for j, (kind, arr) in enumerate((("DTM", dtm), ("DSM", dsm))):
+            for j, (kind, arr) in enumerate((("DTM", dtm), ("DSM", dsm))[:2 if want_dsm() else 1]):
                 if cancel.is_set():
                     raise Cancelled()
                 name = f"{ser['prefix'].format(kind)}CRS3035RES50000mN{n}E{e}.tif"
@@ -332,7 +332,8 @@ class LglnNiedersachsen(DemProvider):
     def fetch(self, aoi, grid, progress, cancel):
         bbox = aoi.lonlat_bbox(margin=grid.step * 3)
         dtm_items = _newest_per_tile(_stac_search("https://dgm.stac.lgln.niedersachsen.de", "dgm1", bbox), "dgm1-tif")
-        dsm_items = _newest_per_tile(_stac_search("https://bdom.stac.lgln.niedersachsen.de", "BDOM", bbox), "bdom20")
+        dsm_items = (_newest_per_tile(_stac_search("https://bdom.stac.lgln.niedersachsen.de", "BDOM", bbox), "bdom20")
+                     if want_dsm() else [])
         jobs = [("dtm", h) for _, h in dtm_items] + [("dsm", h) for _, h in dsm_items]
         res = _parallel(jobs, lambda j: read_cog(j[1], aoi, grid), progress, cancel, "LGLN DGM1/bDOM")
         dtm = np.full(grid.vshape, np.nan)
@@ -357,7 +358,7 @@ class _TileDem(DemProvider):
         raise NotImplementedError
 
     def fetch(self, aoi, grid, progress, cancel):
-        kinds = ("dtm", "dsm") if self.has_dsm else ("dtm",)
+        kinds = ("dtm", "dsm") if self.has_dsm and want_dsm() else ("dtm",)
         cells = _km_tiles(aoi, grid, self.epsg, self.tile_m)
         jobs = []
         for kind in kinds:
@@ -495,7 +496,7 @@ class MvWcs(DemProvider):
         bbox = src_bbox(aoi, grid, 25833)
         res = request_res(self.res_m, grid)
         out = {}
-        for k, (kind, (base, cov)) in enumerate(self.WCS.items()):
+        for k, (kind, (base, cov)) in enumerate(list(self.WCS.items())[:2 if want_dsm() else 1]):
             progress(k / 2, f"MV WCS {cov}")
 
             def tile(b, w, h, base=base, cov=cov):
@@ -504,8 +505,8 @@ class MvWcs(DemProvider):
                      f"&SCALESIZE=x({w}),y({h})&FORMAT=image/tiff")
                 return service_get(q)
             out[kind] = read_service(tile, bbox, res, 2000, aoi, grid, src_crs=25833, cancel=cancel)
-        dsm = out["dsm"] if np.isfinite(out["dsm"]).any() else None
-        return DemArrays(out["dtm"], dsm, f"WCS at {res:.1f} m")
+        dsm = out.get("dsm")
+        return DemArrays(out["dtm"], dsm if dsm is not None and np.isfinite(dsm).any() else None, f"WCS at {res:.1f} m")
 
 
 # ---------------------------------------------------------------- Flai open-lidar-data (COPC)
@@ -564,8 +565,9 @@ def _shp_index(prefix: str) -> dict:
         pos += d[16]
     if fpos is None:
         raise RuntimeError(f"{prefix}: no fname field")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(path, bbox=bbox, hlen=hlen, rlen=rlen, fpos=fpos, flen=flen, base=base)
+    buf = io.BytesIO()
+    np.savez(buf, bbox=bbox, hlen=hlen, rlen=rlen, fpos=fpos, flen=flen, base=base)
+    config.atomic_write(path, buf.getvalue())
     return {"bbox": bbox, "hlen": hlen, "rlen": rlen, "fpos": fpos, "flen": flen, "base": base}
 
 

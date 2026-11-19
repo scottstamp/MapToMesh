@@ -28,6 +28,5 @@ def stac_items(bbox: tuple[float, float, float, float], collection: str) -> list
     )
     r.raise_for_status()
     feats = r.json().get("features", [])
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps(feats))
+    config.atomic_write(cache, json.dumps(feats))
     return feats

@@ -218,6 +218,14 @@ def _process_ept_node(project, key: str, aoi: AOI, grid: Grid, cancel: threading
     return (None, data if len(data[0]) else None), "ok"
 
 
+# octree level of detail: point spacing of at most this many grid cells. Ground-only jobs read one
+# level coarser (3x fewer points, ~40% faster; St. John's harbour at 2000 cells: 0.3% of cells change
+# elevation band, model heights p99 0.03 mm); land-cover models keep the finer level, which their
+# tree outlines need.
+RESOLUTION_FACTOR = 0.7
+GROUND_RESOLUTION_FACTOR = 1.4
+
+
 def _process_tile(tile: Tile, aoi: AOI, grid: Grid, resolution: float, cancel: threading.Event):
     if cancel.is_set():
         raise Cancelled()
@@ -294,7 +302,7 @@ def _project_flags(name: str, n_bld: int, n_veg: int) -> tuple[bool, bool]:
         has_v = bool(k.get("vegetation")) or n_veg >= 100
         if has_b != bool(k.get("buildings")) or has_v != bool(k.get("vegetation")):
             known[name] = {"buildings": has_b, "vegetation": has_v}
-            _FLAGS_PATH.write_text(json.dumps(known, indent=1, sort_keys=True))
+            config.atomic_write(_FLAGS_PATH, json.dumps(known, indent=1, sort_keys=True))
     return has_b, has_v
 
 
@@ -302,8 +310,11 @@ def _plane_fit_ground(a: _Acc, shape: tuple[int, int], step: float) -> np.ndarra
     """Weighted least-squares plane z = h + b*x + c*y through the ground points of each
     vertex bin and its 8 neighbours (weights 1 / 0.3 / 0.1), evaluated at the vertex.
     Falls back to the bin mean where the fit is ill-conditioned; NaN where the bin itself
-    has no ground points."""
+    has no ground points. The native extension does the same on all cores."""
+    from . import native
     H, W = shape
+    if native.enabled():
+        return native.ext.plane_fit_ground(a.gcnt, a.gsum, a.gmom, H, W, float(step))
     n = a.gcnt.astype(np.float64).reshape(H, W)
     sz = a.gsum.reshape(H, W)
     mx, my, mxx, mxy, myy, mxz, myz = (m.reshape(H, W) for m in a.gmom)
@@ -436,7 +447,8 @@ def empty_result(grid: Grid, info: dict | None = None) -> LidarResult:
 
 def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: ProgressFn,
                 cancel: threading.Event | None = None, max_tiles: int = 2500,
-                workers: int = 6, us_source: str = "usgs", allow_empty: bool = False) -> LidarResult:
+                workers: int = 6, us_source: str = "usgs", allow_empty: bool = False,
+                ground_only: bool = False) -> LidarResult:
     """Classified point clouds on the grid. With ``allow_empty`` an area without point clouds,
     or one over the tile limit, returns an empty result (and a note) instead of raising, so that
     elevation models can take over."""
@@ -463,7 +475,7 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: Progres
     provider_of = {t.project: t.provider for t in tiles}
     provider_of.update({p.label: "usgs" for p in projects})
     # octree LOD giving ~1 point per (step/2)^2 at most
-    resolution = max(grid.step * 0.7, 0.25)
+    resolution = max(grid.step * (GROUND_RESOLUTION_FACTOR if ground_only else RESOLUTION_FACTOR), 0.25)
     hit0, miss0, req0 = RANGE_CACHE.counters()
     shape = grid.vshape
     accs: dict[str, _Acc] = defaultdict(lambda: _Acc(shape))

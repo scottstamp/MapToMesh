@@ -35,7 +35,8 @@ def same(a: Path, b: Path) -> bool:
 
 def native_zip(path: Path, items) -> None:
     export._native.write_zip(str(path), [(n, [s if isinstance(s, bytes) else (s[0], np.ascontiguousarray(s[1]))
-                                              for s in segs]) for n, segs in items], export.NATIVE_LEVEL)
+                                              for s in segs]) for n, segs in items], export.NATIVE_LEVEL,
+                                 decimals=export.DECIMALS)
 
 
 def main() -> int:
@@ -44,18 +45,22 @@ def main() -> int:
         return 0
     rng = np.random.default_rng(7)
     ties = np.array([[0.03125, -0.03125, 12.00005], [-0.0, 0.0, -0.00001], [1e6, -123456.78125, 0.99995],
+                     [0.0625, -0.0625, 0.0005], [2.0625, -0.0004, 0.9995],
                      [2.5e-5, 7.5e-5, 0.00015]], np.float32)
     rand = (rng.random((40_000, 3)) * 400 - 200).astype(np.float32)
     cases = {
         "rounding ties / signs (float32)": [("vertices", ties)],
         "rounding ties / signs (float64)": [("vertices", ties.astype(np.float64))],
         "1/32 mm grid (ties)": [("vertices", (np.round(rng.random((40_000, 3)) * 8000) / 32).astype(np.float32))],
+        "1/16 mm grid (ties at 3 decimals)": [("vertices", (np.round(rng.random((40_000, 3)) * 4000) / 16).astype(np.float32))],
         "random float32": [("vertices", rand)],
         "random float64": [("vertices", rng.random((10_000, 3)) * 1e4 - 5e3)],
         "int32 triangles": [("triangles", rng.integers(0, 2**31 - 1, (70_000, 3)).astype(np.int32))],
         "int64 triangles": [("triangles", rng.integers(0, 2**40, (1_000, 3)).astype(np.int64))],
         "empty arrays": [b"<a>", ("vertices", np.zeros((0, 3), np.float32)), ("triangles", np.zeros((0, 3), np.int32)), b"</a>"],
         "non-contiguous": [("vertices", rand[::3])],
+        "large raw bytes (split across cores)": [rng.integers(0, 4, 9_500_000, dtype=np.uint8).tobytes(), b"tail",
+                                                 ("triangles", np.arange(30, dtype=np.int32).reshape(10, 3)), b"x" * 5_000_000],
     }
     failures = 0
     with tempfile.TemporaryDirectory() as td:

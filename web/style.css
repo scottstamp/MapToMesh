@@ -30,6 +30,8 @@ main { flex: 1; min-width: 0; position: relative; display: flex; flex-direction:
 #viewer { position: relative; background: var(--viewer-bg); overflow: hidden; }
 #viewer canvas { display: block; }
 #viewerMsg { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); padding: 16px; text-align: center; }
+#viewerNote { position: absolute; left: 8px; bottom: 8px; max-width: calc(100% - 16px); padding: 3px 8px; border-radius: 5px;
+  font-size: 11.5px; color: var(--muted); background: color-mix(in srgb, var(--panel) 80%, transparent); pointer-events: none; }
 #topview { display: grid; place-items: center; background: var(--viewer-bg); overflow: auto; }
 #topview img { max-width: 95%; max-height: 95%; }
 [hidden] { display: none !important; }

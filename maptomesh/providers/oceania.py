@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from .. import config
-from ..dem import DemArrays, DemProvider, register
+from ..dem import DemArrays, DemProvider, register, want_dsm
 from ..dem_readers import merge_fill, read_cog, read_service, request_res, service_get, src_bbox
 
 # ---------------------------------------------------------------- New Zealand (LINZ)
@@ -138,7 +138,8 @@ class Linz1m(DemProvider):
     def fetch(self, aoi, grid, progress, cancel):
         dtm = np.full(grid.vshape, np.nan)
         dsm = np.full(grid.vshape, np.nan)
-        used = _linz_read([(self.DEM, dtm), (self.DSM, dsm)], aoi, grid, progress, cancel, "LINZ 1 m")
+        used = _linz_read([(self.DEM, dtm)] + ([(self.DSM, dsm)] if want_dsm() else []),
+                          aoi, grid, progress, cancel, "LINZ 1 m")
         dsm = np.where(np.isfinite(dtm), dsm, np.nan)   # surface only where the ground is known
         return DemArrays(dtm, dsm if np.isfinite(dsm).any() else None,
                          "NZTopo50 sheets " + ", ".join(used) if used else "")

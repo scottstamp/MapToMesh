@@ -125,8 +125,7 @@ def _cached_search(bbox: tuple[float, float, float, float], max_items: int) -> l
              "usgs_id": f.get("properties", {}).get("3dep:usgs_id"),
              "start": f.get("properties", {}).get("start_datetime"),
              "href": f.get("assets", {}).get("data", {}).get("href")} for f in feats]
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps(slim))
+    config.atomic_write(cache, json.dumps(slim))
     return slim
 
 

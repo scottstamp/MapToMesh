@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from ..dem import DemArrays, DemProvider, register
+from ..dem import DemArrays, DemProvider, register, want_dsm
 from ..dem_readers import (merge_fill, read_cog, reproject_array, request_res, service_get, service_tiles,
                            src_bbox)
 
@@ -150,8 +150,10 @@ class WalesLidar(DemProvider):
         progress(0.0, "Wales LiDAR DTM")
         dtm = read_cog(self.DTM, aoi, grid)
         _cancelled(cancel)
-        progress(0.5, "Wales LiDAR DSM")
-        dsm = read_cog(self.DSM, aoi, grid)
+        dsm = None
+        if want_dsm():
+            progress(0.5, "Wales LiDAR DSM")
+            dsm = read_cog(self.DSM, aoi, grid)
         return DemArrays(dtm, dsm, "wales_dtm_32bit_cog + wales_dsm_32bit_cog")
 
 
@@ -177,12 +179,12 @@ class EnglandEaLidar(DemProvider):
 
     def fetch(self, aoi, grid, progress, cancel):
         out = []
-        for k, (name, (slug, cov)) in enumerate((("DTM", self.DTM), ("first-return DSM", self.DSM))):
+        for k, (name, (slug, cov)) in enumerate((("DTM", self.DTM), ("first-return DSM", self.DSM))[:2 if want_dsm() else 1]):
             progress(k / 2, f"Environment Agency LiDAR {name}")
             # outside the survey footprint the WCS answers with zeros and no nodata tag
             out.append(_read_wcs(f"{self.BASE}/{slug}/wcs", cov, 27700, 1.0, aoi, grid, cancel,
                                  zero_is_nodata=True, extra={"geotiff:compression": "Deflate"}))
-        return DemArrays(out[0], out[1], "EA LIDAR Composite 2022 DTM + first-return DSM (WCS)")
+        return DemArrays(out[0], out[1] if len(out) > 1 else None, "EA LIDAR Composite 2022 DTM + first-return DSM (WCS)")
 
 
 # ------------------------------------------------------------------------------------------- Scotland
@@ -310,10 +312,11 @@ class ScotlandSrsp(DemProvider):
         dtm = np.full(grid.vshape, np.nan)
         dsm = np.full(grid.vshape, np.nan)
         used = []
+        wants = want_dsm()
         steps = max(1, len(groups))
         with ThreadPoolExecutor(WORKERS) as ex:
             for g, pr in enumerate(sorted(groups)):
-                for kind, arr in (("dtm", dtm), ("dsm", dsm)):
+                for kind, arr in (("dtm", dtm), ("dsm", dsm))[:2 if wants else 1]:
                     todo = []
                     for it in groups[pr][kind]:
                         lon, lat = _footprint_lonlat(it)
@@ -335,9 +338,9 @@ class ScotlandSrsp(DemProvider):
                             note = _srsp_note(cname, restricted[cname])
                             if note not in notes:
                                 notes.append(note)
-                if np.isfinite(dtm).all() and np.isfinite(dsm).all():
+                if np.isfinite(dtm).all() and (not wants or np.isfinite(dsm).all()):
                     break
-        return DemArrays(dtm, dsm, ", ".join(used), licence_notes=notes)
+        return DemArrays(dtm, dsm if wants else None, ", ".join(used), licence_notes=notes)
 
 
 # -------------------------------------------------------------------------------------------- Ireland
@@ -463,12 +466,12 @@ class _SouthTyrol(DemProvider):
 
     def fetch(self, aoi, grid, progress, cancel):
         out = []
-        for k, model in enumerate(("DigitalTerrainModel", "DigitalElevationModel")):   # DTM, DSM (DOM)
+        for k, model in enumerate(("DigitalTerrainModel", "DigitalElevationModel")[:2 if want_dsm() else 1]):   # DTM, DSM
             cov = f"p_bz-Elevation__{model}-{self.suffix}"
             progress(k / 2, f"South Tyrol {cov}")
             out.append(_read_wcs(BZ_WCS, cov, 25832, self.res_m, aoi, grid, cancel,
                                  extra={"geotiff:compression": "Deflate"}))
-        return DemArrays(out[0], out[1], f"Bolzano WCS DTM/DSM {self.suffix}")
+        return DemArrays(out[0], out[1] if len(out) > 1 else None, f"Bolzano WCS DTM/DSM {self.suffix}")
 
 
 class SouthTyrol05(_SouthTyrol):

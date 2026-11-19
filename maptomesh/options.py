@@ -118,5 +118,11 @@ class Options(BaseModel):
     layout: Literal["parts", "objects"] = "parts"
     name: str = Field("MapToMesh", max_length=80)
 
+    @property
+    def ground_only(self) -> bool:
+        """Bare terrain not coloured by land cover: only the ground is used, so no surface models
+        (DSM) are downloaded and LiDAR is read one octree level coarser."""
+        return self.surface == "terrain" and self.color_mode != "landcover"
+
     def elevation_key(self) -> str:
-        return f"v9|{'dem' if self.source == 'hrdem' else self.source}|{self.us_source}|{self.lat:.6f}|{self.lon:.6f}|{self.width_m:.1f}|{self.height_m:.1f}|{self.grid_cells}"
+        return ("g|" if self.ground_only else "") + f"v9|{'dem' if self.source == 'hrdem' else self.source}|{self.us_source}|{self.lat:.6f}|{self.lon:.6f}|{self.width_m:.1f}|{self.height_m:.1f}|{self.grid_cells}"

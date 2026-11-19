@@ -35,10 +35,16 @@ On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and co
 
 ### Optional native extension
 
-`native/` is a small Rust extension (PyO3) that writes the 3MF on all cores: about 15x faster for
-large models (a 6.9 M-triangle model: 12 s -> 0.8 s), with byte-identical content. Without it the
-pure-Python writer is used automatically. To build it (needs a Rust toolchain; on Windows the MSVC
-build tools):
+`native/` is a small Rust extension (PyO3) for the CPU-heavy steps, all on every core:
+
+- writing the 3MF (and the STL zip): a 6.9 M-triangle model takes 0.8 s instead of 12 s, with
+  byte-identical content;
+- simplifying the 3D preview of large models (meshoptimizer);
+- fitting the ground planes of the point clouds (3.5 s -> 0.03 s on a 3 M-cell grid).
+
+Without it the pure-Python versions are used automatically (the preview of a very large model is
+then thinned instead of simplified). To build it (needs a Rust toolchain and a C++ compiler; on
+Windows the MSVC build tools):
 
 ```bash
 .venv/Scripts/pip install maturin
@@ -46,7 +52,7 @@ build tools):
 ```
 
 For deployment, `maturin build --release -m native/Cargo.toml` makes a wheel (abi3: one wheel per
-OS / CPU for every Python >= 3.10). `MAPTOMESH_NATIVE=0` switches back to the Python writer.
+OS / CPU for every Python >= 3.10). `MAPTOMESH_NATIVE=0` switches back to the Python code.
 
 ## Using it
 
@@ -268,6 +274,23 @@ web/ (Leaflet + three.js)  ──HTTP──>  maptomesh/server.py (FastAPI, back
   through the same OSM-footprint routing as unclassified Canadian projects; where a project does
   classify both, leftover class-1 points inside OSM footprints still count as buildings
   (classifiers often skip the tallest towers - Chicago 2017 leaves Willis Tower in class 1).
+- **Ground-only jobs** (bare terrain coloured by a single colour or elevation bands) use only
+  the ground: LiDAR is read one octree level coarser (3x fewer points, ~0.03 mm height difference
+  on the printed model) and elevation models skip their surface model (DSM). On a 3.2 x 2.4 km
+  model at full detail that halves the download. Land-cover models keep the finer level: their
+  tree outlines need it.
+- **Filling gaps**: where point clouds cover most of the area, the elevation models that fill the
+  gaps are read only in 256 m blocks around them (plus a block of overlap for the datum offset),
+  not over the whole area - on the St. John's harbour model, 52 MB instead of 211 MB. Cloud-
+  optimized GeoTIFFs are read by fetching the tiles the warp needs in parallel first.
+- **Jobs**: up to two run at once - one building its model (CPU and memory heavy, one at a time)
+  while the next downloads its data (`MAPTOMESH_PIPELINE`, default 2; 1 = strictly one after
+  another). A model's parts are meshed in parallel threads (`MAPTOMESH_PART_WORKERS`, default 2: on a
+  3 M-cell model 25 s instead of 30 s, peak memory 6.0 GB instead of 4.3 GB).
+- **3D preview**: models over 2 M triangles are simplified for display (600 k on phones and
+  low-memory devices), quantised to 16-bit positions and gzip-compressed (a 6.9 M-triangle model:
+  14 MB instead of 125 MB); the preview is cached with the job's files and by browsers. The
+  downloads always have full detail.
 - **Caching LiDAR data**: CanElevation and 3DEP are free public services, so every byte read from
   them - COPC point-cloud nodes and HRDEM COG tiles - is kept in an on-disk block cache
   (`cache/nrcan_range_cache.sqlite`, 64 KiB blocks, LRU, default 10 GB via
@@ -306,7 +329,9 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 | `MAPTOMESH_SERVICE_CACHE_GB` | `2` (size limit of cached elevation-service responses) |
 | `MAPTOMESH_DATA_DIR` | `./data` (user reviews database; not a cache, keep it private) |
 | `MAPTOMESH_PUBLIC_URL` | `https://maptomesh.com` (base of the absolute URLs in link previews; empty = the URL each request came in on) |
-| `MAPTOMESH_NATIVE` | `1` (use the native 3MF writer when it is installed; `0` = pure Python) |
+| `MAPTOMESH_NATIVE` | `1` (use the native extension when it is installed; `0` = pure Python) |
+| `MAPTOMESH_PIPELINE` | `2` (jobs in flight: one building while the next downloads; `1` = one at a time) |
+| `MAPTOMESH_PART_WORKERS` | `2` (threads meshing a model's parts; more threads, more memory) |
 
 **Link previews**: the page carries Open Graph / Twitter-card metadata, so links posted to Discord,
 Slack, X, iMessage etc. show a preview. The server fills in absolute URLs (from

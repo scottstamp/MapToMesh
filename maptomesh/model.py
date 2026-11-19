@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
+import os
 import json
 import threading
 from collections import OrderedDict
@@ -67,7 +69,9 @@ def get_elevation(opts: Options, progress: ProgressFn, cancel: threading.Event) 
     else:
         arrays, info = _fetch_elevation(opts, aoi, grid, progress, cancel)
         info["grid"] = {"nx": grid.nx, "ny": grid.ny, "step_m": grid.step}
-        np.savez_compressed(path, info=np.frombuffer(json.dumps(info).encode(), dtype=np.uint8), **arrays)
+        buf = io.BytesIO()
+        np.savez_compressed(buf, info=np.frombuffer(json.dumps(info).encode(), dtype=np.uint8), **arrays)
+        config.atomic_write(path, buf.getvalue())
         elev = Elevation(opts.source, grid, arrays, info)
     with _MEM_LOCK:
         _MEM[key] = elev
@@ -95,7 +99,8 @@ def _fetch_elevation(opts: Options, aoi: AOI, grid: Grid, progress: ProgressFn,
     if opts.source == "lidar":
         from .lidar_index import INDEX
         r = fetch_lidar(aoi, grid, INDEX.get() if INDEX.ready else None, sub(0.0, 0.8), cancel,
-                        max_tiles=config.MAX_TILES, us_source=opts.us_source, allow_empty=True)
+                        max_tiles=config.MAX_TILES, us_source=opts.us_source, allow_empty=True,
+                        ground_only=opts.ground_only)
     else:
         r = empty_result(grid)
     info = r.info
@@ -114,7 +119,7 @@ def _fetch_elevation(opts: Options, aoi: AOI, grid: Grid, progress: ProgressFn,
     if need.any():
         lo = 0.8 if opts.source == "lidar" else 0.0
         comp = best_dems(aoi, grid, need=need, ref=np.where(covered, ground, np.nan),
-                         progress=sub(lo, 1.0), cancel=cancel)
+                         progress=sub(lo, 1.0), cancel=cancel, dsm=not opts.ground_only)
         take = need & np.isfinite(comp.dtm)
         ground[take] = comp.dtm[take]
         water[take] = 0.0
@@ -821,6 +826,11 @@ def _label_field(opts: Options, nx: int, ny: int, pad: int, frame_cells: float, 
     return lbl.stroke_field(segs, sw / 2, (R + 1, C + 1), cell_mm)
 
 
+# threads meshing parts: each holds large temporaries (a 3 M-cell model peaks at 4.3 GB with 1,
+# 6.0 GB with 2, 8.0 GB with 4 workers; build 30 / 25 / 23 s)
+PART_WORKERS = int(os.environ.get("MAPTOMESH_PART_WORKERS", "2"))
+
+
 def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: ProgressFn) -> BuildResult:
     g = elev.grid
     nx, ny = g.nx, g.ny
@@ -1110,6 +1120,7 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
     total = ntiles * len(defs) + (len(bre_) - 1) * (len(bce_) - 1) * len(base_defs)
     sources = {"base": base_src, "body": land, "frame": outline, "label": outline, "lfill": outline}
     jobs = [(parts, defs, re_, ce_, multi, "Tile"), (base_parts, base_defs, bre_, bce_, bmulti, "Base tile")]
+    tasks = []
     for target, dlist, rows_e, cols_e, is_multi, tword in jobs:
         nty, ntx = len(rows_e) - 1, len(cols_e) - 1
         for ty in range(nty):
@@ -1117,16 +1128,25 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
                 win = (rows_e[ty], rows_e[ty + 1], cols_e[tx], cols_e[tx + 1])
                 tname = f"{tword} {ty * ntx + tx + 1}" if is_multi else opts.name
                 for cat, name, color, labels, top, bottom in dlist:
-                    src = sources.get(cat, part)
-                    mesh = src.build_part(labels, top, bottom, win, cell_mm, tx * opts.tile_gap_mm,
-                                          ty * opts.tile_gap_mm, simplify=opts.simplify_mm)
-                    done += 1
-                    progress(0.2 + 0.8 * done / total, f"Meshing {name}" + (f" ({tname})" if is_multi else ""))
-                    if mesh is not None and len(mesh.triangles):
-                        if base_defs and target is parts:
-                            mesh = mesh.translate(0, 0, -base)  # sits on the bed; the base is its own print
-                        target.append(Part(name if not is_multi else f"{tname} - {name}", color.upper(), mesh,
-                                           tname, cat))
+                    tasks.append((target, is_multi, tname, cat, name, color, sources.get(cat, part),
+                                  (labels, top, bottom, win, cell_mm, tx * opts.tile_gap_mm, ty * opts.tile_gap_mm)))
+    # parts are independent and only read the partitions; NumPy's sorts / searches release the GIL,
+    # so they mesh in parallel (bounded: each part's temporaries are large). Results keep task order.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    meshes: list = [None] * len(tasks)
+    with ThreadPoolExecutor(max_workers=max(1, min(PART_WORKERS, len(tasks)))) as ex:
+        futs = {ex.submit(t[6].build_part, *t[7], simplify=opts.simplify_mm): i for i, t in enumerate(tasks)}
+        for fut in as_completed(futs):
+            i = futs[fut]
+            meshes[i] = fut.result()
+            done += 1
+            _, is_multi, tname, _, name = tasks[i][:5]
+            progress(0.2 + 0.8 * done / total, f"Meshing {name}" + (f" ({tname})" if is_multi else ""))
+    for (target, is_multi, tname, cat, name, color, _src, _args), mesh in zip(tasks, meshes):
+        if mesh is not None and len(mesh.triangles):
+            if base_defs and target is parts:
+                mesh = mesh.translate(0, 0, -base)  # sits on the bed; the base is its own print
+            target.append(Part(name if not is_multi else f"{tname} - {name}", color.upper(), mesh, tname, cat))
 
     # --- filaments
     colors_order: list[str] = []

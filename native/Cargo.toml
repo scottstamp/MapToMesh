@@ -17,6 +17,7 @@ numpy = "0.27"
 rayon = "1.10"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 crc32fast = "1.4"
+meshopt = "0.7"
 
 [profile.release]
 codegen-units = 1

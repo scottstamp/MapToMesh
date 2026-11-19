@@ -209,8 +209,7 @@ def _get_tile(url_tmpl: str, z: int, x: int, y: int) -> bytes:
             else:
                 r.raise_for_status()
                 data = r.content
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
+            config.atomic_write(path, data)
             return data
         except requests.RequestException:
             if attempt == 2:

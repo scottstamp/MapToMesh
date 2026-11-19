@@ -154,7 +154,7 @@ class ProjectIndex:
                           "geometry": {"type": "MultiPolygon", "coordinates": [[r] for r in rings if len(r) >= 4]}})
         data = gzip.compress(json.dumps({"type": "FeatureCollection", "features": feats},
                                         separators=(",", ":")).encode(), 6)
-        OVERLAY_PATH.write_bytes(data)
+        config.atomic_write(OVERLAY_PATH, data)
         return data
 
 

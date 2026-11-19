@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import requests
 
-from ..dem import DemArrays, DemProvider, register
+from ..dem import DemArrays, DemProvider, register, want_dsm
 from ..dem_readers import merge_fill, reproject_array, service_get, zoom_for
 from ..httpcache import RANGE_CACHE
 
@@ -296,7 +296,7 @@ class HongKongLidar2020(DemProvider):
         if not sheets:
             return DemArrays(dtm, dsm, "no sheets")
         jobs = [(name, kind, url if kind == "dtm" else url.replace("/2020dtm/", "/2020dsm/"))
-                for name, url in sheets for kind in ("dtm", "dsm")]
+                for name, url in sheets for kind in (("dtm", "dsm") if want_dsm() else ("dtm",))]
 
         def one(job):
             if cancel.is_set():

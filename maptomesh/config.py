@@ -15,6 +15,20 @@ DATA_DIR = Path(os.environ.get("MAPTOMESH_DATA_DIR", ROOT / "data"))
 for _d in (CACHE_DIR, OUTPUT_DIR, ELEV_CACHE_DIR, OSM_CACHE_DIR, DATA_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
+
+def atomic_write(path: Path, data: bytes | str) -> None:
+    """Write a cache file so that concurrent readers (two jobs downloading at once) see the old
+    file or the new one, never half of it."""
+    import threading
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_bytes(data.encode("utf-8") if isinstance(data, str) else data)
+    try:
+        os.replace(tmp, path)
+    except PermissionError:   # Windows: the file is open in another thread; theirs is as good
+        tmp.unlink(missing_ok=True)
+
 LIDAR_BASE = "https://canelevation-lidar-point-clouds.s3.ca-central-1.amazonaws.com/pointclouds_nuagespoints/"
 PROJECTS_ZIP_URL = LIDAR_BASE + "Index_LiDARprojects_projetslidar.zip"
 TILES_ZIP_URL = LIDAR_BASE + "Index_LiDARtiles_tuileslidar.zip"
