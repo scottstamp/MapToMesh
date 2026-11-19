@@ -33,6 +33,21 @@ python -m venv .venv
 On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and converts it into
 `cache/tile_index.npz` (~22 MB). The status line at the top of the sidebar shows progress.
 
+### Optional native extension
+
+`native/` is a small Rust extension (PyO3) that writes the 3MF on all cores: about 15x faster for
+large models (a 6.9 M-triangle model: 12 s -> 0.8 s), with byte-identical content. Without it the
+pure-Python writer is used automatically. To build it (needs a Rust toolchain; on Windows the MSVC
+build tools):
+
+```bash
+.venv/Scripts/pip install maturin
+.venv/Scripts/maturin develop --release -m native/Cargo.toml   # builds and installs into the venv
+```
+
+For deployment, `maturin build --release -m native/Cargo.toml` makes a wheel (abi3: one wheel per
+OS / CPU for every Python >= 3.10). `MAPTOMESH_NATIVE=0` switches back to the Python writer.
+
 ## Using it
 
 1. **Area** – search a place, then *Draw on map* (drag a box; for circle/hexagon drag from the
@@ -265,6 +280,7 @@ web/ (Leaflet + three.js)  ──HTTP──>  maptomesh/server.py (FastAPI, back
 ```bash
 .venv/Scripts/python tests/test_mesh_unit.py                    # offline mesh/raster checks
 .venv/Scripts/python tests/test_partition.py                    # offline iso-line partition checks
+.venv/Scripts/python tests/test_native_writer.py                # native 3MF writer == Python writer
 .venv/Scripts/python tests/probe_sources.py                    # every elevation provider, needs internet
 .venv/Scripts/python run.py --no-browser --port 8765            # in another terminal
 .venv/Scripts/python tests/integration.py                       # end-to-end, needs internet
@@ -290,6 +306,7 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 | `MAPTOMESH_SERVICE_CACHE_GB` | `2` (size limit of cached elevation-service responses) |
 | `MAPTOMESH_DATA_DIR` | `./data` (user reviews database; not a cache, keep it private) |
 | `MAPTOMESH_PUBLIC_URL` | `https://maptomesh.com` (base of the absolute URLs in link previews; empty = the URL each request came in on) |
+| `MAPTOMESH_NATIVE` | `1` (use the native 3MF writer when it is installed; `0` = pure Python) |
 
 **Link previews**: the page carries Open Graph / Twitter-card metadata, so links posted to Discord,
 Slack, X, iMessage etc. show a preview. The server fills in absolute URLs (from

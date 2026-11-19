@@ -1,0 +1,23 @@
+[package]
+name = "maptomesh-native"
+version = "0.1.0"
+edition = "2024"
+description = "Optional native speed-ups for MapToMesh (3MF writer)"
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0"  # see ../LICENSE.md
+publish = false
+
+[lib]
+name = "maptomesh_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3: one build works on every CPython >= 3.10
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
+numpy = "0.27"
+rayon = "1.10"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+crc32fast = "1.4"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
