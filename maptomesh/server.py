@@ -12,7 +12,7 @@ from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -454,9 +454,41 @@ def _value_error(_req, exc: ValueError):
     return JSONResponse({"detail": str(exc)}, status_code=400)
 
 
+SITE_TITLE = "MapToMesh: 3D-printable maps from LiDAR"
+SITE_DESCRIPTION = ("Turn LiDAR and elevation data into 3D-printable, multi-colour terrain and city models (3MF) "
+                    "of anywhere on Earth, with water, roads, buildings and trees.")
+EXAMPLE_IMAGE = ("/static/og-image.jpg", 1200, 630, "image/jpeg",
+                 "3D-printable model of San Francisco made with MapToMesh: streets, parks and the bay over the hills")
+
+
 @app.get("/")
-def index():
-    return FileResponse(config.WEB_DIR / "index.html")
+def index(request: Request, job: str | None = None):
+    """The UI, with link-preview metadata (absolute URLs) filled in."""
+    import html
+
+    base = config.PUBLIC_URL or str(request.base_url).rstrip("/")
+    title, desc, page = SITE_TITLE, SITE_DESCRIPTION, f"{base}/"
+    path, w, h, mime, alt = EXAMPLE_IMAGE
+    image = f"{base}{path}"
+    j = JOBS.get(job) if job and _JOB_ID.match(job) else None
+    if j is not None and j.state == "done" and j.result:
+        o = j.opts
+        title = f"{o.name} - MapToMesh"
+        desc = (f"3D-printable model of {o.width_m / 1000:g} x {o.height_m / 1000:g} km around "
+                f"{o.lat:.4f}, {o.lon:.4f} ({j.result['stats'].get('scale', '')}), made with MapToMesh.")
+        page = f"{base}/?job={j.id}"
+        image, w, h, mime, alt = f"{base}/api/jobs/{j.id}/thumbnail.png", None, None, "image/png", f"Top view of the {o.name} model"
+    esc = lambda v: html.escape(str(v), quote=True)  # noqa: E731 - names are user input
+    size_tags = [f'  <meta property="og:image:type" content="{mime}">']
+    if w:
+        size_tags += [f'  <meta property="og:image:width" content="{w}">',
+                      f'  <meta property="og:image:height" content="{h}">']
+    size = "\n".join(size_tags)
+    page_html = (config.WEB_DIR / "index.html").read_text(encoding="utf-8")
+    for key, val in (("__OG_IMAGE_META__", size), ("__OG_TITLE__", esc(title)), ("__OG_DESCRIPTION__", esc(desc)),
+                     ("__PAGE_URL__", esc(page)), ("__OG_IMAGE_ALT__", esc(alt)), ("__OG_IMAGE__", esc(image))):
+        page_html = page_html.replace(key, val)
+    return HTMLResponse(page_html)
 
 
 app.mount("/static", StaticFiles(directory=config.WEB_DIR), name="static")

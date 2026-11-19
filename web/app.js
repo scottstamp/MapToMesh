@@ -942,8 +942,10 @@ updateDerived();
 pollIndex();
 scheduleUsCoverage();
 
-// reopen a finished job from the URL (?job=<id>)
+// reopen a finished job from the URL (?job=<id>); &embed=1 shows only the 3D view (link previews,
+// screenshots: the preview image in the page's <head> metadata is rendered this way)
 const jobParam = new URLSearchParams(location.search).get('job');
+if (jobParam && new URLSearchParams(location.search).get('embed') === '1') document.body.classList.add('embed');
 // first visit: introduce the tool (not over a shared result link - the About link is always there)
 if (!jobParam && !localStorage.getItem(ABOUT_KEY)) openAbout();
 if (jobParam) {

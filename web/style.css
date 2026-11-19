@@ -135,3 +135,5 @@ button.secondary.active { background: var(--ink); color: #fff; border-color: var
 .hp { position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden; }
 .review-done { color: var(--ok); }
 
+/* ---- embed mode (?job=<id>&embed=1): the 3D view only */
+body.embed #sidebar, body.embed #tabs, body.embed #review { display: none !important; }
