@@ -263,6 +263,12 @@ class Partition:
     # ------------------------------------------------------------ solids
     def build_part(self, labels, top: FieldSpec, bottom: FieldSpec, window: tuple[int, int, int, int],
                    scale: float, ox: float, oy: float, simplify: float = 0.0) -> Mesh | None:
+        """A closed solid from the pieces labelled ``labels`` inside ``window`` (cells r0:r1 x c0:c1),
+        between the ``bottom`` and ``top`` fields. The native extension does the same, with the
+        same vertex and triangle order, much faster; this is the reference / fallback."""
+        res = _native_build_part(self, labels, top, bottom, window, scale, ox, oy, simplify)
+        if res is not NotImplemented:
+            return res
         r0, r1, c0, c1 = window
         labels = np.asarray(list(labels), dtype=np.int16)
         cell_of = np.arange(len(self.tris)) // 2
@@ -534,6 +540,33 @@ class Partition:
         cov_r, cov_c = np.nonzero(covered)
         merged_cells = (cov_r + r0) * self.C + (cov_c + c0)
         return np.concatenate(tris), merged_cells
+
+
+def _spec_arg(fs: FieldSpec):
+    if np.isscalar(fs.base):
+        return (None, float(fs.base), float(fs.offset), float(fs.lo), float(fs.hi))
+    b = np.asarray(fs.base)
+    if b.dtype != np.float64 or b.ndim != 1:   # the NumPy path interpolates in the field's dtype
+        return None
+    return (np.ascontiguousarray(b), 0.0, float(fs.offset), float(fs.lo), float(fs.hi))
+
+
+def _native_build_part(part: "Partition", labels, top: FieldSpec, bottom: FieldSpec, window, scale, ox, oy,
+                       simplify):
+    """Partition.build_part in the native extension, or NotImplemented (not built / disabled /
+    unexpected dtypes) to use the NumPy version."""
+    from . import native
+    if not native.enabled():
+        return NotImplemented
+    ts, bs = _spec_arg(top), _spec_arg(bottom)
+    arrays = [(part.tris, np.int64), (part.tri_label, np.int16), (part.p_keys, np.int64), (part.p_xy, np.float64),
+              (part.p_cnt, np.int64), (part.p_tri, np.int64), (part.p_label, np.int16)]
+    if ts is None or bs is None or any(a.dtype != dt for a, dt in arrays):
+        return NotImplemented
+    res = native.ext.build_part(*[np.ascontiguousarray(a) for a, _ in arrays], int(part.NV), int(part.C),
+                                [int(v) for v in labels], ts, bs, tuple(int(v) for v in window), float(scale),
+                                float(ox), float(oy), float(simplify))
+    return None if res is None else Mesh(res[0], res[1])
 
 
 # ---------------------------------------------------------------- shapes

@@ -39,6 +39,8 @@ On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and co
 
 - writing the 3MF (and the STL zip): a 6.9 M-triangle model takes 0.8 s instead of 12 s, with
   byte-identical content;
+- meshing the parts (`Partition.build_part`): about 5x faster, same vertices and triangles in the
+  same order as the NumPy version;
 - simplifying the 3D preview of large models (meshoptimizer);
 - fitting the ground planes of the point clouds (3.5 s -> 0.03 s on a 3 M-cell grid).
 

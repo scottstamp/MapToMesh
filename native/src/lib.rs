@@ -22,6 +22,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
 use rayon::prelude::*;
 
+mod partition;
+
 /// Rows of vertices / triangles per parallel work item (about 1.5-2 MB of XML).
 const ROWS_PER_CHUNK: usize = 32_768;
 /// Raw bytes per parallel work item (a large binary entry, e.g. an STL, uses every core).
@@ -476,8 +478,63 @@ fn plane_fit_ground<'py>(
     Ok(numpy::PyArray1::from_vec(py, out))
 }
 
+/// A FieldSpec as passed from Python: (flat float64 base array or None, scalar base, offset, lo, hi).
+type SpecArg<'py> = (Option<PyReadonlyArray1<'py, f64>>, f64, f64, f64, f64);
+
+/// `Partition.build_part` (see native/src/partition.rs): returns (vertices (n, 3) float32,
+/// triangles (m, 3) int32), or None when no piece carries the labels inside the window.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn build_part<'py>(
+    py: Python<'py>,
+    tris: PyReadonlyArray2<'py, i64>,
+    tri_label: PyReadonlyArray1<'py, i16>,
+    p_keys: PyReadonlyArray2<'py, i64>,
+    p_xy: numpy::PyReadonlyArray3<'py, f64>,
+    p_cnt: PyReadonlyArray1<'py, i64>,
+    p_tri: PyReadonlyArray1<'py, i64>,
+    p_label: PyReadonlyArray1<'py, i16>,
+    nv: i64,
+    ncols: i64,
+    labels: Vec<i16>,
+    top: SpecArg<'py>,
+    bottom: SpecArg<'py>,
+    window: (i64, i64, i64, i64),
+    scale: f64,
+    ox: f64,
+    oy: f64,
+    simplify: f64,
+) -> PyResult<Option<(Bound<'py, numpy::PyArray2<f32>>, Bound<'py, numpy::PyArray2<i32>>)>> {
+    let m = p_keys.as_array().ncols();
+    let part = partition::Part {
+        tris: tris.as_slice()?,
+        tri_label: tri_label.as_slice()?,
+        p_keys: p_keys.as_slice()?,
+        p_xy: p_xy.as_slice()?,
+        p_cnt: p_cnt.as_slice()?,
+        p_tri: p_tri.as_slice()?,
+        p_label: p_label.as_slice()?,
+        m,
+        nv,
+        c: ncols,
+    };
+    let tb = match &top.0 { Some(a) => Some(a.as_slice()?), None => None };
+    let bb = match &bottom.0 { Some(a) => Some(a.as_slice()?), None => None };
+    let ts = partition::Spec { base: tb, scalar: top.1, offset: top.2, lo: top.3, hi: top.4 };
+    let bs = partition::Spec { base: bb, scalar: bottom.1, offset: bottom.2, lo: bottom.3, hi: bottom.4 };
+    let res = py.detach(|| partition::build_part(&part, &labels, &ts, &bs, window, scale, ox, oy, simplify));
+    Ok(match res {
+        None => None,
+        Some((v, t)) => {
+            let (nv, nt) = (v.len() / 3, t.len() / 3);
+            Some((numpy::PyArray1::from_vec(py, v).reshape([nv, 3])?, numpy::PyArray1::from_vec(py, t).reshape([nt, 3])?))
+        }
+    })
+}
+
 #[pymodule]
 fn maptomesh_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(build_part, m)?)?;
     m.add_function(wrap_pyfunction!(plane_fit_ground, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(write_zip, m)?)?;
