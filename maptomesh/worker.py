@@ -10,7 +10,12 @@ Messages, child -> parent over a ``multiprocessing`` pipe:
     ("progress", fraction, message)
     ("ready_to_build",)          data is in; wait for ("build",) before the CPU / memory heavy part
     ("done", result)             result: the job's result dict (JSON-able), files are written
-    ("error", kind, message, trace)
+    ("error", kind, message, trace, public)
+
+``public``: ``message`` was written for users (a plain ``RuntimeError`` such as "No elevation data
+covers this area.", out of memory) and may be shown, with local paths removed (``scrub``); else it
+is an internal error, which the server logs and replaces by a generic message with an error id.
+The trace is only ever logged on the server, never shown.
 
 parent -> child: ("build",). Cancelling a job kills the child.
 """
@@ -27,6 +32,27 @@ import traceback
 def _slug(s: str) -> str:
     s = re.sub(r"[^A-Za-z0-9_-]+", "_", s).strip("_")
     return s[:60] or "model"
+
+
+_PATHS = re.compile(
+    r"(?<![\w/])(?:[A-Za-z]:[\\/]|\\\\)[^\s'\"<>|,;)\]]*"     # C:\... C:/... \\host\share\...
+    r"|(?<![\w.:/~-])/(?:home|root|Users|usr|opt|var|tmp|etc|srv|mnt|app|proc|private|data)/[^\s'\"<>|,;)\]]*")
+
+
+def scrub(text: str, limit: int = 600) -> str:
+    """``text`` for users: local file paths (this server's directories, user names) removed and
+    cut to ``limit`` characters. URLs of public data hosts are kept."""
+    text = _PATHS.sub("<file>", str(text))
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def public_error(e: BaseException) -> tuple[str, bool]:
+    """(message, public): see the module docstring."""
+    if isinstance(e, MemoryError):
+        return "Out of memory", True
+    if type(e) is RuntimeError and str(e):
+        return scrub(str(e)), True
+    return type(e).__name__, False
 
 
 def _oom_first() -> None:
@@ -53,9 +79,10 @@ def run(job_id: str, opts: dict, conn) -> None:
         result = _pipeline(job_id, opts, conn, progress)
         conn.send(("done", result))
     except MemoryError:
-        conn.send(("error", "memory", "Out of memory", traceback.format_exc(limit=3)))
+        conn.send(("error", "memory", "Out of memory", traceback.format_exc(limit=8), True))
     except Exception as e:  # noqa: BLE001
-        conn.send(("error", "error", str(e) or type(e).__name__, traceback.format_exc(limit=3)))
+        msg, public = public_error(e)
+        conn.send(("error", "error", msg, traceback.format_exc(limit=8), public))
     finally:
         try:
             conn.close()
@@ -101,7 +128,8 @@ def _pipeline(job_id: str, opts_d: dict, conn, progress) -> dict:
                                 o.river_min_width_mm)
             progress(0.72, f"OpenStreetMap: {len(data['features']):,} features from {data['tiles']} tiles")
         except Exception as e:  # noqa: BLE001 - OSM is optional
-            warnings.append(f"Warning: OpenStreetMap unavailable ({e}); continuing without it")
+            warnings.append(f"Warning: OpenStreetMap unavailable ({type(e).__name__}: {scrub(e, 300)}); "
+                            "continuing without it")
             progress(0.72, warnings[-1])
     # 3D buildings where the elevation is bare earth (PLATEAU in Japan, Overture heights elsewhere)
     from .buildings import fetch_buildings

@@ -2,36 +2,151 @@
 
 from __future__ import annotations
 
+import copy
+import hmac
 import json
+import logging
+import math
 import os
 import re
+import secrets
 import threading
 import time
 import traceback
 import uuid
-from collections import Counter, OrderedDict, deque
+from collections import Counter, OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from . import __version__, config
 from .geo import AOI, Grid
 from .lidar_index import INDEX, PROJECTS_GEOJSON
+from .limits import RateLimit, client_key
 from .options import Options
+from .worker import scrub
 
-app = FastAPI(title="MapToMesh", version=__version__)
+log = logging.getLogger("maptomesh")
+
+# no interactive API docs or schema in public: the page is the only client
+app = FastAPI(title="MapToMesh", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
 
 
-@app.middleware("http")
-async def _no_cache_ui(request, call_next):
-    resp = await call_next(request)
-    if request.url.path == "/" or request.url.path.startswith("/static/"):
-        resp.headers["Cache-Control"] = "no-cache"  # always revalidate the UI after updates
-    return resp
+# ---------------------------------------------------------------- middleware (plain ASGI: streams pass through)
+
+_SECURITY_HEADERS = ((b"x-content-type-options", b"nosniff"),
+                     (b"referrer-policy", b"strict-origin-when-cross-origin"),
+                     (b"x-frame-options", b"DENY"))
+
+
+class _Headers:
+    """Security headers on every response (kept where a route set its own, e.g. the proxy's
+    sandbox CSP), and ``Cache-Control: no-cache`` on the UI so browsers revalidate it after updates."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        path = scope.get("path", "")
+        ui = path == "/" or path.startswith("/static/")
+
+        async def send_(msg):
+            if msg["type"] == "http.response.start":
+                headers = [(k, v) for k, v in msg.get("headers", []) if not (ui and k.lower() == b"cache-control")]
+                have = {k.lower() for k, _ in headers}
+                headers += [(k, v) for k, v in _SECURITY_HEADERS if k not in have]
+                if ui:
+                    headers.append((b"cache-control", b"no-cache"))
+                msg = {**msg, "headers": headers}
+            await send(msg)
+
+        await self.app(scope, receive, send_)
+
+
+# Request bodies: the API takes small JSON documents (settings, reports) and the proxy forwards
+# small POST queries; anything larger is refused with 413 before it is read into memory.
+BODY_LIMIT = 64_000
+BODY_LIMITS = {"/api/proxy": 64_000,                # POST queries of catalogue APIs (STAC searches)
+               "/api/device-failures": 128_000}  # message + trace + browser facts
+REVIEW_BODY_LIMIT = 300_000                         # a review carries the browser's copy of its job
+
+
+def body_limit(path: str) -> int:
+    if path.startswith("/api/jobs/") and path.endswith("/review"):
+        return REVIEW_BODY_LIMIT
+    return BODY_LIMITS.get(path, BODY_LIMIT)
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+class _BodyLimit:
+    """413 for a request body over ``body_limit``: by its Content-Length before reading anything,
+    and by counting the bytes of a body without one (chunked) as the route reads it."""
+
+    def __init__(self, app):
+        self.app = app
+
+    @staticmethod
+    async def _refuse(send) -> None:
+        body = b'{"detail":"Request body too large"}'
+        await send({"type": "http.response.start", "status": 413,
+                    "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
+                                (b"connection", b"close")]})
+        await send({"type": "http.response.body", "body": body})
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        limit = body_limit(scope.get("path", ""))
+        for k, v in scope.get("headers", []):
+            if k.lower() == b"content-length":
+                if not v.strip().isdigit() or int(v) > limit:
+                    return await self._refuse(send)
+        seen = 0
+        over = False
+        started = False
+
+        async def receive_():
+            nonlocal seen, over
+            if over:
+                raise _BodyTooLarge()
+            msg = await receive()
+            if msg["type"] == "http.request":
+                seen += len(msg.get("body", b""))
+                if seen > limit:
+                    over = True
+                    raise _BodyTooLarge()
+            return msg
+
+        async def send_(msg):
+            nonlocal started
+            if over:
+                return        # whatever the route made of the aborted read; 413 follows
+            if msg["type"] == "http.response.start":
+                started = True
+            await send(msg)
+
+        try:
+            await self.app(scope, receive_, send_)
+        except Exception:
+            if not over:
+                raise
+        if over and not started:
+            await self._refuse(send)
+
+
+app.add_middleware(_BodyLimit)
+app.add_middleware(_Headers)       # outermost: every response, the 413s too
 
 
 # ---------------------------------------------------------------- jobs
@@ -55,9 +170,13 @@ class Job:
     seconds: float = 0.0          # active time (waiting for another model's build excluded)
     peak_mb: int = 0              # the job process's peak memory
     cancel: threading.Event = field(default_factory=threading.Event)
+    # not public: who submitted it (per-client job cap) and the secret that lets them cancel it
+    client: str = ""
+    cancel_token: str = ""
 
     def set(self, f: float, msg: str) -> None:
         self.progress = max(0.0, min(1.0, f))
+        msg = scrub(msg) if msg else msg       # progress text may quote errors: no local paths
         if msg and msg != self.message:
             self.message = msg
             # keep the log readable: drop repetitive per-tile updates
@@ -92,11 +211,29 @@ _CHILDREN_LOCK = threading.Lock()
 
 
 class _Stop(Exception):
-    """A job stopped by the server: ``kind`` is the reason (timeout / memory / cancelled / error)."""
+    """A job stopped by the server: ``kind`` is the reason (timeout / memory / cancelled / error).
+    ``public``: ``message`` was written for users; else it is replaced by a generic message with an
+    error id (``_internal_error``). ``trace`` only goes to the server log."""
 
-    def __init__(self, kind: str, message: str, trace: str = ""):
+    def __init__(self, kind: str, message: str, trace: str = "", public: bool = True):
         super().__init__(message)
-        self.kind, self.message, self.trace = kind, message, trace
+        self.kind, self.message, self.trace, self.public = kind, message, trace, public
+
+
+def _error_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def _internal_error(what: str, detail: str) -> str:
+    """Log an unexpected error with a short id; the id is what users see (and can report)."""
+    eid = _error_id()
+    log.error("%s [error %s]\n%s", what, eid, detail)
+    return eid
+
+
+def _job_failed_message(eid: str) -> str:
+    return (f"Something went wrong on the server while building this model (error id {eid}). "
+            "Trying again may help; if it keeps happening, please report it with this id.")
 
 
 def _wait_for(lock, job: "Job", msg: str) -> None:
@@ -114,8 +251,28 @@ def _slug(s: str) -> str:
     return s[:60] or "model"
 
 
+_JOB_ID = re.compile(r"[0-9a-f]{12}")      # uuid4().hex[:12]; always with fullmatch
+
+
+def valid_job_id(jid) -> bool:
+    return isinstance(jid, str) and _JOB_ID.fullmatch(jid) is not None
+
+
+def job_path(jid: str, name: str = "") -> Path:
+    """``OUTPUT_DIR/<jid>[/<name>]`` for a well-formed job id and a plain file name; anything else
+    (separators, drive or UNC paths, ``..``) is refused, so a request can't reach other files."""
+    if not valid_job_id(jid) or (name and (name != Path(name).name or name in (".", "..")
+                                           or "\\" in name or ":" in name)):
+        raise HTTPException(404, "Unknown job")
+    root = config.OUTPUT_DIR.resolve()
+    path = (root / jid / name) if name else (root / jid)
+    if not path.resolve().is_relative_to(root):
+        raise HTTPException(404, "Unknown job")
+    return path
+
+
 def _job_file(jid: str):
-    return config.OUTPUT_DIR / jid / "job.json"
+    return job_path(jid, "job.json")
 
 
 def _persist(job: Job) -> None:
@@ -146,8 +303,10 @@ def _prune_outputs() -> None:
 
 def _lookup(jid: str) -> Job | None:
     """A job from memory, or from its ``job.json`` after a restart; None if unknown or pruned."""
+    if not valid_job_id(jid):
+        return None
     j = JOBS.get(jid)
-    if j is not None or not _JOB_ID.match(jid):
+    if j is not None:
         return j
     path = _job_file(jid)
     if not path.exists():
@@ -214,7 +373,7 @@ def _run_job(job: Job) -> None:
             INDEX.start()
             while not INDEX.ready:
                 if INDEX.state == "error":
-                    raise RuntimeError(f"Tile index failed: {INDEX.error}")
+                    raise _Stop("error", f"The LiDAR tile index is not available. {INDEX.error or ''}".strip())
                 if job.cancel.is_set():
                     raise _Stop("cancelled", "Cancelled")
                 job.set(0.0, f"Preparing LiDAR index: {INDEX.message}")
@@ -253,7 +412,7 @@ def _run_job(job: Job) -> None:
                     result = msg[1]
                     break
                 elif msg[0] == "error":
-                    raise _Stop(msg[1], msg[2], msg[3])
+                    raise _Stop(msg[1], msg[2], msg[3], bool(msg[4]) if len(msg) > 4 else False)
             if wait_since is not None and not has_build:
                 if _BUILD_LOCK.acquire(blocking=False):
                     has_build = True
@@ -272,7 +431,7 @@ def _run_job(job: Job) -> None:
             _memory_check(job, me)
         job.seconds = time.time() - t0 - waited
         for w in result.pop("warnings", []):
-            job.log.append(w)
+            job.log.append(scrub(w))
         job.result = result
         job.state = "done"
         job.set(1.0, "Done")
@@ -281,13 +440,19 @@ def _run_job(job: Job) -> None:
         if s.kind == "cancelled" or job.cancel.is_set():
             job.state, job.error, job.error_kind = "cancelled", "Cancelled", "cancelled"
         else:
-            job.state, job.error = "error", s.message
+            # tracebacks and internal error text stay in the server log: users see the message
+            # (written for them) or a generic one with an error id to report
+            if s.public:
+                job.error = scrub(s.message)
+                if s.trace:
+                    log.info("job %s stopped (%s): %s\n%s", job.id, s.kind, s.message, s.trace)
+            else:
+                job.error = _job_failed_message(_internal_error(f"job {job.id} failed: {s.message}", s.trace))
+            job.state = "error"
             job.advice, job.suggest = limits.advice_for(s.kind, job.opts)
-            if s.trace:
-                job.log.append(s.trace)
-    except Exception as e:  # noqa: BLE001
-        job.state, job.error, job.error_kind = "error", str(e), "error"
-        job.log.append(traceback.format_exc(limit=3))
+    except Exception:  # noqa: BLE001
+        job.state, job.error_kind = "error", "error"
+        job.error = _job_failed_message(_internal_error(f"job {job.id} failed", traceback.format_exc()))
     finally:
         if proc is not None:
             if proc.is_alive():
@@ -400,15 +565,54 @@ def browser_config():
             "package": f"/api/browser/package.zip?v={version}"}
 
 
+# ---------------------------------------------------------------- per-client limits
+
+def _rate(limit, request: Request, message: str) -> str:
+    """Count a request against ``limit`` (``limits.RateLimit``); 429 with Retry-After when over.
+    Returns the client key."""
+    key = client_key(request)
+    wait = limit.hit(key)
+    if wait:
+        raise HTTPException(429, message, headers={"Retry-After": str(int(math.ceil(wait)))})
+    return key
+
+
+@contextmanager
+def _slot(slots, key: str):
+    """Hold one of ``slots`` (``limits.Slots``) or fail at once: 429 when this client already has
+    its share in use, 503 when the server is busy; never waits on a server thread."""
+    why = slots.enter(key)
+    if why == "client":
+        raise HTTPException(429, "Another request from here is still being worked on; try again in a moment",
+                            headers={"Retry-After": "2"})
+    if why:
+        raise HTTPException(503, "Busy; please try again in a moment", headers={"Retry-After": "5"})
+    try:
+        yield
+    finally:
+        slots.leave(key)
+
+
+def check_bbox(w: float, s: float, e: float, n: float, max_deg2: float | None = None) -> None:
+    """400 unless (w, s, e, n) is a finite lon/lat box with w < e and s < n (and at most
+    ``max_deg2`` square degrees)."""
+    if not all(math.isfinite(v) for v in (w, s, e, n)) or not (-180 <= w < e <= 180 and -90 <= s < n <= 90):
+        raise HTTPException(400, "Box out of range")
+    if max_deg2 is not None and (e - w) * (n - s) > max_deg2:
+        raise HTTPException(400, "Box too large")
+
+
 @app.get("/api/lidar/tiles")
-def lidar_tiles(w: float, s: float, e: float, n: float):
+def lidar_tiles(request: Request, w: float, s: float, e: float, n: float):
     """NRCan CanElevation tiles in a lon/lat box, for jobs built in the browser (the index is 22 MB)."""
     import dataclasses
-    if not (-180 <= w < e <= 180 and -90 <= s < n <= 90) or (e - w) * (n - s) > 25:
-        raise HTTPException(400, "Box out of range or too large")
+
+    from . import limits
+    check_bbox(w, s, e, n, 25)
+    _rate(limits.COVERAGE_RATE, request, "Too many requests from here; please try again later")
     if not INDEX.ready:
         raise HTTPException(503, "The LiDAR tile index is not available yet; try again in a minute.")
-    tiles = INDEX.get().query(w, s, e, n)[:5001]
+    tiles = INDEX.get().query(w, s, e, n, limit=5001)
     return {"tiles": [dataclasses.asdict(t) for t in tiles]}
 
 
@@ -419,10 +623,14 @@ async def data_proxy(request: Request, url: str = Query(..., max_length=4000)):
     from starlette.concurrency import run_in_threadpool
 
     from . import proxy
+    # refuse before reading anything: only allowlisted data URLs, and the body (POST queries of
+    # catalogue APIs) is capped by _BodyLimit
+    if not proxy.allowed(url, request.method):
+        raise HTTPException(403, "Not a data source this server forwards")
     body = await request.body() if request.method == "POST" else None
-    if body is not None and len(body) > 64_000:
+    if body is not None and len(body) > BODY_LIMITS.get("/api/proxy", BODY_LIMIT):
         raise HTTPException(413, "Request body too large")
-    client = request.client.host if request.client else "unknown"
+    client = client_key(request)
     try:
         status, headers, it = await run_in_threadpool(proxy.open_upstream, url, request.method,
                                                       dict(request.headers), body, client)
@@ -457,20 +665,24 @@ def projects():
     return FileResponse(PROJECTS_GEOJSON, media_type="application/geo+json")
 
 
-class AreaIn(BaseModel):
-    lat: float
-    lon: float
-    width_m: float = Field(gt=0)
-    height_m: float = Field(gt=0)
-    grid_cells: int = 600
-    us_source: str = "usgs"
-    source: str = "lidar"
-    ground_only: bool = False          # bare terrain not coloured by land cover
-    dem_preference: str = "mapterhorn"
+# The area fields as a job's (``Options``: same types, ranges and defaults), so coverage can't be
+# asked about areas no job could build (e.g. a 1500 km box, lat 95)
+AREA_FIELDS = ("lat", "lon", "width_m", "height_m", "grid_cells", "us_source", "source", "dem_preference")
+AreaIn = create_model(
+    "AreaIn", __config__=ConfigDict(allow_inf_nan=False),
+    ground_only=(bool, False),          # bare terrain not coloured by land cover
+    **{k: (Options.model_fields[k].annotation, copy.deepcopy(Options.model_fields[k])) for k in AREA_FIELDS})
 
 
 @app.post("/api/coverage")
-def coverage(a: AreaIn) -> dict:
+def coverage(a: AreaIn, request: Request) -> dict:
+    from . import limits
+    key = _rate(limits.COVERAGE_RATE, request, "Too many coverage checks from here; please try again later")
+    with _slot(limits.COVERAGE_SLOTS, key):
+        return _coverage(a)
+
+
+def _coverage(a) -> dict:
     aoi = AOI(a.lat, a.lon, a.width_m, a.height_m)
     grid = Grid.for_aoi(aoi, max(50, min(a.grid_cells, config.MAX_GRID_CELLS)))
     from . import providers  # noqa: F401 - registers elevation providers
@@ -510,7 +722,7 @@ def coverage(a: AreaIn) -> dict:
     out.update({
         "ready": True, "tiles": len(tiles), "ept_projects": len(projects), "max_tiles": max_tiles,
         "max_ept_km2": max_ept,
-        "area_km2": round(a.width_m * a.height_m / 1e6, 2), "errors": errors,
+        "area_km2": round(a.width_m * a.height_m / 1e6, 2), "errors": [scrub(x, 300) for x in errors],
         "projects": sorted(plist, key=lambda x: -x["year"]),
     })
     return out
@@ -524,56 +736,78 @@ def projects_usgs():
     try:
         return Response(EPT_INDEX.overlay(), media_type="application/geo+json",
                         headers={"Content-Encoding": "gzip"})
-    except Exception as ex:  # noqa: BLE001
-        raise HTTPException(502, f"USGS 3DEP project list unavailable: {ex}") from ex
+    except Exception:  # noqa: BLE001
+        eid = _internal_error("USGS 3DEP project list unavailable", traceback.format_exc())
+        raise HTTPException(502, f"USGS 3DEP project list unavailable (error id {eid})") from None
 
 
 @app.get("/api/coverage/usgs")
-def coverage_usgs(w: float = Query(...), s: float = Query(...), e: float = Query(...), n: float = Query(...)):
+def coverage_usgs(request: Request, w: float = Query(...), s: float = Query(...), e: float = Query(...),
+                  n: float = Query(...)):
     """USGS 3DEP tile footprints in a map view (only when zoomed in: one search per view)."""
+    from . import limits
     from .usgs3dep import footprints, in_us
 
+    if not all(math.isfinite(v) for v in (w, s, e, n)) or not (w < e and -90 <= s < n <= 90):
+        raise HTTPException(400, "Box out of range")
     bbox = (w, s, e, n)
-    if not in_us(bbox):
+    if w < -180 or e > 180 or not in_us(bbox):     # (a map view across the antimeridian)
         return {"type": "FeatureCollection", "features": [], "in_us": False}
     if (e - w) * (n - s) > 0.35:
         return {"type": "FeatureCollection", "features": [], "in_us": True, "too_large": True}
-    try:
-        gj = footprints(bbox)
-    except Exception as ex:  # noqa: BLE001
-        raise HTTPException(502, f"USGS 3DEP search failed: {ex}") from ex
+    key = _rate(limits.COVERAGE_RATE, request, "Too many coverage checks from here; please try again later")
+    with _slot(limits.COVERAGE_SLOTS, key):
+        try:
+            gj = footprints(bbox)
+        except Exception:  # noqa: BLE001
+            eid = _internal_error("USGS 3DEP search failed", traceback.format_exc())
+            raise HTTPException(502, f"USGS 3DEP search failed (error id {eid})") from None
     gj["in_us"] = True
     return gj
 
 
-def _refuse(kind: str, message: str, advice: list[str], suggest: dict | None = None, status: int = 422):
+def _refuse(kind: str, message: str, advice: list[str], suggest: dict | None = None, status: int = 422,
+            headers: dict | None = None):
     """A job refused before it starts: same fields as a failed job, for the UI's failure dialog."""
     return JSONResponse({"detail": message, "error_kind": kind, "advice": advice, "suggest": suggest or {}},
-                        status_code=status)
+                        status_code=status, headers=headers)
+
+
+_JOBS_LOCK = threading.Lock()
 
 
 @app.post("/api/jobs")
-def create_job(o: Options):
+def create_job(o: Options, request: Request):
+    """Queue a job. The reply's ``cancel_token`` is the only way to cancel it (``job_cancel``):
+    job ids appear in shared ``?job=`` links."""
     from . import limits
     try:
         limits.check(o)
     except limits.LimitError as e:
         return _refuse(e.kind, e.message, e.advice, e.suggest)
-    waiting = sum(1 for j in JOBS.values() if j.state in ("queued", "running"))
-    if waiting >= limits.MAX_QUEUE:
-        advice, _ = limits.advice_for("busy", o)
-        return _refuse("busy", f"The server is busy: {waiting} models are queued or being built.", advice,
-                       status=429)
-    job = Job(uuid.uuid4().hex[:12], o)
-    JOBS[job.id] = job
-    while len(JOBS) > 50:
-        JOBS.popitem(last=False)
+    key = client_key(request)
+    with _JOBS_LOCK:
+        active = [j for j in JOBS.values() if j.state in ("queued", "running")]
+        mine = sum(1 for j in active if j.client == key)
+        if mine >= limits.JOBS_PER_CLIENT:
+            return _refuse("busy", f"You already have {mine} model{'s' if mine > 1 else ''} queued or being built "
+                           "on the server; wait for one to finish (or cancel it).",
+                           ["Wait for your other model to finish, or cancel it, then try again."], status=429,
+                           headers={"Retry-After": "30"})
+        if len(active) >= limits.MAX_QUEUE:
+            advice, _ = limits.advice_for("busy", o)
+            return _refuse("busy", f"The server is busy: {len(active)} models are queued or being built.", advice,
+                           status=429, headers={"Retry-After": "60"})
+        job = Job(uuid.uuid4().hex[:12], o, client=key, cancel_token=secrets.token_urlsafe(18))
+        JOBS[job.id] = job
+        while len(JOBS) > 50:
+            JOBS.popitem(last=False)
     threading.Thread(target=_run_job, args=(job,), daemon=True).start()
-    return {"id": job.id}
+    return {"id": job.id, "cancel_token": job.cancel_token}
 
 
 def _job(jid: str) -> Job:
-    j = _lookup(jid)
+    j = _lookup(jid) if valid_job_id(jid) else None
     if not j:
         raise HTTPException(404, "Unknown job (finished models are kept for the last 10 jobs)")
     return j
@@ -585,9 +819,9 @@ def _done_file(jid: str, key: str):
     if j.state != "done":
         raise HTTPException(409, "Not ready")
     name = (j.result or {}).get(key)
-    if not name:
+    if not name or not isinstance(name, str):
         raise HTTPException(404, "No such file for this job")
-    path = config.OUTPUT_DIR / jid / name
+    path = job_path(jid, name)
     if not path.exists():
         raise HTTPException(410, "This model's files were removed (only the last 10 jobs are kept); generate it again")
     return path, name
@@ -599,8 +833,12 @@ def job_status(jid: str) -> dict:
 
 
 @app.post("/api/jobs/{jid}/cancel")
-def job_cancel(jid: str) -> dict:
+def job_cancel(jid: str, request: Request) -> dict:
+    """Cancel a job: only with the ``cancel_token`` its submission returned (``X-Cancel-Token``)."""
     j = _job(jid)
+    given = request.headers.get("x-cancel-token", "")
+    if not j.cancel_token or not hmac.compare_digest(given.encode(), j.cancel_token.encode()):
+        raise HTTPException(403, "Only the page that started this model can cancel it")
     j.cancel.set()
     return {"ok": True}
 
@@ -619,7 +857,7 @@ def job_base_3mf(jid: str):
 
 @app.get("/api/jobs/{jid}/thumbnail.png")
 def job_thumb(jid: str):
-    path = config.OUTPUT_DIR / jid / "thumbnail.png"
+    path = job_path(jid, "thumbnail.png")
     if not path.exists():
         raise HTTPException(404)
     return FileResponse(path, media_type="image/png")
@@ -636,9 +874,9 @@ def job_preview(jid: str, lod: str = "high"):
     """The 3D-preview mesh (``export.preview_bytes``, gzip-encoded) at a level of detail, written
     by the job's worker; a job's preview never changes, so browsers may cache it for good."""
     from .export import PREVIEW_LODS
-    if lod not in PREVIEW_LODS or not _JOB_ID.match(jid):
+    if lod not in PREVIEW_LODS or not valid_job_id(jid):
         raise HTTPException(404, "Unknown preview")
-    path = config.OUTPUT_DIR / jid / f"preview_{lod}.bin.gz"
+    path = job_path(jid, f"preview_{lod}.bin.gz")
     if not path.exists():
         j = _lookup(jid)
         raise HTTPException(409 if j is not None and j.state != "done" else 404, "Preview not available")
@@ -651,14 +889,9 @@ def download_estimate(o: Options, request: Request) -> dict:
     """About how much data building this model downloads (``maptomesh.estimate``): the page warns
     before building on a phone."""
     from . import estimate as est
-    if est.rate_limited(request.client.host if request.client else "unknown"):
-        raise HTTPException(429, "Too many estimates from here; please try again later")
-    if not est.SLOTS.acquire(timeout=20):
-        raise HTTPException(503, "Busy; please try again in a moment")
-    try:
+    key = _rate(est.RATE, request, "Too many estimates from here; please try again later")
+    with _slot(est.SLOTS, key):
         return est.estimate(o)
-    finally:
-        est.SLOTS.release()
 
 
 # ---------------------------------------------------------------- device failures
@@ -676,7 +909,7 @@ class DeviceFailureIn(BaseModel):
 def device_failure(f: DeviceFailureIn, request: Request) -> dict:
     """A build that failed in the user's browser (``maptomesh.device_failures``), for review."""
     from . import device_failures as df
-    if df.rate_limited(request.client.host if request.client else "unknown"):
+    if df.rate_limited(client_key(request)):
         raise HTTPException(429, "Too many reports from here")
     env = f.env if len(json.dumps(f.env, default=str)) <= 16_000 else {"dropped": "too large"}
     try:
@@ -695,8 +928,7 @@ def device_failure(f: DeviceFailureIn, request: Request) -> dict:
 def create_share(o: Options, request: Request) -> dict:
     """Store a model's settings for a share link (``/?s=<id>``; see ``maptomesh.shares``)."""
     from . import shares
-    addr = request.client.host if request.client else "unknown"
-    if shares.rate_limited(addr):
+    if shares.rate_limited(client_key(request)):
         raise HTTPException(429, "Too many share links from here; please try again later")
     return {"id": shares.store().add(o.model_dump())}
 
@@ -723,27 +955,13 @@ class ReviewIn(BaseModel):
     snapshot: dict | None = None                # the browser's copy of the job (server restarted)
 
 
-_JOB_ID = re.compile(r"^[0-9a-f]{12}$")
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_REVIEW_TIMES: dict[str, deque] = {}
-_REVIEW_LOCK = threading.Lock()
-REVIEWS_PER_HOUR = 20      # per client address
+REVIEWS_PER_HOUR = 20      # per client (limits.client_key)
 REVIEWS_PER_JOB = 10
+SNAPSHOT_MAX = 200_000     # bytes of the browser's copy of a job (JSON)
 
 
-def _rate_limited(addr: str) -> bool:
-    now = time.time()
-    with _REVIEW_LOCK:
-        q = _REVIEW_TIMES.setdefault(addr, deque())
-        while q and now - q[0] > 3600:
-            q.popleft()
-        if len(q) >= REVIEWS_PER_HOUR:
-            return True
-        q.append(now)
-        if len(_REVIEW_TIMES) > 10_000:   # forget idle addresses
-            for k in [k for k, v in _REVIEW_TIMES.items() if not v]:
-                _REVIEW_TIMES.pop(k, None)
-        return False
+REVIEW_RATE = RateLimit(REVIEWS_PER_HOUR)
 
 
 def _job_snapshot(job: Job) -> tuple[str, dict, dict]:
@@ -753,12 +971,12 @@ def _job_snapshot(job: Job) -> tuple[str, dict, dict]:
 
 
 def _client_snapshot(snap: dict) -> tuple[str, dict, dict]:
-    if len(json.dumps(snap)) > 200_000:
+    if len(json.dumps(snap)) > SNAPSHOT_MAX:
         raise HTTPException(413, "Job snapshot too large")
     try:
         opts = Options(**(snap.get("options") or {})).model_dump()
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(400, f"Invalid job settings in snapshot: {e}") from e
+    except Exception:  # noqa: BLE001
+        raise HTTPException(400, "Invalid job settings in snapshot") from None
     state = snap.get("state") if snap.get("state") in ("done", "error", "cancelled") else "unknown"
     result = {"result": snap.get("result"), "error": snap.get("error"), "log": (snap.get("log") or [])[-40:]}
     return state, opts, result
@@ -766,10 +984,15 @@ def _client_snapshot(snap: dict) -> tuple[str, dict, dict]:
 
 @app.post("/api/jobs/{jid}/review")
 def job_review(jid: str, rv: ReviewIn, request: Request) -> dict:
-    """Store a review of a job with the job's settings and result (see ``maptomesh.reviews``)."""
+    """Store a review of a job with the job's settings and result (see ``maptomesh.reviews``).
+
+    A job this server ran is reviewed with the server's own record of it. Any other well-formed
+    id needs the browser's copy of the job (``snapshot``): models built on the device (the default;
+    the page gives them an id in the same format) and server jobs from before a restart. The
+    store keeps a row and size budget (``reviews.KEEP``, ``reviews.MAX_MB``), oldest out first."""
     from .reviews import PROBLEM_KEYS, store
 
-    if not _JOB_ID.match(jid):
+    if not valid_job_id(jid):
         raise HTTPException(404, "Unknown job")
     problems = list(dict.fromkeys(rv.problems))
     if any(p not in PROBLEM_KEYS for p in problems):
@@ -781,9 +1004,7 @@ def job_review(jid: str, rv: ReviewIn, request: Request) -> dict:
         raise HTTPException(400, "Enter an email address so we can follow up (or untick follow-up)")
     if rv.website:   # bot: pretend it worked
         return {"ok": True, "id": 0}
-    addr = request.client.host if request.client else "unknown"
-    if _rate_limited(addr):
-        raise HTTPException(429, "Too many reviews from here; please try again later")
+    _rate(REVIEW_RATE, request, "Too many reviews from here; please try again later")
     st = store()
     if st.count_for_job(jid) >= REVIEWS_PER_JOB:
         raise HTTPException(429, "This model has already been reviewed several times")
@@ -804,8 +1025,39 @@ def job_review(jid: str, rv: ReviewIn, request: Request) -> dict:
 
 
 @app.exception_handler(ValueError)
-def _value_error(_req, exc: ValueError):
-    return JSONResponse({"detail": str(exc)}, status_code=400)
+def _value_error(req, exc: ValueError):
+    """An invalid value deep in a request's work: its text (paths, internals) stays in the log."""
+    eid = _internal_error(f"{req.method} {req.url.path}: ValueError",
+                          "".join(traceback.format_exception(exc)))
+    return JSONResponse({"detail": f"Invalid request (error id {eid})"}, status_code=400)
+
+
+@app.exception_handler(RequestValidationError)
+def _invalid_request(_req, exc: RequestValidationError):
+    """422 with FastAPI's error list (the page turns ``loc`` / ``msg`` / ``input`` into a message),
+    minus the parts that can't or shouldn't be echoed: NaN / Infinity inputs (which would make
+    the default handler fail with a 500), long inputs and exception context."""
+    from fastapi.encoders import jsonable_encoder
+    detail = []
+    for e in exc.errors()[:50]:
+        d = {k: e[k] for k in ("type", "loc", "msg") if k in e}
+        if "input" in e:
+            try:
+                text = json.dumps(jsonable_encoder(e["input"]), allow_nan=False)
+                if len(text) <= 200:
+                    d["input"] = json.loads(text)
+            except (TypeError, ValueError):
+                d["input"] = str(e["input"])[:50]
+        detail.append(jsonable_encoder(d))
+    return JSONResponse({"detail": detail}, status_code=422)
+
+
+@app.exception_handler(Exception)
+def _unexpected(req, exc: Exception):
+    """Any other failure: a generic 500 with an error id; the traceback goes to the log."""
+    eid = _internal_error(f"{req.method} {req.url.path}: {type(exc).__name__}",
+                          "".join(traceback.format_exception(exc)))
+    return JSONResponse({"detail": f"Internal server error (error id {eid})"}, status_code=500)
 
 
 SITE_TITLE = "MapToMesh: 3D-printable maps from LiDAR"
@@ -824,7 +1076,7 @@ def index(request: Request, job: str | None = None, s: str | None = None):
     title, desc, page = SITE_TITLE, SITE_DESCRIPTION, f"{base}/"
     path, w, h, mime, alt = EXAMPLE_IMAGE
     image = f"{base}{path}"
-    j = _lookup(job) if job and _JOB_ID.match(job) else None
+    j = _lookup(job) if job and valid_job_id(job) else None
     if j is not None and j.state == "done" and j.result:
         o = j.opts
         title = f"{o.name} - MapToMesh"

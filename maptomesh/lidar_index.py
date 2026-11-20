@@ -130,6 +130,9 @@ class Tile:
     class_map: dict | None = None  # source class -> ASPRS class (e.g. GeoSN uses 20 for non-ground)
 
 
+MAX_HITS = 10_000     # tiles one query returns at most (config.MAX_TILES per job is far below)
+
+
 class TileIndex:
     def __init__(self, bbox: np.ndarray, project_id: np.ndarray, urls: list[str], projects: list[str]):
         self.bbox = bbox
@@ -145,9 +148,13 @@ class TileIndex:
         projects = bytes(z["projects"]).decode("utf-8").split("\n")
         return cls(z["bbox"], z["project_id"], urls, projects)
 
-    def query(self, minx: float, miny: float, maxx: float, maxy: float) -> list[Tile]:
+    def query(self, minx: float, miny: float, maxx: float, maxy: float, limit: int = MAX_HITS) -> list[Tile]:
+        """Tiles overlapping the box: at most ``limit`` (a job uses at most a few hundred, and
+        callers only compare the count with their cap), so a huge box doesn't make the server
+        build hundreds of thousands of objects."""
         b = self.bbox
         hit = np.nonzero((b[:, 0] <= maxx) & (b[:, 2] >= minx) & (b[:, 1] <= maxy) & (b[:, 3] >= miny))[0]
+        hit = hit[:max(0, int(limit))]
         out = []
         for i in hit:
             u = self.urls[i]
@@ -277,8 +284,14 @@ class IndexManager:
             self.state = "ready"
             self._set(1.0, f"{len(self._index.urls):,} LiDAR tiles in {len(self._index.projects)} projects")
         except Exception as e:  # noqa: BLE001
+            # the details (paths, hosts) go to the server log; /api/status shows a short message
+            import logging
+            import uuid
+            eid = uuid.uuid4().hex[:8]
+            logging.getLogger("maptomesh").error("LiDAR tile index failed [error %s]: %s: %s", eid,
+                                                 type(e).__name__, e, exc_info=True)
             self.state = "error"
-            self.error = f"{type(e).__name__}: {e}"
+            self.error = f"The LiDAR tile index could not be prepared (error id {eid})."
 
     def load_now(self) -> bool:
         """Load an already-built index synchronously (job worker processes); False if not built."""

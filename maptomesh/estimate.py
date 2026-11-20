@@ -17,11 +17,9 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import os
-import threading
-import time
-from collections import deque
 
 from .geo import AOI, Grid
+from .limits import RateLimit, Slots
 from .options import Options
 
 EPT_BYTES_PER_POINT = 12.0       # LAZ in USGS Entwine nodes
@@ -132,26 +130,18 @@ def estimate(o: Options) -> dict:
     return {"mb": round(sum(p["mb"] for p in parts), 1), "parts": parts, "notes": notes}
 
 
-_LOCK = threading.Lock()
-_TIMES: dict[str, deque] = {}
-SLOTS = threading.BoundedSemaphore(int(os.environ.get("MAPTOMESH_ESTIMATES_CONCURRENT", "2")))
+# An estimate makes the server read file headers: at most ``PER_HOUR`` per client
+# (``limits.client_key``) and ``MAPTOMESH_ESTIMATES_CONCURRENT`` at once, one per client; a request
+# that finds no free slot is refused at once (``limits.Slots``), not queued on a server thread.
 PER_HOUR = int(os.environ.get("MAPTOMESH_ESTIMATES_PER_HOUR", "120"))
+RATE = RateLimit(PER_HOUR)
+SLOTS = Slots(int(os.environ.get("MAPTOMESH_ESTIMATES_CONCURRENT", "2")), per_client=1)
 
 
 def rate_limited(addr: str) -> bool:
-    """An estimate makes the server read file headers: at most ``PER_HOUR`` per client address."""
-    now = time.time()
-    with _LOCK:
-        q = _TIMES.setdefault(addr, deque())
-        while q and now - q[0] > 3600:
-            q.popleft()
-        if len(q) >= PER_HOUR:
-            return True
-        q.append(now)
-        if len(_TIMES) > 10_000:
-            for k in [k for k, v in _TIMES.items() if not v]:
-                _TIMES.pop(k, None)
-        return False
+    """Count an estimate for ``addr``; True if it is over ``PER_HOUR``."""
+    RATE.per_hour = PER_HOUR
+    return RATE.hit(addr) > 0
 
 
 def _dem_bytes(prov, aoi, grid, dsm) -> tuple[float | None, bool]:

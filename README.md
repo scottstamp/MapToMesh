@@ -418,6 +418,7 @@ web/ (Leaflet + three.js)  ──HTTP──>  maptomesh/server.py (FastAPI, back
 .venv/Scripts/python tests/test_browser_io.py                   # offline GDAL-free GeoTIFF reader / resampling / proxy allowlist
 .venv/Scripts/python tests/test_shares.py                       # offline share-link store
 .venv/Scripts/python tests/test_device_failures.py              # offline device-failure reports
+.venv/Scripts/python tests/test_server_security.py              # offline API hardening (bounds, body caps, ids, limits)
 .venv/Scripts/python tests/test_structures.py                   # offline bridge / OSM building-height checks
 .venv/Scripts/python tests/test_buildings.py                    # offline PLATEAU / Overture building checks
 .venv/Scripts/python tests/probe_sources.py                    # every elevation provider, needs internet
@@ -464,7 +465,23 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 | `MAPTOMESH_KEEP_SHARES` | `200000` (share links kept; the least recently used go first) |
 | `MAPTOMESH_SHARES_PER_HOUR` | `60` (new share links per client address per hour) |
 | `MAPTOMESH_ESTIMATES_PER_HOUR` | `120` (download estimates per client address per hour; each reads file headers) |
-| `MAPTOMESH_ESTIMATES_CONCURRENT` | `2` (download estimates computed at once) |
+| `MAPTOMESH_ESTIMATES_CONCURRENT` | `2` (download estimates computed at once, one per client; more are refused at once with 503 / 429) |
+| `MAPTOMESH_COVERAGE_PER_HOUR` | `1200` (coverage checks per client per hour: `/api/coverage`, `/api/coverage/usgs`, `/api/lidar/tiles`) |
+| `MAPTOMESH_COVERAGE_CONCURRENT` | `6` (coverage checks computed at once, two per client) |
+| `MAPTOMESH_JOBS_PER_CLIENT` | `2` (server jobs one client may have queued or running) |
+| `MAPTOMESH_KEEP_REVIEWS` | `20000` (reviews kept; the oldest go first) |
+| `MAPTOMESH_REVIEWS_MAX_MB` | `200` (size budget of the stored reviews; the oldest go first) |
+| `MAPTOMESH_FORWARDED_ALLOW_IPS` | `127.0.0.1` (reverse proxies trusted to set `X-Forwarded-For`; see below) |
+
+**Deployment behind a reverse proxy.** Per-client limits (jobs, estimates, coverage, shares,
+reviews, the data proxy) count against the client's address (IPv6: its /64). Behind nginx, Caddy
+or a tunnel, that address comes from `X-Forwarded-For`, which uvicorn only believes from the
+addresses in `MAPTOMESH_FORWARDED_ALLOW_IPS` (comma-separated IPs / CIDR ranges; `run.py` passes it
+on). Set it to the proxy's address, make the proxy overwrite (not pass through) the header, and
+never use `*` on a server that is reachable directly. Started some other way than `run.py`, give
+uvicorn the same `--proxy-headers --forwarded-allow-ips`. The API has no public docs or schema
+(`/docs`, `/openapi.json`), request bodies are capped (413), and error responses carry an error id
+instead of internals: the details go to the server log.
 
 **Link previews**: the page carries Open Graph / Twitter-card metadata, so links posted to Discord,
 Slack, X, iMessage etc. show a preview. The server fills in absolute URLs (from
