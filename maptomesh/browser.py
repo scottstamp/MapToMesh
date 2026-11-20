@@ -104,11 +104,21 @@ class InlineExecutor(cf.Executor):
     def __init__(self, *args, **kwargs):
         self.pending: list[DeferredFuture] = []
         self._hinted = 0
+        self._compact_at = 64
 
     def submit(self, fn, /, *args, **kwargs):
         f = DeferredFuture(self, fn, args, kwargs)
+        if len(self.pending) >= self._compact_at:
+            self._compact()
         self.pending.append(f)
         return f
+
+    def _compact(self) -> None:
+        """Forget tasks that have run: their results belong to whoever holds their futures (a
+        caller streaming tasks through a window would otherwise have every result kept here)."""
+        self._hinted = sum(1 for f in self.pending[:self._hinted] if f._task is not None)
+        self.pending = [f for f in self.pending if f._task is not None]
+        self._compact_at = max(64, 2 * len(self.pending))
 
     def hint(self) -> None:
         new = self.pending[self._hinted:]
@@ -383,15 +393,30 @@ class BrowserRangeCache:
                 runs.append([b, b])
         return [(a, b) for a, b in runs]
 
-    def _store(self, url: str, run: tuple[int, int], r) -> None:
+    def _store_whole(self, url: str, data: bytes) -> None:
+        """The whole file arrived (the server ignored Range, or a plain GET): it is the current
+        version, so it replaces every block of ``url`` held here or on disk, and fixes its size."""
+        for k in [k for k in self.blocks if k[0] == url]:
+            self.held -= len(self.blocks.pop(k))
+        _Disk.drop(f"b|{url}|")
+        self.sizes[url] = len(data)
+        self._meta_save(url)
+        self.requests += 1
+        self.miss_bytes += len(data)
+        for b in range((len(data) + self.block - 1) // self.block):
+            chunk = data[b * self.block:(b + 1) * self.block]
+            self._keep(url, b, chunk)
+            _Disk.put(self._bkey(url, b), chunk)
+
+    def _store(self, url: str, run: tuple[int, int], r) -> bool:
+        """Keep a response's blocks; True when it was the whole file (every block replaced)."""
         r.raise_for_status()
         self._validate(url, r)
-        size0 = self.sizes.get(url)
-        lo = run[0] * self.block
         data = r.content
-        if r.status_code == 200:              # range ignored: the whole file came back
-            self.sizes[url] = len(data)
-            data = data[lo:(run[1] + 1) * self.block]
+        if r.status_code != 206:              # range ignored: the whole file came back
+            self._store_whole(url, data)
+            return True
+        size0 = self.sizes.get(url)
         cr = r.headers.get("Content-Range", "")
         if "/" in cr and cr.rsplit("/", 1)[1].isdigit():
             self.sizes[url] = int(cr.rsplit("/", 1)[1])
@@ -412,15 +437,14 @@ class BrowserRangeCache:
     def _fetch(self, url: str, runs: list[tuple[int, int]]) -> None:
         reqs = [(self._real(url), self._range(run)) for run in runs]
         for run, r in zip(runs, http_many(reqs)):
-            self._store(url, run, r)
+            if self._store(url, run, r):      # the whole file: the other responses are no newer
+                break
 
     def _fetch_whole(self, url: str) -> None:
         r = http(self._real(url))
         r.raise_for_status()
-        n = len(r.content)
-        self.sizes[url] = n
-        if n:
-            self._store(url, (0, (n - 1) // self.block), r)
+        self._validate(url, r)
+        self._store_whole(url, r.content)
 
     def hint(self, url: str, ranges: list[tuple[int, int]] | None = None) -> None:
         """About to read these (start, length) ranges of ``url`` (None: the whole file): the worker
@@ -466,16 +490,23 @@ class BrowserRangeCache:
         runs = self._runs(url, list(range(b0, b1 + 1)), split=False)
         if runs:
             self._fetch(url, runs)
-        parts = []
+            size = self.sizes.get(url)        # a whole-file answer may have told the size
+            if size is not None:
+                n = max(0, min(n, size - start))
+        # one copy: the blocks' memoryviews, trimmed to the range, joined
+        parts, want, off = [], n, start - b0 * self.block
         for b in range(b0, b1 + 1):
-            d = self._block(url, b)
+            d = self._block(url, b) if want > 0 else None
             if d is None:
                 break
-            parts.append(d)
+            v = memoryview(d)[off:off + want]
+            parts.append(v)
             self.hit_bytes += len(d)
-        buf = b"".join(parts)
-        off = start - b0 * self.block
-        return buf[off:off + n]
+            want -= len(v)
+            off = 0
+            if len(d) < self.block:           # the file's last block
+                break
+        return b"".join(parts)
 
     def prefetch(self, url: str, ranges: list[tuple[int, int]], workers: int = 8) -> None:
         self._check(url)

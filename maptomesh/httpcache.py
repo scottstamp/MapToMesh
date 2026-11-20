@@ -162,22 +162,41 @@ class RangeCache:
         con = self._conn()
         rows = con.execute("SELECT block, data, used FROM blocks WHERE url_id = ? AND block BETWEEN ? AND ?",
                            (uid, b0, b1)).fetchall()
-        have = {b: d for b, d, _ in rows}
+        # a short block before the last one wanted was the file's end when cached: it has grown
+        have = {b: d for b, d, _ in rows if b == b1 or len(d) == BLOCK}
+        hit = sum(len(d) for d in have.values())
         missing = [b for b in range(b0, b1 + 1) if b not in have]
         if missing:
-            have.update(self._fetch(url, uid, missing, session))
+            got, whole = self._fetch(url, uid, missing, session)
+            if whole is not None:     # the server sent the whole file: it replaced every block
+                have, rows = got, []
+                n = max(0, min(n, whole - start))
+                if n == 0:
+                    return b""
+            else:
+                have.update(got)
         now = time.time()
         stale = [b for b, _, used in rows if used < now - TOUCH_S]   # LRU order only needs hours
         if stale:
             con.execute(f"UPDATE blocks SET used = ? WHERE url_id = ? AND block IN ({','.join('?' * len(stale))})",
                         (now, uid, *stale))
             con.commit()
-        buf = b"".join(have[b] for b in range(b0, b1 + 1) if b in have)
+        # one copy: the blocks' memoryviews, trimmed to the range, joined
         off = start - b0 * BLOCK
-        out = buf[off:off + n]
+        parts, want = [], n
+        for b in range(b0, b1 + 1):
+            d = have.get(b)
+            if d is None or want <= 0:
+                break
+            v = memoryview(d)[off:off + want]
+            parts.append(v)
+            want -= len(v)
+            off = 0
+            if len(d) < BLOCK:        # the file's last block
+                break
         with self._lock:
-            self.hit_bytes += sum(len(d) for _, d, _ in rows)
-        return out
+            self.hit_bytes += hit
+        return b"".join(parts)
 
     def prefetch(self, url: str, ranges: list[tuple[int, int]], workers: int = 8) -> None:
         """Download the (start, length) byte ranges of ``url`` that aren't cached yet, in parallel.
@@ -201,7 +220,27 @@ class RangeCache:
             for fut in [ex.submit(self.read, url, s, n) for s, n in pieces]:
                 fut.result()
 
-    def _fetch(self, url: str, uid: int, blocks: list[int], session) -> dict[int, bytes]:
+    def _store_whole(self, uid: int, data: bytes, etag: str | None) -> dict[int, bytes]:
+        """A server ignored the Range header and sent the whole file: it is the current version,
+        so it replaces every cached block of the URL (in one transaction) and fixes its size.
+        Without this, blocks of two versions of a file that changed would be mixed."""
+        blocks = {b: data[b * BLOCK:(b + 1) * BLOCK] for b in range((len(data) + BLOCK - 1) // BLOCK)}
+        con = self._conn()
+        now = time.time()
+        with con:
+            con.execute("DELETE FROM blocks WHERE url_id = ?", (uid,))
+            con.executemany("INSERT INTO blocks (url_id, block, data, used) VALUES (?, ?, ?, ?)",
+                            [(uid, b, d, now) for b, d in blocks.items()])
+            con.execute("UPDATE urls SET size = ?, etag = ?, checked = ? WHERE id = ?", (len(data), etag, now, uid))
+        with self._lock:
+            self.requests += 1
+            self.miss_bytes += len(data)
+            self._writes_since_check += len(blocks)
+        return blocks
+
+    def _fetch(self, url: str, uid: int, blocks: list[int], session) -> tuple[dict[int, bytes], int | None]:
+        """Download ``blocks`` of ``url`` -> ({block: data}, None), or ({every block}, file size)
+        when the server answered with the whole file (which then replaced all cached blocks)."""
         # contiguous runs -> one ranged GET each
         runs, cur = [], [blocks[0]]
         for b in blocks[1:]:
@@ -227,12 +266,14 @@ class RangeCache:
                     con.commit()
                     raise ChangedUpstream(f"{url.split('#')[0]} changed upstream (ETag {old} -> {tag})")
             data = r.content
+            if r.status_code != 206:  # server ignored the range: the whole file
+                out = self._store_whole(uid, data, tag)
+                self._maybe_evict()
+                return out, len(data)
             total = None
             cr = r.headers.get("Content-Range")  # "bytes lo-hi/total"
             if cr and "/" in cr and cr.rsplit("/", 1)[1].isdigit():
                 total = int(cr.rsplit("/", 1)[1])
-            if r.status_code == 200:  # server ignored the range: whole file
-                data = data[lo:hi + 1]
             with self._lock:
                 self.requests += 1
                 self.miss_bytes += len(data)
@@ -248,12 +289,16 @@ class RangeCache:
             con.commit()
         with self._lock:
             self._writes_since_check += len(blocks)
+        self._maybe_evict()
+        return out, None
+
+    def _maybe_evict(self) -> None:
+        with self._lock:
             check = self._writes_since_check > 2000
             if check:
                 self._writes_since_check = 0
         if check:
             self.evict()
-        return out
 
     def total_bytes(self) -> int:
         return int(self._conn().execute("SELECT COALESCE(SUM(LENGTH(data)), 0) FROM blocks").fetchone()[0])

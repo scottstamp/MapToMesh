@@ -16,7 +16,9 @@ request.
 from __future__ import annotations
 
 import json
+import logging
 import math
+import struct
 import threading
 import time
 
@@ -24,11 +26,15 @@ import numpy as np
 
 from .. import config, mvt
 
+log = logging.getLogger(__name__)
+
 STAC = "https://stac.overturemaps.org/catalog.json"
 TILES = "https://tiles.overturemaps.org/{release}/buildings.pmtiles"
 ZOOM = 14
 MAX_TILES = 100                  # ~15 x 15 km at mid latitudes (central Tokyo: ~0.9 MB per tile)
+WINDOW = 16                      # tiles downloaded (in parallel) and held at once
 LEVEL_M = 3.66                   # metres per floor (as OpenMapTiles' render_height)
+MAX_HEIGHT_M = 1000.0            # anything taller is a data error (the tallest building: 828 m)
 WORLD = 2 * math.pi * 6378137.0
 LICENCE = "ODbL 1.0"
 CREDIT = ("Buildings: © OpenStreetMap contributors, Overture Maps Foundation (ODbL); "
@@ -70,8 +76,18 @@ def _archive():
     if a is None:
         a = Archive(TILES.format(release=rel))
         with _lock:
+            _archives.clear()            # older releases' directories: deleted upstream anyway
             _archives[rel] = a
     return a, rel
+
+
+def _tiles(a, tiles: list[tuple[int, int]]):
+    """(x, y, tile bytes) of the archive's zoom-14 tiles among ``tiles``, ``WINDOW`` downloaded at
+    a time (up to 100 tiles of ~1-3 MB decompressed in a city: not all held at once)."""
+    for k in range(0, len(tiles), WINDOW):
+        got = a.get_many([(ZOOM, x, y) for x, y in tiles[k:k + WINDOW]])
+        for key in list(got):            # in order; each dropped once handed over
+            yield key[1], key[2], got.pop(key)
 
 
 def needed_tiles(aoi, grid, need: np.ndarray) -> set[tuple[int, int]]:
@@ -80,14 +96,20 @@ def needed_tiles(aoi, grid, need: np.ndarray) -> set[tuple[int, int]]:
     return _needed_tiles(aoi, grid, need, ZOOM)
 
 
-def _height(p: dict) -> float:
-    h = p.get("height")
-    if isinstance(h, (int, float)) and h > 0:
-        return float(h)
-    f = p.get("num_floors")
-    if isinstance(f, (int, float)) and f > 0:
-        return float(f) * LEVEL_M
+def _num(v) -> float:
+    """A plausible positive number from a tile's properties (NaN otherwise: missing, a string, a
+    flag, infinite, or beyond the tallest building)."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < MAX_HEIGHT_M:
+        return float(v)
     return math.nan
+
+
+def _height(p: dict) -> float:
+    h = _num(p.get("height"))
+    if h == h:
+        return h
+    f = _num(p.get("num_floors"))
+    return f * LEVEL_M if f * LEVEL_M < MAX_HEIGHT_M else math.nan
 
 
 def fetch(aoi, grid, need: np.ndarray, cancel=None, progress=lambda f, m: None) -> dict | None:
@@ -105,19 +127,24 @@ def fetch(aoi, grid, need: np.ndarray, cancel=None, progress=lambda f, m: None) 
     if len(tiles) > MAX_TILES:
         from . import TooLarge
         raise TooLarge(f"the area needs {len(tiles)} of its tiles, over {MAX_TILES}")
+    from . import Cancelled
     a, rel = _archive()
     progress(0.1, f"Overture buildings: {len(tiles)} tiles")
-    got = a.get_many([(ZOOM, x, y) for x, y in tiles])
     shape = grid.vshape
     h_out = np.full(shape, np.nan, np.float32)
     mask = np.zeros(shape, bool)
     other = np.zeros(shape, bool)
     to_aoi = Transformer.from_crs(3857, aoi.crs, always_xy=True)
     tile_m = WORLD / 2 ** ZOOM
-    for i, ((_, tx, ty), data) in enumerate(got.items()):
+    for i, (tx, ty, data) in enumerate(_tiles(a, tiles)):
         if cancel is not None and cancel.is_set():
-            raise RuntimeError("Cancelled")
-        layer = mvt.decode(data).get("building") if data else None
+            raise Cancelled()
+        try:
+            layer = mvt.decode(data).get("building") if data else None
+        except (ValueError, IndexError, KeyError, TypeError, struct.error) as e:   # a damaged tile: skip it
+            log.warning("Overture tile %d/%d/%d unreadable: %r", ZOOM, tx, ty, e)
+            continue
+        del data
         if not layer:
             continue
         ext = float(layer["extent"])
@@ -153,5 +180,5 @@ def fetch(aoi, grid, need: np.ndarray, cancel=None, progress=lambda f, m: None) 
             if h == h:
                 view = h_out[sl]
                 view[m] = np.fmax(view[m], h)
-        progress(0.1 + 0.9 * (i + 1) / len(got), f"Overture buildings: tile {i + 1}/{len(got)}")
+        progress(0.1 + 0.9 * (i + 1) / len(tiles), f"Overture buildings: tile {i + 1}/{len(tiles)}")
     return {"h": h_out, "mask": mask, "other": other, "tiles": len(tiles), "release": rel}
