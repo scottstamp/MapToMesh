@@ -59,6 +59,7 @@ class Partition:
         v00 = (r * self.W1 + c).ravel().astype(np.int64)
         v01, v10 = v00 + 1, v00 + self.W1
         v11 = v10 + 1
+        self.diag = np.asarray(diag_a, bool).reshape(R, C)   # never written: shared by copies
         a = diag_a.ravel()[:, None]
         t1 = np.where(a, np.column_stack([v00, v01, v11]), np.column_stack([v00, v01, v10]))
         t2 = np.where(a, np.column_stack([v00, v11, v10]), np.column_stack([v01, v11, v10]))
@@ -74,8 +75,24 @@ class Partition:
         self.p_cnt = np.zeros(0, np.int64)
         self.p_tri = np.zeros(0, np.int64)
         self.p_label = np.zeros(0, np.int16)
-        self.steps: list[tuple[np.ndarray, float, int | None, int | None]] = []
+        # (threshold, above, below, only) per step; the fields themselves are not kept (one
+        # float64 per vertex each): ``cell_label`` holds the steps applied to the cell centres
+        self.steps: list[tuple[float, int | None, int | None, int | None]] = []
+        self.cell_label = np.full((R, C), ACTIVE, np.int16)
         self._interior = INTERIOR_BASE
+
+    def copy(self) -> "Partition":
+        """An independent copy for further steps. The vertex indices of the source triangles
+        (``tris``, the largest array) are never written after construction and are shared."""
+        new = object.__new__(type(self))
+        new.__dict__.update(self.__dict__)
+        for k in ("tri_label", "p_keys", "p_xy", "p_org", "p_cnt", "p_tri", "p_label", "cell_label"):
+            setattr(new, k, getattr(self, k).copy())
+        new.steps = list(self.steps)
+        return new
+
+    def __deepcopy__(self, memo) -> "Partition":
+        return self.copy()
 
     # ------------------------------------------------------------ geometry helpers
     def vxy(self, vid: np.ndarray) -> np.ndarray:
@@ -91,6 +108,21 @@ class Partition:
         l2 = (e1[:, 0] * d[:, 1] - e1[:, 1] * d[:, 0]) / det
         fa, fb, fc = field[t[:, 0]], field[t[:, 1]], field[t[:, 2]]
         return fa + l1 * (fb - fa) + l2 * (fc - fa)
+
+    def _tri_sides(self, field: np.ndarray, th: float) -> tuple[np.ndarray, np.ndarray]:
+        """Per source triangle: all corners ``<= th`` / all corners ``>= th`` (as max / min of the
+        corners compared with ``th``, NaN corners: False). Computed on the vertex and cell grids:
+        no gather of ``tris`` - several times faster when most triangles are active."""
+        f = field.reshape(self.R + 1, self.W1)
+        a = self.diag
+        res = []
+        for side in (f <= th, f >= th):
+            s00, s01, s10, s11 = side[:-1, :-1], side[:-1, 1:], side[1:, :-1], side[1:, 1:]
+            t = np.empty((self.R, self.C, 2), bool)
+            np.logical_and(s00 & s01, np.where(a, s11, s10), out=t[..., 0])
+            np.logical_and(np.where(a, s00, s01) & s11, s10, out=t[..., 1])
+            res.append(t.reshape(-1))
+        return res[0], res[1]
 
     def _poly_field(self, field: np.ndarray, idx: np.ndarray) -> np.ndarray:
         keys = self.p_keys[idx]
@@ -125,15 +157,24 @@ class Partition:
         field = np.asarray(field, dtype=np.float64).ravel()
         sidx = len(self.steps)
         assert sidx < MAX_STEPS
-        self.steps.append((field, th, above, below, only))
+        self.steps.append((th, above, below, only))
         src = ACTIVE if only is None else only
+        self._classify_cells(field, th, above, below, src)
 
         # full triangles
         act = np.nonzero(self.tri_label == src)[0]
-        fv = field[self.tris[act]]
-        fmax, fmin = fv.max(axis=1), fv.min(axis=1)
-        out = fmax <= th
-        inn = ~out & (fmin >= th)
+        if 4 * len(act) > len(self.tri_label):
+            le, ge = self._tri_sides(field, th)
+            out = le[act]
+            inn = ~out & ge[act]
+            del le, ge
+        else:   # element-wise max / min chains: much faster than .max(axis=1) on (n, 3)
+            t = self.tris[act]
+            f0, f1, f2 = field[t[:, 0]], field[t[:, 1]], field[t[:, 2]]
+            del t
+            out = np.maximum(np.maximum(f0, f1), f2) <= th
+            inn = ~out & (np.minimum(np.minimum(f0, f1), f2) >= th)
+            del f0, f1, f2
         cross = ~out & ~inn
         if below is not None:
             self.tri_label[act[out]] = below
@@ -166,9 +207,14 @@ class Partition:
             return
         f = self._poly_field(field, pidx)
         M = self.M
-        valid = np.arange(M)[None, :] < self.p_cnt[pidx][:, None]
-        fmax = np.where(valid, f, -np.inf).max(axis=1)
-        fmin = np.where(valid, f, np.inf).min(axis=1)
+        cnt = self.p_cnt[pidx]
+        fmax = np.maximum(np.maximum(f[:, 0], f[:, 1]), f[:, 2])   # every polygon has >= 3 corners
+        fmin = np.minimum(np.minimum(f[:, 0], f[:, 1]), f[:, 2])
+        for j in range(3, M):
+            v = cnt > j
+            if v.any():
+                fmax = np.where(v, np.maximum(fmax, f[:, j]), fmax)
+                fmin = np.where(v, np.minimum(fmin, f[:, j]), fmin)
         out = fmax <= th
         inn = ~out & (fmin >= th)
         if below is not None:
@@ -248,10 +294,33 @@ class Partition:
         self.tri_label[self.tri_label == ACTIVE] = label
         self.p_label[self.p_label == ACTIVE] = label
 
+    def _classify_cells(self, field: np.ndarray, th: float, above, below, src: int) -> None:
+        """Apply one step to the cell centres (field = mean of the four corners)."""
+        if above is None and below is None:
+            return
+        f = field.reshape(self.R + 1, self.W1)
+        v = np.add(f[:-1, :-1], f[:-1, 1:])      # (f00 + f01 + f10 + f11) / 4, fewer temporaries
+        v += f[1:, :-1]
+        v += f[1:, 1:]
+        v /= 4
+        lab = self.cell_label
+        act = lab == src
+        if below is not None:
+            lab[act & (v <= th)] = below
+        if above is not None:
+            lab[act & (v > th)] = above
+
+    def cell_labels(self, default: int) -> np.ndarray:
+        """Label of every cell centre under the steps so far (unfinished cells: ``default``)."""
+        lab = self.cell_label.copy()
+        lab[lab == ACTIVE] = default
+        return lab
+
     def classify(self, values: list[np.ndarray], default: int) -> np.ndarray:
-        """Apply the recorded steps to arbitrary sample points (e.g. cell centres)."""
+        """Apply the recorded steps to arbitrary sample points (``values``: each step's field at
+        those points)."""
         lab = np.full(values[0].shape, ACTIVE, np.int16)
-        for (field, th, above, below, only), v in zip(self.steps, values):
+        for (th, above, below, only), v in zip(self.steps, values):
             act = lab == (ACTIVE if only is None else only)
             if below is not None:
                 lab[act & (v <= th)] = below

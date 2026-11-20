@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import io
 import os
@@ -397,7 +396,7 @@ def _bare_earth_buildings(bld_v, Gf, bare, so, osm, step, notes):
             lab_b = np.where(pm, ids, 0)
             idx = np.unique(lab_b[lab_b > 0])
             lut = np.zeros(int(ids.max()) + 1)
-            lut[idx] = ndimage.minimum(ground(pm), lab_b, idx)
+            lut[idx] = _label_reduce(np.minimum, ground(pm), lab_b, int(ids.max()))[idx - 1]
             bld_v = np.where(pm, np.fmax(bld_v, lut[ids] + rel), bld_v)
             notes.append(f"Buildings: Project PLATEAU 3D city models ({', '.join(pl.get('cities', []))}): "
                          "surveyed roof shapes (LoD2) or blocks at the measured height (LoD1).")
@@ -539,7 +538,7 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
         lab, n = ndimage.label(W, structure=np.ones((3, 3)))
         touch = np.unique(lab[ndimage.binary_dilation(river, iterations=2) & (lab > 0)])
         if len(touch):
-            radius = np.asarray(ndimage.maximum(ndimage.distance_transform_edt(W), lab, touch))
+            radius = _label_reduce(np.maximum, ndimage.distance_transform_edt(W), lab, n)[touch - 1]
             size = np.bincount(lab.ravel(), minlength=n + 1)[touch]
             take = touch[(radius * step <= max(15.0, 3 * step)) | (size < cells(3000))]
             if len(take):
@@ -668,21 +667,40 @@ def _indicator(mask: np.ndarray, min_cells: int, sigma: float = 0.7) -> np.ndarr
     return ndimage.gaussian_filter(f, sigma, mode="nearest") if sigma > 0 else f
 
 
-def _iso_distance(diag: np.ndarray, f: np.ndarray, th: float, reach: float) -> np.ndarray:
+def _iso_distance(diag: np.ndarray, f: np.ndarray, th: float, reach: float,
+                  query: np.ndarray | None = None) -> np.ndarray:
     """Signed distance (cells) from every vertex to the ``th`` iso-line of the piecewise-linear
     field ``f`` on the grid triangulated like ``Partition(R, C, diag)`` - the exact line the
-    partition cuts along. Positive where ``f < th``; NaN farther than ``reach`` cells."""
+    partition cuts along. Positive where ``f < th``; NaN farther than ``reach`` cells, and where
+    the (optional) vertex mask ``query`` is False."""
+    W1 = f.shape[1]
+    out = np.full(f.size, np.nan)
+    wg = f >= th
+    coarse = ndimage.distance_transform_edt(~wg) + ndimage.distance_transform_edt(wg)
+    sel = coarse <= reach + 1.5
+    if query is not None:
+        sel &= query
+    idx = np.nonzero(sel.ravel())[0]
+    if len(idx):
+        dist = _iso_query(diag, f, th, wg, idx, reach + 1.5)
+        if dist is not None:
+            out[idx] = np.where(np.isfinite(dist), np.where(wg.ravel()[idx], -dist, dist), np.nan)
+    return out.reshape(f.shape)
+
+
+def _iso_query(diag: np.ndarray, f: np.ndarray, th: float, wg: np.ndarray, idx: np.ndarray,
+               bound: float) -> np.ndarray | None:
+    """Unsigned distance from the flat vertex indices ``idx`` to the iso-line (inf beyond
+    ``bound``); None when there is no iso-line."""
     from scipy.spatial import cKDTree
 
     W1 = f.shape[1]
     fv = f.ravel()
-    out = np.full(fv.shape, np.nan)
-    wg = f >= th
     wet = wg.ravel()
     c4 = (wg[:-1, :-1], wg[:-1, 1:], wg[1:, :-1], wg[1:, 1:])
     rr, cc = np.nonzero((c4[0] | c4[1] | c4[2] | c4[3]) & ~(c4[0] & c4[1] & c4[2] & c4[3]))
     if not len(rr):
-        return out.reshape(f.shape)
+        return None
     v00 = rr * W1 + cc
     v01, v10 = v00 + 1, v00 + W1
     v11 = v10 + 1
@@ -703,25 +721,48 @@ def _iso_distance(diag: np.ndarray, f: np.ndarray, th: float, reach: float) -> n
     seg = np.take_along_axis(P, first2[:, :, None], axis=1)              # the iso segment per triangle
     w = np.linspace(0.0, 1.0, 12)[None, :, None]                         # <= 0.13 cells apart
     tree = cKDTree((seg[:, :1] * (1 - w) + seg[:, 1:] * w).reshape(-1, 2))
-    coarse = ndimage.distance_transform_edt(~wg) + ndimage.distance_transform_edt(wg)
-    idx = np.nonzero(coarse.ravel() <= reach + 1.5)[0]
     dist, _ = tree.query(np.column_stack([idx % W1, idx // W1]).astype(np.float64),
-                         distance_upper_bound=reach + 1.5, workers=-1)   # all cores
-    out[idx] = np.where(np.isfinite(dist), np.where(wet[idx], -dist, dist), np.nan)
-    return out.reshape(f.shape)
+                         distance_upper_bound=bound, workers=_WORKERS)
+    return dist
+
+
+_WORKERS = -1   # cKDTree queries on all cores
 
 
 def _shore_cap(diag: np.ndarray, ind: np.ndarray, wtop: np.ndarray, wall: float, k: float,
-               hmax: float) -> np.ndarray:
-    """Upper bound (mm) for land near water: ``wall`` above the water surface exactly on the water
-    outline, rising inland at ``k`` mm per cell. Land surfaces capped by it descend to one uniform
-    shore edge along the smooth outline - sampled on the grid, a cliff that meets the water
+               top: np.ndarray, hmax: float | None = None) -> np.ndarray:
+    """``top`` (mm) capped near water: the cap is ``wall`` above the water surface exactly on the
+    water outline, rising inland at ``k`` mm per cell. Land surfaces capped by it descend to one
+    uniform shore edge along the smooth outline - sampled on the grid, a cliff that meets the water
     otherwise ends in a wall whose height jumps from vertex to vertex (jagged cliff tops). On the
     water side the cap continues below the water, so the land's edge is interpolated to exactly
-    ``wall`` above the water."""
+    ``wall`` above the water.
+
+    The cap reaches as far inland as the highest point (``hmax``, default ``top.max()``) could
+    bind, but distances to the outline are only computed for vertices it can bind: a vertex
+    ``c`` cells (grid distance) from the nearest vertex across the outline is at least
+    ``c - sqrt(2)`` cells from the outline on land and at most ``c + 1`` in the water."""
+    if hmax is None:
+        hmax = float(np.max(top))
     reach = max(2.0, (hmax - float(np.min(wtop)) - wall) / k + 2.0)
-    d = _iso_distance(diag, ind, 0.5, reach)
-    return np.where(np.isfinite(d), wtop + wall + k * np.nan_to_num(d), np.inf)
+    wg = ind >= 0.5
+    d_dry = ndimage.distance_transform_edt(~wg)
+    d_wet = ndimage.distance_transform_edt(wg)
+    low = np.where(wg, -(d_wet + 1.5), d_dry - 1.5)        # lower bound of the signed distance
+    query = (top > wtop + wall + k * low) & (d_dry + d_wet <= reach + 1.5)
+    del low, d_dry, d_wet
+    idx = np.nonzero(query.ravel())[0]
+    if not len(idx):
+        return top
+    dist = _iso_query(diag, ind, 0.5, wg, idx, reach + 1.5)
+    if dist is None:
+        return top
+    ok = np.isfinite(dist)
+    idx, dist = idx[ok], dist[ok]
+    d = np.where(wg.ravel()[idx], -dist, dist)
+    out = top.copy().ravel()
+    out[idx] = np.minimum(out[idx], wtop.ravel()[idx] + wall + k * d)
+    return out.reshape(top.shape)
 
 
 def _water_indicator(lakes: np.ndarray, rivers: np.ndarray, min_cells: int, sigma: float) -> np.ndarray | None:
@@ -757,7 +798,7 @@ def _land_fragments(land: np.ndarray, land0: np.ndarray, max_cells: int) -> np.n
     size0 = np.bincount(lab0.ravel())
     size0[0] = 0
     ids = np.arange(1, n + 1)
-    src = np.asarray(ndimage.maximum(size0[lab0], lab, ids))   # the largest land each piece touches
+    src = _label_reduce(np.maximum, size0[lab0], lab, n)   # the largest land each piece touches
     bad = np.zeros(n + 1, bool)
     bad[1:] = (size[1:] < max_cells) & (src >= 3 * size[1:])
     return bad[lab]
@@ -783,6 +824,22 @@ def _cut_water(part: Partition, lakes: np.ndarray, rivers: np.ndarray, min_cells
     return ind
 
 
+def _label_reduce(op, values: np.ndarray, lab: np.ndarray, n: int) -> np.ndarray:
+    """``op`` (np.maximum / np.minimum) of ``values`` over each label 1..n of ``lab`` (array of n).
+    Same result as ``ndimage.maximum/minimum(values, lab, 1..n)``, which sorts the whole grid on
+    every call; this only visits the labelled cells."""
+    sel = lab > 0
+    v = np.asarray(values)[sel]
+    if v.dtype.kind == "f":
+        init = -np.inf if op is np.maximum else np.inf
+    else:
+        info = np.iinfo(v.dtype)
+        init = info.min if op is np.maximum else info.max
+    out = np.full(n + 1, init, v.dtype)
+    op.at(out, lab[sel], v)
+    return out[1:]
+
+
 def _drop_swap_patches(masks: dict[int, np.ndarray], tops: dict[int, np.ndarray], ground: np.ndarray,
                        depth: float, cell_mm: float, budget_mm2: float, max_patch_mm2: float = 20.0,
                        layer: float = 0.2, keep: np.ndarray | None = None
@@ -801,9 +858,9 @@ def _drop_swap_patches(masks: dict[int, np.ndarray], tops: dict[int, np.ndarray]
         labels[lab] = lm
         idx = np.arange(1, n + 1)
         area = np.bincount(lm.ravel(), minlength=n + 1)[1:] * cell_mm * cell_mm
-        hi = np.ceil(np.asarray(ndimage.maximum(tops[lab], lm, idx)) / layer).astype(int)
+        hi = np.ceil(_label_reduce(np.maximum, tops[lab], lm, n) / layer).astype(int)
         base_f = tops[lab] if lab in (WATER, RIVER) else ground
-        lo = np.floor((np.asarray(ndimage.minimum(base_f, lm, idx)) - depth) / layer).astype(int)
+        lo = np.floor((_label_reduce(np.minimum, base_f, lm, n) - depth) / layer).astype(int)
         kept = set(np.unique(lm[keep & (lm > 0)]).tolist()) if keep is not None else set()
         for k in range(n):
             if k + 1 in kept:
@@ -839,9 +896,10 @@ def _drop_swap_patches(masks: dict[int, np.ndarray], tops: dict[int, np.ndarray]
         saved += best_uniq
     out = {lab: m.copy() for lab, m in masks.items()}
     removed = np.nonzero(~active)[0]
-    for i in removed:
-        lab, cid = comps[i][0], comps[i][1]
-        out[lab][labels[lab] == cid] = False
+    for lab in {comps[i][0] for i in removed}:   # one pass per colour, not per patch
+        drop = np.zeros(int(labels[lab].max()) + 1, bool)
+        drop[[comps[i][1] for i in removed if comps[i][0] == lab]] = True
+        out[lab][drop[labels[lab]]] = False
     return out, int(len(removed)), float(lost), int(saved)
 
 
@@ -903,7 +961,7 @@ def _min_features(cm: dict[int, np.ndarray], r: float) -> dict[int, np.ndarray]:
     if B is not None and B.any():
         lab, n = ndimage.label(B, structure=np.ones((3, 3)))
         idx = np.arange(1, n + 1)
-        rad = np.asarray(ndimage.maximum(ndimage.distance_transform_edt(B), lab, idx))
+        rad = _label_reduce(np.maximum, ndimage.distance_transform_edt(B), lab, n)
         small = idx[rad < r]
         if len(small):
             B = B | ndimage.binary_dilation(np.isin(lab, small), structure=disk)
@@ -931,7 +989,7 @@ def _flat_interface(mask: np.ndarray, top: np.ndarray, depth: float, floor: floa
     lab, n = ndimage.label(md, structure=np.ones((3, 3)))
     out = np.maximum(top - depth, floor)
     if n:
-        mins = np.asarray(ndimage.minimum(top, lab, np.arange(1, n + 1)), float)
+        mins = _label_reduce(np.minimum, np.asarray(top, float), lab, n)
         lvl = np.maximum(np.concatenate([[0.0], mins])[lab] - depth, floor)
         out = np.where(lab > 0, lvl, out)
     return np.round(out, 3)
@@ -1060,7 +1118,7 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         ind0 = _water_indicator(P(surf.masks[WATER]), P(surf.masks[RIVER]), min_cells, shore_sigma)
         if ind0 is not None:
             w0 = np.maximum(zmm(surf.level) - opts.water_recess_mm, lowest)
-            diag = diagonals(np.minimum(S_mm, _shore_cap(diag, ind0, w0, shore_wall, shore_k, float(S_mm.max()))))
+            diag = diagonals(_shore_cap(diag, ind0, w0, shore_wall, shore_k, S_mm))
     part = Partition(R, C, diag)
     progress(0.05, "Cutting outline")
     if opts.frame:
@@ -1070,7 +1128,7 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         part.step(f_model, 0.0, below=DROPPED)
     # the base plate spans every colour region: build it from the outline cuts only, so later
     # colour cuts cannot leave T-junctions inside it
-    outline = copy.deepcopy(part)
+    outline = part.copy()
     outline.finish(GROUND)
     land = outline
 
@@ -1163,15 +1221,14 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         # partition with only the outline + water cut then gives one seamless ground-coloured body
         # under all land colours (no walls along every colour boundary). LiDAR bridges were
         # already removed from the water mask, so they survive as roads.
-        land = copy.deepcopy(part)
+        land = part.copy()
         # all water (lakes, sea, rivers) is cut as ONE region, then divided into lake / river
         # inside it - separate outlines would leave slivers of land between a river and LiDAR
         # water patches or a lake it runs into
         ind = _cut_water(part, cmasks[WATER], cmasks[RIVER], min_cells, land=land, sigma=shore_sigma)
         if ind is not None and shore_k > 0:
             # on the water side G_mm drops below the water: only the shore edge interpolates it
-            G_mm = np.minimum(G_mm, _shore_cap(diag, ind, fields[WATER], shore_wall, shore_k,
-                                               float(G_mm.max())))
+            G_mm = _shore_cap(diag, ind, fields[WATER], shore_wall, shore_k, G_mm)
             fields.update(land_fields(G_mm))
         for i, lab in enumerate((BUILDING, ROAD, VEG), start=2):  # priority order
             m = cmasks[lab]
@@ -1236,7 +1293,7 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         # the water so shores are clean walls (see Surface.surface_land)
         Sb_mm = terrain_mm(water_sep)
         if water_sep and ind is not None and shore_k > 0:
-            Sb_mm = np.minimum(Sb_mm, _shore_cap(diag, ind, wtop, shore_wall, shore_k, float(Sb_mm.max())))
+            Sb_mm = _shore_cap(diag, ind, wtop, shore_wall, shore_k, Sb_mm)
         # buildings and decks: their own regions, banded by their own tops (band 0 keeps the label)
         labs = cut_structures(part)
         tops = {BAND0: Sb_mm}
@@ -1427,11 +1484,7 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
                                  round(float((re_[1] - re_[0]) * cell_mm), 1)]
 
     # --- per-cell colour map for the thumbnail (labels sampled at cell centres)
-    def centre(a: np.ndarray) -> np.ndarray:
-        a = a.reshape(R + 1, C + 1)
-        return (a[:-1, :-1] + a[:-1, 1:] + a[1:, :-1] + a[1:, 1:]) / 4
-
-    cl = part.classify([centre(f) for f, *_ in part.steps], default)
+    cl = part.cell_labels(default)
     rgb = np.full((R, C, 3), 255, np.uint8)
     for lab, colr in label_color.items():
         rgb[cl == lab] = _hex_rgb(colr)
