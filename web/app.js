@@ -837,6 +837,7 @@ async function runOnServer(body) {
     }
     if (!r.ok) throw new Error(describeError(d));
     state.jobId = d.id;
+    state.cancelToken = d.cancel_token;   // the server cancels a job only with this
     poll();
   } catch (e) {
     finish();
@@ -893,7 +894,7 @@ function cancelJob() {
     setProgress(null, 'Cancelled');
     return;
   }
-  if (state.jobId) fetch(`/api/jobs/${state.jobId}/cancel`, { method: 'POST' });
+  if (state.jobId) fetch(`/api/jobs/${state.jobId}/cancel`, { method: 'POST', headers: { 'X-Cancel-Token': state.cancelToken || '' } });
 }
 
 function localJobId() {   // the server's job-id format, so a review of this model can be sent

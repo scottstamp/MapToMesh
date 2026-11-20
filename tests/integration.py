@@ -248,13 +248,13 @@ def run_case(base: str, name: str, body: dict, timeout: float = 1800) -> dict:
     t0 = time.time()
     r = requests.post(f"{base}/api/jobs", json=body, timeout=30)
     r.raise_for_status()
-    jid = r.json()["id"]
+    jid, token = r.json()["id"], r.json().get("cancel_token", "")
     while True:
         j = requests.get(f"{base}/api/jobs/{jid}", timeout=30).json()
         if j["state"] in ("done", "error", "cancelled"):
             break
         if time.time() - t0 > timeout:
-            requests.post(f"{base}/api/jobs/{jid}/cancel", timeout=30)
+            requests.post(f"{base}/api/jobs/{jid}/cancel", headers={"X-Cancel-Token": token}, timeout=30)
             return {"case": name, "ok": False, "error": "timeout"}
         time.sleep(1.5)
     elapsed = time.time() - t0

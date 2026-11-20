@@ -13,7 +13,10 @@ Point clouds over large areas don't need a refusal: beyond ``config.MAX_TILES`` 
 elevation models instead (fast for any area).
 
 Configuration: ``MAPTOMESH_MEMORY_MB`` (memory the jobs may use in total; default 80% of the
-machine's RAM), ``MAPTOMESH_JOB_TIMEOUT_S`` (default 300), ``MAPTOMESH_MAX_QUEUE`` (default 8).
+machine's RAM), ``MAPTOMESH_JOB_TIMEOUT_S`` (default 300), ``MAPTOMESH_MAX_QUEUE`` (default 8),
+``MAPTOMESH_JOBS_PER_CLIENT`` (default 2).
+
+Per-client request limits (``client_key``, ``RateLimit``, ``Slots``) are at the end.
 """
 
 from __future__ import annotations
@@ -143,6 +146,101 @@ def public() -> dict:
     """The memory model for the UI, which caps its Detail slider the same way (``max_cells``)."""
     return {"memory_mb": JOB_MEMORY_MB, "timeout_s": TIMEOUT_S, "target_s": TARGET_S, "max_queue": MAX_QUEUE,
             "base_mb": BASE_MB, "build_mb": BUILD_MB[min(PART_WORKERS, 2)], "fetch_mb": FETCH_MB}
+
+
+# ---------------------------------------------------------------- per-client request limits
+# A public server keys its limits on the client: the address uvicorn reports, which is the
+# X-Forwarded-For address only when the request came through a trusted reverse proxy
+# (``MAPTOMESH_FORWARDED_ALLOW_IPS``, run.py). IPv6 clients are keyed by their /64: one
+# subscriber usually has a whole /64 and could otherwise rotate through addresses.
+
+JOBS_PER_CLIENT = int(os.environ.get("MAPTOMESH_JOBS_PER_CLIENT", "2"))   # server jobs queued / running
+
+
+def client_key(request) -> str:
+    """The key per-client limits count against (an IPv4 address or an IPv6 /64)."""
+    import ipaddress
+    host = request.client.host if getattr(request, "client", None) else ""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host[:100] or "unknown"
+    if ip.version == 6:
+        if ip.ipv4_mapped is not None:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+    return str(ip)
+
+
+class RateLimit:
+    """At most ``per_hour`` events per client key in any hour (sliding window)."""
+
+    def __init__(self, per_hour: int, window_s: float = 3600.0):
+        import threading
+        self.per_hour, self.window = per_hour, window_s
+        self._times: dict = {}
+        self._lock = threading.Lock()
+
+    def hit(self, key: str) -> float:
+        """Count an event; 0 if allowed, else the seconds until the client may try again."""
+        import time
+        from collections import deque
+        now = time.time()
+        with self._lock:
+            q = self._times.setdefault(key, deque())
+            while q and now - q[0] > self.window:
+                q.popleft()
+            if len(q) >= self.per_hour:
+                return max(1.0, self.window - (now - q[0]))
+            q.append(now)
+            if len(self._times) > 10_000:     # forget idle clients
+                for k in [k for k, v in self._times.items() if not v]:
+                    self._times.pop(k, None)
+            return 0.0
+
+    def clear(self) -> None:
+        with self._lock:
+            self._times.clear()
+
+
+class Slots:
+    """Work running at once: at most ``total`` overall and ``per_client`` per client. Never waits:
+    a request that finds no free slot is refused (the caller answers 429 / 503 with Retry-After)
+    instead of holding a server thread."""
+
+    def __init__(self, total: int, per_client: int = 1):
+        import threading
+        self.total, self.per_client = max(1, total), max(1, per_client)
+        self._active: dict[str, int] = {}
+        self._n = 0
+        self._lock = threading.Lock()
+
+    def enter(self, key: str) -> str | None:
+        """Take a slot: None if taken, else why not ("client": this client's share is in use,
+        "busy": all slots are)."""
+        with self._lock:
+            if self._active.get(key, 0) >= self.per_client:
+                return "client"
+            if self._n >= self.total:
+                return "busy"
+            self._active[key] = self._active.get(key, 0) + 1
+            self._n += 1
+            return None
+
+    def leave(self, key: str) -> None:
+        with self._lock:
+            n = self._active.get(key, 0) - 1
+            if n > 0:
+                self._active[key] = n
+            else:
+                self._active.pop(key, None)
+            self._n = max(0, self._n - 1)
+
+
+# /api/coverage and /api/coverage/usgs: the page asks on every change of the area (debounced),
+# so a higher hourly allowance than estimates; each may search a catalogue (network, CPU)
+COVERAGE_RATE = RateLimit(int(os.environ.get("MAPTOMESH_COVERAGE_PER_HOUR", "1200")))
+COVERAGE_SLOTS = Slots(int(os.environ.get("MAPTOMESH_COVERAGE_CONCURRENT", "6")), per_client=2)
 
 
 def advice_for(kind: str, opts) -> tuple[list[str], dict]:
