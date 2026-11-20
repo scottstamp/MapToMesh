@@ -19,7 +19,7 @@ import time
 import numpy as np
 import requests
 
-from . import config
+from . import config, native
 from .geo import AOI, Grid
 from .raster import fill_polygon, rasterize_lines
 
@@ -130,6 +130,38 @@ def decode_tile(data: bytes, z: int, tx: int, ty: int, layers: set[str]) -> list
     """Decode wanted layers to features with lon/lat part arrays."""
     if data[:2] == b"\x1f\x8b":
         data = gzip.decompress(data)
+    if native.enabled() and hasattr(native.ext, "mvt_decode_osm"):
+        return _decode_tile_native(bytes(data), z, tx, ty, layers)
+    return _decode_tile_py(data, z, tx, ty, layers)
+
+
+def _decode_tile_native(data: bytes, z: int, tx: int, ty: int, layers) -> list[dict]:
+    """The Rust decoder (``maptomesh_native.mvt_decode_osm``) parses the tile and builds the
+    feature dicts; each layer's points are projected here in one go (numpy's element-wise results
+    don't depend on the array, so they match ``_decode_tile_py``'s per-part projection exactly)."""
+    feats = []
+    wanted = layers if isinstance(layers, (set, frozenset)) else set(layers)
+    for _name, extent, xy, ends, lf in native.ext.mvt_decode_osm(data, wanted):
+        parts = []
+        if ends:
+            scale = 1.0 / (extent * (1 << z))
+            X = tx / (1 << z) + xy[:, 0] * scale  # normalised web-mercator
+            Y = ty / (1 << z) + xy[:, 1] * scale
+            lon = X * 360.0 - 180.0
+            lat = np.degrees(np.arctan(np.sinh(np.pi * (1 - 2 * Y))))
+            ll = np.column_stack([lon, lat])
+            parts = [ll[a:b] for a, b in zip([0, *ends[:-1]], ends)]
+        k = 0
+        for f in lf:                      # "parts" holds the feature's number of parts
+            n = f["parts"]
+            f["parts"] = parts[k:k + n]
+            k += n
+        feats += lf
+    return feats
+
+
+def _decode_tile_py(data: bytes, z: int, tx: int, ty: int, layers: set[str]) -> list[dict]:
+    """Pure-Python ``decode_tile`` (the fallback; ``data`` already decompressed)."""
     feats = []
     for f, wt, lb in _fields(data):
         if f != 3 or wt != 2:
