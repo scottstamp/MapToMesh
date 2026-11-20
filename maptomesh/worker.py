@@ -189,7 +189,9 @@ def _pipeline(job_id: str, opts_d: dict, conn, progress) -> dict:
                                                                "ept_nodes", "us_source", "sources",
                                                                "attribution", "skipped",
                                                                "licence_warnings")}
-                 | {"attribution": attribution},
+                 | {"attribution": attribution}
+                 # data-source errors quote exceptions: shown to users, so without local paths
+                 | {"errors": [scrub(x, 300) if isinstance(x, str) else x for x in elev.info.get("errors") or []]},
         "warnings": warnings,
     }
 
