@@ -46,12 +46,11 @@ def test_prune():
 
 
 def test_rate_limit():
-    per = shares.PER_HOUR
-    shares.PER_HOUR = 2
-    shares._TIMES.clear()
+    real = shares._LIMIT
+    shares._LIMIT = shares.limits.RateLimit(2)
     assert not shares.rate_limited("1.2.3.4") and not shares.rate_limited("1.2.3.4")
     assert shares.rate_limited("1.2.3.4") and not shares.rate_limited("5.6.7.8")
-    shares.PER_HOUR = per
+    shares._LIMIT = real
 
 
 if __name__ == "__main__":

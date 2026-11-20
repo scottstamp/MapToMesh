@@ -32,7 +32,9 @@ from __future__ import annotations
 import concurrent.futures as cf
 import io
 import json
+import logging
 import math
+import uuid
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -52,6 +54,16 @@ from .httpcache import RANGE_CACHE, install_laspy_cache
 from . import usgs3dep, usgs_ept
 from .lidar_index import Tile, TileIndex
 from .raster import fill_polygon
+
+log = logging.getLogger(__name__)
+
+
+def _failure(what: str) -> str:
+    """Log the exception being handled (its text can hold paths, URLs with tokens, internals)
+    under a short id and return ``what`` with that id: the text users see."""
+    eid = uuid.uuid4().hex[:8]
+    log.warning("%s [error %s]", what, eid, exc_info=True)
+    return f"{what} (error id {eid})"
 
 ProgressFn = Callable[[float, str], None]
 
@@ -441,7 +453,7 @@ def find_sources(bbox: tuple[float, float, float, float], index: TileIndex | Non
                  max_items: int = 5000) -> tuple[list[Tile], list, list[str]]:
     """LiDAR covering ``bbox`` (lon/lat): COPC tiles (NRCan, Planetary Computer), AWS Entwine
     projects (USGS) and any search errors."""
-    tiles = index.query(*bbox) if index is not None else []
+    tiles = index.query(*bbox, limit=max_items) if index is not None else []
     projects, errors = [], []
     if usgs3dep.in_us(bbox):
         try:
@@ -450,7 +462,7 @@ def find_sources(bbox: tuple[float, float, float, float], index: TileIndex | Non
             else:
                 projects = usgs_ept.INDEX.query(bbox)
         except Exception as e:  # noqa: BLE001 - keep whatever the other provider has
-            errors.append(f"USGS 3DEP search failed: {e}")
+            errors.append(_failure("USGS 3DEP search failed"))
     for p in POINTCLOUD_PROVIDERS:
         if p.covers(bbox):
             try:
@@ -459,7 +471,7 @@ def find_sources(bbox: tuple[float, float, float, float], index: TileIndex | Non
                     t.provider = p.key
                 tiles += found
             except Exception as e:  # noqa: BLE001
-                errors.append(f"{p.label} search failed: {type(e).__name__}: {e}")
+                errors.append(_failure(f"{p.label} search failed"))
     return tiles, projects, errors
 
 
@@ -529,7 +541,7 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: Progres
                 try:
                     pl = fut.result()
                 except Exception as e:  # noqa: BLE001
-                    errors.append(f"{p.name}: {type(e).__name__}: {e}")
+                    errors.append(_failure(f"{p.name}: could not read the point cloud index"))
                     continue
                 if not pl.keys:
                     continue
@@ -564,7 +576,7 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: Progres
                 except Cancelled:
                     raise
                 except Exception as e:  # noqa: BLE001
-                    errors.append(f"{type(e).__name__}: {e}")
+                    errors.append(_failure("A LiDAR tile could not be read"))
                     failed += 1
                     payload = None
                 done += 1

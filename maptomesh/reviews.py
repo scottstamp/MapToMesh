@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import contextlib
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -64,10 +65,17 @@ class ReviewStore:
             if con.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
                 con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self):
+        """A connection for one ``with`` block: commits (or rolls back), then closes, so the
+        database file is never left locked (Windows)."""
         con = sqlite3.connect(self.path, timeout=30)
-        con.execute("PRAGMA journal_mode=WAL")
-        return con
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            with con:
+                yield con
+        finally:
+            con.close()
 
     def add(self, *, job_id: str, job_state: str, rating: int | None, problems: list[str], comment: str,
             wants_followup: bool, contact_name: str | None, contact_email: str | None, options: dict,

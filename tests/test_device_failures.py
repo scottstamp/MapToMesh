@@ -35,11 +35,10 @@ def test_store():
 
 
 def test_rate_limit():
-    per = df.PER_HOUR
-    df.PER_HOUR = 2
-    df._TIMES.clear()
+    real = df._LIMIT
+    df._LIMIT = df.limits.RateLimit(2)
     assert not df.rate_limited("a") and not df.rate_limited("a") and df.rate_limited("a")
-    df.PER_HOUR = per
+    df._LIMIT = real
 
 
 def test_cli_safe_strips_control_bytes():

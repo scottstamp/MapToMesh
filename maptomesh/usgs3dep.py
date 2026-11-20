@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -25,6 +27,12 @@ import requests
 from . import config
 from .httpcache import register_signer
 from .lidar_index import Tile
+
+log = logging.getLogger(__name__)
+
+# search results cached on disk: at most this many files / MB (oldest by mtime go first)
+STAC_CACHE_FILES = int(os.environ.get("MAPTOMESH_STAC_CACHE_FILES", "500"))
+STAC_CACHE_MB = float(os.environ.get("MAPTOMESH_STAC_CACHE_MB", "50"))
 
 BLOB_PREFIX = "https://usgslidareuwest.blob.core.windows.net/"
 
@@ -109,6 +117,35 @@ def _search(bbox: tuple[float, float, float, float], max_items: int) -> list[dic
     return feats
 
 
+def _trim_cache(directory, keep_files: int | None = None, keep_mb: float | None = None) -> None:
+    """Delete the oldest ``pc_*.json`` search files until at most ``keep_files`` files and
+    ``keep_mb`` MB remain."""
+    keep_files = STAC_CACHE_FILES if keep_files is None else keep_files
+    limit = (STAC_CACHE_MB if keep_mb is None else keep_mb) * 1e6
+    try:
+        files = []
+        for p in directory.glob("pc_*.json"):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            files.append((st.st_mtime, st.st_size, p))
+    except OSError:
+        return
+    files.sort(key=lambda f: f[0])
+    total = sum(f[1] for f in files)
+    n = len(files)
+    for _, size, p in files:
+        if n <= max(0, keep_files) and total <= limit:
+            break
+        try:
+            p.unlink()
+        except OSError:
+            continue        # in use or already gone
+        n -= 1
+        total -= size
+
+
 def _cached_search(bbox: tuple[float, float, float, float], max_items: int) -> list[dict]:
     """Search a slightly enlarged, rounded box (cache hits while the area is nudged around),
     cached on disk for a day."""
@@ -126,6 +163,7 @@ def _cached_search(bbox: tuple[float, float, float, float], max_items: int) -> l
              "start": f.get("properties", {}).get("start_datetime"),
              "href": f.get("assets", {}).get("data", {}).get("href")} for f in feats]
     config.atomic_write(cache, json.dumps(slim))
+    _trim_cache(cache.parent)
     return slim
 
 
