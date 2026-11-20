@@ -279,9 +279,22 @@ def test_inline_executor_forgets_results() -> None:
     ex.shutdown()
 
 
+def test_remote_index_matches_server_index() -> None:
+    """The browser's tile index stands in for the server's: callers pass the same arguments (a
+    `limit=` added on one side only broke every device build in Canada)."""
+    import inspect
+
+    from maptomesh.browser import RemoteTileIndex
+    from maptomesh.lidar_index import TileIndex
+    server = list(inspect.signature(TileIndex.query).parameters)
+    remote = list(inspect.signature(RemoteTileIndex.query).parameters)
+    assert server == remote, (server, remote)
+
+
 if __name__ == "__main__":
     for fn in (test_geotiff_native, test_geotiff_python, test_reproject_numpy, test_ascii_grid, test_proxy_allowlist,
-               test_range_cache_whole_file, test_browser_cache_whole_file, test_inline_executor_forgets_results):
+               test_range_cache_whole_file, test_browser_cache_whole_file, test_inline_executor_forgets_results,
+               test_remote_index_matches_server_index):
         fn()
         print(f"{fn.__name__}: ok")
     print("all passed")

@@ -548,11 +548,13 @@ def _copc_chunks(source, byte_queries, out, num_threads) -> None:
 class RemoteTileIndex:
     """NRCan CanElevation tile lookups answered by the server (its index is 22 MB)."""
 
-    def query(self, minx: float, miny: float, maxx: float, maxy: float) -> list:
+    def query(self, minx: float, miny: float, maxx: float, maxy: float, limit: int | None = None) -> list:
+        """Same interface as ``lidar_index.TileIndex.query`` (the server caps its answer too)."""
         from .lidar_index import Tile
         r = http(f"/api/lidar/tiles?w={minx}&s={miny}&e={maxx}&n={maxy}")
         r.raise_for_status()
-        return [Tile(**{**t, "bbox": tuple(t["bbox"])}) for t in r.json()["tiles"]]
+        tiles = [Tile(**{**t, "bbox": tuple(t["bbox"])}) for t in r.json()["tiles"]]
+        return tiles if limit is None else tiles[:max(0, int(limit))]
 
 
 class RemoteIndex:
