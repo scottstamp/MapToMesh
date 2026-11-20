@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -20,8 +21,15 @@ class Colors(BaseModel):
     vegetation: str = Field("#4F8A3C", pattern=HEX)
     label: str = Field("#FAFAFA", pattern=HEX)
     bands: list[str] = Field(default_factory=lambda: ["#6FA35A", "#C9B26B", "#B07A3E", "#7A4E2A", "#F4F4F4"])
-    band_thresholds_m: list[float] | None = None
+    band_thresholds_m: list[float] | None = Field(None, max_length=11)
     band_mode: Literal["equal", "quantile"] = "equal"
+
+    @field_validator("band_thresholds_m")
+    @classmethod
+    def _finite(cls, v: list[float] | None) -> list[float] | None:
+        if v is not None and not all(math.isfinite(x) for x in v):
+            raise ValueError("band thresholds must be finite")
+        return v
 
     @field_validator("bands")
     @classmethod

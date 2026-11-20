@@ -295,7 +295,9 @@ def rasterize_osm(data: dict, aoi: AOI, grid: Grid, mm_per_m: float, min_width_m
         if layer == "water" and f["type"] == "polygon":
             if props.get("class") in SKIP_WATER or props.get("brunnel") == "tunnel":
                 continue
-            water |= fill_polygon(parts, shape)
+            box = _fill_box(parts, shape)
+            if box is not None:
+                water[box[0]] |= box[1]
         elif layer == "waterway" and f["type"] == "line":
             # rivers / streams as continuous centrelines, at least a printable width wide
             if props.get("class") not in STREAM_LEVELS.get(stream_level, set()):

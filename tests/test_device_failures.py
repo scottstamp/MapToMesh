@@ -42,8 +42,16 @@ def test_rate_limit():
     df.PER_HOUR = per
 
 
+def test_cli_safe_strips_control_bytes():
+    from maptomesh.device_failures import _safe
+    s = _safe("a\x1b[31mred\x9b\x07\nb")
+    assert "\x1b" not in s and "\x9b" not in s and "\x07" not in s and "\n" not in s
+    t = _safe("x\x1b]0;t\x07\n  at f()", keep_newlines=True)
+    assert "\x1b" not in t and "\n  at f()" in t
+
+
 if __name__ == "__main__":
-    for fn in (test_store, test_rate_limit):
+    for fn in (test_store, test_rate_limit, test_cli_safe_strips_control_bytes):
         fn()
         print(f"{fn.__name__}: ok")
     print("all passed")
