@@ -23,6 +23,7 @@ use pyo3::types::{PyBytes, PyTuple};
 use rayon::prelude::*;
 
 mod mesh3d;
+mod mvt;
 mod partition;
 mod tiff;
 
@@ -544,5 +545,7 @@ fn maptomesh_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tiff::decode_tile, m)?)?;
     m.add_function(wrap_pyfunction!(mesh3d::decode_draco, m)?)?;
     m.add_function(wrap_pyfunction!(mesh3d::raster_max, m)?)?;
+    m.add_function(wrap_pyfunction!(mvt::mvt_decode_osm, m)?)?;
+    m.add_function(wrap_pyfunction!(mvt::mvt_decode, m)?)?;
     Ok(())
 }

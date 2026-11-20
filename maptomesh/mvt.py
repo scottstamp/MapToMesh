@@ -4,12 +4,17 @@ https://github.com/mapbox/vector-tile-spec/tree/master/2.1
 
 Only what reading coverage footprints needs: layers, features, string / numeric tags and polygon
 geometry (rings in tile pixel coordinates, 0..extent, y down).
+
+The Rust extension decodes tiles when it is built (``maptomesh_native.mvt_decode``: the same
+output); the pure-Python decoder here is the fallback.
 """
 
 from __future__ import annotations
 
 import gzip
 import struct
+
+from . import native
 
 
 def _varint(b: bytes, p: int) -> tuple[int, int]:
@@ -106,8 +111,11 @@ def polygons(rings: list[list[tuple[int, int]]]) -> list[list[list[tuple[int, in
     """Group rings into polygons: an exterior ring followed by its holes."""
     out = []
     for r in rings:
+        if not out:                      # the first ring starts a polygon whatever its area
+            out.append([r])
+            continue
         a = ring_area(r)
-        if a > 0 or not out:
+        if a > 0:
             out.append([r])
         elif a < 0:
             out[-1].append(r)
@@ -118,6 +126,12 @@ def decode(data: bytes) -> dict[str, dict]:
     """{layer name: {"extent": int, "features": [{"props": {...}, "type": int, "rings": [...]}]}}"""
     if data[:2] == b"\x1f\x8b":
         data = gzip.decompress(data)
+    if native.enabled() and hasattr(native.ext, "mvt_decode"):
+        return native.ext.mvt_decode(bytes(data))
+    return _decode_py(data)
+
+
+def _decode_py(data: bytes) -> dict[str, dict]:
     layers = {}
     for f, _, lb in _fields(data):
         if f != 3:
