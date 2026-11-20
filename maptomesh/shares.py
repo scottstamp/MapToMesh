@@ -18,9 +18,8 @@ import os
 import sqlite3
 import threading
 import time
-from collections import deque
 
-from . import config
+from . import config, limits
 
 DB_PATH = config.DATA_DIR / "shares.sqlite"
 KEEP = int(os.environ.get("MAPTOMESH_KEEP_SHARES", "200000"))       # newest-used links kept
@@ -55,7 +54,11 @@ class ShareStore:
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-        con.execute("PRAGMA journal_mode=WAL")
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            con.close()
+            raise
         return _Closing(con)
 
     def add(self, options: dict) -> str:
@@ -111,7 +114,7 @@ class _Closing:
 
 _STORE: ShareStore | None = None
 _STORE_LOCK = threading.Lock()
-_TIMES: dict[str, deque] = {}
+_LIMIT = limits.RateLimit(PER_HOUR)     # new links per client key (limits.client_key), per hour
 
 
 def store() -> ShareStore:
@@ -123,16 +126,5 @@ def store() -> ShareStore:
 
 
 def rate_limited(addr: str) -> bool:
-    """More than ``PER_HOUR`` new links from this address in the last hour."""
-    now = time.time()
-    with _STORE_LOCK:
-        q = _TIMES.setdefault(addr, deque())
-        while q and now - q[0] > 3600:
-            q.popleft()
-        if len(q) >= PER_HOUR:
-            return True
-        q.append(now)
-        if len(_TIMES) > 10_000:
-            for k in [k for k, v in _TIMES.items() if not v]:
-                _TIMES.pop(k, None)
-        return False
+    """More than ``PER_HOUR`` new links from this client key in the last hour."""
+    return _LIMIT.hit(addr) > 0

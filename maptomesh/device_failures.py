@@ -20,10 +20,9 @@ import sqlite3
 import sys
 import threading
 import time
-from collections import deque
 from datetime import datetime, timezone
 
-from . import config
+from . import config, limits
 
 DB_PATH = config.DATA_DIR / "device_failures.sqlite"
 PER_HOUR = 30                 # reports per client address
@@ -60,7 +59,11 @@ class FailureStore:
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-        con.execute("PRAGMA journal_mode=WAL")
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            con.close()
+            raise
         return con
 
     def add(self, *, kind: str, message: str, trace: str, stage: str, options: dict | None, env: dict,
@@ -90,7 +93,7 @@ class FailureStore:
 
 _STORE: FailureStore | None = None
 _STORE_LOCK = threading.Lock()
-_TIMES: dict[str, deque] = {}
+_LIMIT = limits.RateLimit(PER_HOUR)     # reports per client key (limits.client_key), per hour
 
 
 def store() -> FailureStore:
@@ -102,18 +105,7 @@ def store() -> FailureStore:
 
 
 def rate_limited(addr: str) -> bool:
-    now = time.time()
-    with _STORE_LOCK:
-        q = _TIMES.setdefault(addr, deque())
-        while q and now - q[0] > 3600:
-            q.popleft()
-        if len(q) >= PER_HOUR:
-            return True
-        q.append(now)
-        if len(_TIMES) > 10_000:
-            for k in [k for k, v in _TIMES.items() if not v]:
-                _TIMES.pop(k, None)
-        return False
+    return _LIMIT.hit(addr) > 0
 
 
 _CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
