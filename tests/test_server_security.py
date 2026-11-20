@@ -87,7 +87,7 @@ def test_security_headers():
     assert h["referrer-policy"] == "strict-origin-when-cross-origin"
     assert h["x-frame-options"] == "DENY"
     assert h["cache-control"] == "no-cache"
-    assert "content-security-policy" not in h          # added later with the page changes
+    assert "frame-ancestors 'none'" in h["content-security-policy"]   # details: tests/test_web_security.py
     status, h, _ = call("GET", "/static/app.js")
     assert status == 200 and h["x-frame-options"] == "DENY" and h["cache-control"] == "no-cache"
     status, h, _ = call("GET", "/api/status")

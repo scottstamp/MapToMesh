@@ -69,7 +69,7 @@ function renderBandInputs(colors) {
 function fillPresets() {
   const mode = $('colorMode').value;
   const sel = $('preset');
-  sel.innerHTML = '<option value="">— choose —</option>';
+  setHtml(sel, html`<option value="">— choose —</option>`);
   for (const name of Object.keys(PRESETS[mode] || {})) sel.add(new Option(name, name));
   $('presetRow').hidden = !PRESETS[mode];
 }
@@ -306,7 +306,7 @@ function loadUsgsProjects() {
     usgsLayer = L.geoJSON(gj, {
       renderer: L.canvas({ padding: 0.5 }),  // 2,000+ project outlines
       style: { color: '#2b7a78', weight: 0.6, opacity: 0.6, fillColor: '#3aafa9', fillOpacity: 0.08 },
-      onEachFeature: (f, layer) => layer.bindTooltip(`${f.properties.project}${f.properties.year ? ' (' + f.properties.year + ')' : ''}`, { sticky: true }),
+      onEachFeature: (f, layer) => layer.bindTooltip(tooltipText(f.properties), { sticky: true }),
     });
     loadUsCoverage();
   }).catch(() => { usgsLoading = false; });
@@ -343,7 +343,7 @@ async function loadUsCoverage() {
     usKey = key;
     usLayer = L.geoJSON(gj, {
       style: { stroke: false, fillColor: '#3aafa9', fillOpacity: 0.12 },
-      onEachFeature: (f, layer) => layer.bindTooltip(`${f.properties.project}${f.properties.year ? ' (' + f.properties.year + ')' : ''}`, { sticky: true }),
+      onEachFeature: (f, layer) => layer.bindTooltip(tooltipText(f.properties), { sticky: true }),
     });
     if ($('showCoverage').checked) { usLayer.addTo(map); selection.bringToFront(); }
   } catch (e) { hint.textContent = ''; }
@@ -355,7 +355,7 @@ function loadCoverage() {
     coverageLayer = L.geoJSON(gj, {
       style: { color: '#2b7a78', weight: 1, fillColor: '#3aafa9', fillOpacity: 0.12 },
       interactive: true,
-      onEachFeature: (f, layer) => layer.bindTooltip(`${f.properties.project}${f.properties.year ? ' (' + f.properties.year + ')' : ''}`, { sticky: true }),
+      onEachFeature: (f, layer) => layer.bindTooltip(tooltipText(f.properties), { sticky: true }),
     });
     if ($('showCoverage').checked) coverageLayer.addTo(map);
     selection.bringToFront();
@@ -571,6 +571,31 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 }
 
+// Markup goes into the page only through html`...` and setHtml: every ${value} is escaped (text
+// from the server or upstream data services - names, credits, errors - is never markup), except
+// html`...` fragments and arrays of them, which are joined as they are. null / undefined / false
+// add nothing.
+class SafeHtml { constructor(s) { this.s = s; } toString() { return this.s; } }
+function htmlValue(v) {
+  if (v instanceof SafeHtml) return v.s;
+  if (Array.isArray(v)) return v.map(htmlValue).join('');
+  return v == null || v === false ? '' : escapeHtml(v);
+}
+function html(strings, ...values) {
+  return new SafeHtml(strings.reduce((out, s, i) => out + htmlValue(values[i - 1]) + s));
+}
+function joinHtml(items, sep) {   // items (escaped) with a markup separator between them
+  return items.flatMap((x, i) => (i ? [sep, x] : [x]));
+}
+function setHtml(el, h) {
+  if (!(h instanceof SafeHtml)) throw new TypeError('setHtml: markup must come from html``');
+  el.innerHTML = h.s;
+  // colour swatches: set through the CSSOM (the CSP allows no inline style attributes)
+  for (const sw of el.querySelectorAll('[data-swatch]')) sw.style.background = sw.dataset.swatch;
+}
+// a Leaflet tooltip's text (Leaflet treats a string as markup)
+function tooltipText(p) { return escapeHtml(`${p.project}${p.year ? ` (${p.year})` : ''}`); }
+
 // visible label of a form field (its <label>'s own text, without option texts)
 function fieldLabel(el) {
   if (el.dataset.label) return el.dataset.label;   // where the visible label is too terse out of context
@@ -652,10 +677,10 @@ function refreshMode() {
   const note = $('advNote');
   note.hidden = !changed.length;
   if (!changed.length) { note.innerHTML = ''; return; }
-  note.innerHTML = `<span class="adv-list">Also using ${changed.length} changed advanced setting${changed.length > 1 ? 's' : ''}: `
-    + `${changed.map((el) => `${escapeHtml(fieldLabel(el))} <b>${escapeHtml(shownValue(el))}</b>`).join(', ')}</span>`
-    + '<button type="button" class="secondary" data-act="show">Show them</button>'
-    + '<button type="button" class="secondary" data-act="reset">Reset to defaults</button>';
+  const list = joinHtml(changed.map((el) => html`${fieldLabel(el)} <b>${shownValue(el)}</b>`), ', ');
+  setHtml(note, html`<span class="adv-list">Also using ${changed.length} changed advanced setting${changed.length > 1 ? 's' : ''}: ${list}</span><button
+    type="button" class="secondary" data-act="show">Show them</button><button
+    type="button" class="secondary" data-act="reset">Reset to defaults</button>`);
 }
 function resetAdvanced() {
   for (const el of changedAdvanced()) {
@@ -1113,7 +1138,7 @@ function confirmDownload(body) {
       if (dlg.open) dlg.close();
       resolve(v);
     };
-    $('dataParts').innerHTML = '<li>Working out the download size…</li>';
+    setHtml($('dataParts'), html`<li>Working out the download size…</li>`);
     $('dataNote').textContent = '';
     $('dataNoAsk').checked = false;
     $('dataTitle').textContent = 'Download the data on this device?';
@@ -1143,8 +1168,8 @@ async function fillDownload(body) {
                             RUNTIME_MB + (device.fullScipy ? 7 : 0), false]);
     const total = rows.reduce((a, r) => a + r[1], 0);
     $('dataTitle').textContent = `Download about ${fmtMb(total)}?`;
-    $('dataParts').innerHTML = rows.map(([l, mb, exact]) => `<li><span>${escapeHtml(l)}</span><b>${exact ? '' : '≈ '}${fmtMb(mb)}</b></li>`).join('')
-      + `<li class="total"><span>Total</span><b>≈ ${fmtMb(total)}</b></li>`;
+    setHtml($('dataParts'), html`${rows.map(([l, mb, exact]) => html`<li><span>${l}</span><b>${exact ? '' : '≈ '}${fmtMb(mb)}</b></li>`)}
+      <li class="total"><span>Total</span><b>≈ ${fmtMb(total)}</b></li>`);
     $('dataNote').textContent = [...(est.notes || []),
       isSecureContext ? 'Data this device downloaded before is reused.'
         : "This page isn't on a secure connection (https), so this device can't keep the downloads: they repeat on every build."].join(' ');
@@ -1157,7 +1182,7 @@ function fmtBytes(n) { return n > 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${(n / 1
 
 function jobUrls(j) {
   if (j.urls) return j.urls;     // built on this device: blob URLs
-  const id = j.id;
+  const id = encodeURIComponent(j.id);
   return { model: `/api/jobs/${id}/model.3mf`, stl: `/api/jobs/${id}/stl.zip`, base: `/api/jobs/${id}/base.3mf`,
            thumb: `/api/jobs/${id}/thumbnail.png?${Date.now()}`, preview: `/api/jobs/${id}/preview.bin?lod=${PREVIEW_LOD}` };
 }
@@ -1165,21 +1190,24 @@ function jobUrls(j) {
 function showResult(j) {
   const r = j.result, s = r.stats, u = jobUrls(j);
   state.lastResult = j;
-  const fil = r.filaments.map((f) => `<li><span class="swatch" style="background:${f.color}"></span><b>Filament ${f.slot}</b> ${f.color} — ${f.used_by.join(', ')}</li>`).join('');
+  const br = (items) => joinHtml(items, html`<br>`);
+  const swatch = (color) => html`<span class="swatch" data-swatch="${color}"></span>`;
+  const fil = r.filaments.map((f) => html`<li>${swatch(f.color)}<b>Filament ${f.slot}</b> ${f.color} — ${(f.used_by || []).join(', ')}</li>`);
   const cc = r.color_changes.length
-    ? `<h2>Single-extruder colour changes</h2><ul class="filaments">${r.color_changes.map((c) => `<li><span class="swatch" style="background:${c.color}"></span>at Z = ${c.z_mm.toFixed(2)} mm${c.elevation_m != null ? ` (${c.elevation_m} m)` : ''}</li>`).join('')}</ul><p class="hint">Add a filament change / pause at these heights (round to your layer height).</p>`
+    ? html`<h2>Single-extruder colour changes</h2><ul class="filaments">${r.color_changes.map((c) => html`<li>${swatch(c.color)}at Z = ${c.z_mm.toFixed(2)} mm${c.elevation_m != null ? ` (${c.elevation_m} m)` : ''}</li>`)}</ul><p class="hint">Add a filament change / pause at these heights (round to your layer height).</p>`
     : '';
   const notes = [...(r.notes || []).filter((n) => !n.startsWith('Licence restriction:')),  // own row below
     ...(r.data.failed_tiles ? [`${r.data.failed_tiles} tile(s) failed to download.`] : [])];
   const projects = (r.data.projects || []).map((p) => p.name + (p.year ? ` (${p.year})` : '')).join(', ');
-  $('result').innerHTML = `
+  const lidar = [r.data.tiles ? `${r.data.tiles} tiles` : '', r.data.ept_nodes ? `${r.data.ept_nodes} USGS octree nodes (AWS)` : ''].filter(Boolean).join(' + ');
+  setHtml($('result'), html`
     <h2>Result</h2>
     <img src="${u.thumb}" alt="Top view">
     <div class="downloads">
-      <a href="${u.model}" download="${escapeHtml(r.file)}">⬇ 3MF (${fmtBytes(r.file_size)})</a>
-      <a class="alt" href="${u.stl}" download="${escapeHtml(r.stl_file || 'model_stl.zip')}">STL per colour (.zip)</a>
+      <a href="${u.model}" download="${r.file}">⬇ 3MF (${fmtBytes(r.file_size)})</a>
+      <a class="alt" href="${u.stl}" download="${r.stl_file || 'model_stl.zip'}">STL per colour (.zip)</a>
     </div>
-    ${r.base_file ? `<div class="downloads"><a class="alt" href="${u.base}" download="${escapeHtml(r.base_file)}">⬇ Base plate 3MF (${fmtBytes(r.base_file_size)}, ${s.base_plate_mm.join(' × ')} mm)</a></div>` : ''}
+    ${r.base_file ? html`<div class="downloads"><a class="alt" href="${u.base}" download="${r.base_file}">⬇ Base plate 3MF (${fmtBytes(r.base_file_size)}, ${s.base_plate_mm.join(' × ')} mm)</a></div>` : ''}
     <div class="share-row">
       <button type="button" class="secondary" id="shareBtn">Share link</button>
       <input type="text" id="shareUrl" readonly hidden aria-label="Share link">
@@ -1187,24 +1215,24 @@ function showResult(j) {
     <p class="hint" id="shareMsg">The link holds this model's settings: opening it builds the same model.</p>
     <dl class="stats">
       <dt>Model size</dt><dd>${s.size_mm[0]} × ${s.size_mm[1]} × ${s.size_mm[2]} mm</dd>
-      ${s.tile_size_mm ? `<dt>Tiles</dt><dd>${s.tiles} × ${s.tile_size_mm[0]} × ${s.tile_size_mm[1]} mm</dd>` : ''}
+      ${s.tile_size_mm ? html`<dt>Tiles</dt><dd>${s.tiles} × ${s.tile_size_mm[0]} × ${s.tile_size_mm[1]} mm</dd>` : ''}
       <dt>Scale</dt><dd>${s.scale} (z ×${$('zEx').value})</dd>
       <dt>Elevation</dt><dd>${s.elevation_range_m[0]} – ${s.elevation_range_m[1]} m → relief ${s.relief_mm} mm</dd>
       <dt>Resolution</dt><dd>${s.ground_m_per_cell} m / ${s.cell_mm} mm per cell</dd>
       <dt>Mesh</dt><dd>${s.triangles.toLocaleString()} triangles, ${s.parts} parts</dd>
-      ${j.device ? `<dt>Built on</dt><dd>this device in ${j.device.seconds.toFixed(0)} s (${j.device.downloaded_mb.toFixed(1)} MB of data downloaded${j.device.cache_mb >= 0.05 ? `, ${j.device.cache_mb.toFixed(1)} MB reused from earlier downloads` : ''})</dd>` : ''}
-      ${s.colour_changes_est != null ? `<dt>Colour changes</dt><dd>≈ ${s.colour_changes_est.toLocaleString()} at 0.2 mm layers (max ${s.max_colours_per_layer} colours in a layer)</dd>` : ''}
-      ${r.data.points ? `<dt>LiDAR</dt><dd>${(r.data.points / 1e6).toFixed(1)} M points from ${[r.data.tiles ? `${r.data.tiles} tiles` : '', r.data.ept_nodes ? `${r.data.ept_nodes} USGS octree nodes (AWS)` : ''].filter(Boolean).join(' + ')}</dd>` : ''}
-      ${(r.data.sources || []).length ? `<dt>Data sources</dt><dd>${r.data.sources.filter((s) => s.share >= 0.0005).map((s) => `${escapeHtml(s.label)} ${(100 * s.share).toFixed(0)}%`).join('<br>')}</dd>` : ''}
-      ${(r.data.licence_warnings || []).length ? `<dt>Licence</dt><dd class="licence-warn">⚠ ${r.data.licence_warnings.map(escapeHtml).join('<br>⚠ ')}</dd>` : ''}
-      ${(r.data.attribution || []).length ? `<dt>Credits</dt><dd class="credits">${r.data.attribution.map(escapeHtml).join('<br>')}<br>Map data © OpenStreetMap contributors (ODbL)</dd>` : ''}
-      ${projects ? `<dt>Projects</dt><dd>${projects}</dd>` : ''}
-      ${r.data.items ? `<dt>HRDEM</dt><dd>${r.data.items.join(', ')}</dd>` : ''}
+      ${j.device ? html`<dt>Built on</dt><dd>this device in ${j.device.seconds.toFixed(0)} s (${j.device.downloaded_mb.toFixed(1)} MB of data downloaded${j.device.cache_mb >= 0.05 ? `, ${j.device.cache_mb.toFixed(1)} MB reused from earlier downloads` : ''})</dd>` : ''}
+      ${s.colour_changes_est != null ? html`<dt>Colour changes</dt><dd>≈ ${s.colour_changes_est.toLocaleString()} at 0.2 mm layers (max ${s.max_colours_per_layer} colours in a layer)</dd>` : ''}
+      ${r.data.points ? html`<dt>LiDAR</dt><dd>${(r.data.points / 1e6).toFixed(1)} M points from ${lidar}</dd>` : ''}
+      ${(r.data.sources || []).length ? html`<dt>Data sources</dt><dd>${br(r.data.sources.filter((x) => x.share >= 0.0005).map((x) => `${x.label} ${(100 * x.share).toFixed(0)}%`))}</dd>` : ''}
+      ${(r.data.licence_warnings || []).length ? html`<dt>Licence</dt><dd class="licence-warn">${br(r.data.licence_warnings.map((w) => `⚠ ${w}`))}</dd>` : ''}
+      ${(r.data.attribution || []).length ? html`<dt>Credits</dt><dd class="credits">${br([...r.data.attribution, 'Map data © OpenStreetMap contributors (ODbL)'])}</dd>` : ''}
+      ${projects ? html`<dt>Projects</dt><dd>${projects}</dd>` : ''}
+      ${r.data.items ? html`<dt>HRDEM</dt><dd>${[].concat(r.data.items).join(', ')}</dd>` : ''}
     </dl>
     <h2>Filaments</h2><ul class="filaments">${fil}</ul>
     ${cc}
-    ${(r.tips || []).length ? `<h2>Print tips</h2><ul class="tips">${r.tips.map((t) => `<li>${t}</li>`).join('')}</ul>` : ''}
-    ${notes.length ? `<div class="info warn">${notes.join('<br>')}</div>` : ''}`;
+    ${(r.tips || []).length ? html`<h2>Print tips</h2><ul class="tips">${r.tips.map((tip) => html`<li>${tip}</li>`)}</ul>` : ''}
+    ${notes.length ? html`<div class="info warn">${br(notes)}</div>` : ''}`);
   $('result').hidden = false;
   setProgress(1, `Done · ${s.size_mm[0]} × ${s.size_mm[1]} mm, ${r.filaments.length} colour${r.filaments.length > 1 ? 's' : ''}`);
   $('miniDownload').href = u.model; $('miniDownload').hidden = false;
@@ -1298,18 +1326,18 @@ function showReview(j) {
   state.reviewJob = j;
   box.hidden = false;
   if (reviewedJobs().includes(j.id)) {
-    box.innerHTML = '<p class="hint review-done">Thanks for reviewing this model.</p>';
+    setHtml(box, html`<p class="hint review-done">Thanks for reviewing this model.</p>`);
     return;
   }
   const failed = j.state !== 'done';
-  const stars = [5, 4, 3, 2, 1].map((n) => `<input type="radio" id="star${n}" name="rating" value="${n}">`
-    + `<label for="star${n}" title="${n} star${n > 1 ? 's' : ''}" aria-label="${n} star${n > 1 ? 's' : ''}">★</label>`).join('');
-  box.innerHTML = `
+  const stars = [5, 4, 3, 2, 1].map((n) => html`<input type="radio" id="star${n}" name="rating" value="${n}"><label
+    for="star${n}" title="${n} star${n > 1 ? 's' : ''}" aria-label="${n} star${n > 1 ? 's' : ''}">★</label>`);
+  setHtml(box, html`
     <h2>${failed ? 'Report this problem' : 'How did it turn out?'}</h2>
     <form id="reviewForm" novalidate>
-      ${failed ? '' : `<fieldset class="stars"><legend>Your score</legend><div class="star-row">${stars}</div></fieldset>`}
+      ${failed ? '' : html`<fieldset class="stars"><legend>Your score</legend><div class="star-row">${stars}</div></fieldset>`}
       <fieldset class="problems"><legend>${failed ? 'What went wrong?' : 'Anything wrong? (optional)'}</legend>
-        ${PROBLEMS.map(([k, l]) => `<label class="check"><input type="checkbox" name="problem" value="${k}"${failed && k === 'slow_failed' ? ' checked' : ''}> ${l}</label>`).join('')}
+        ${PROBLEMS.map(([k, l]) => html`<label class="check"><input type="checkbox" name="problem" value="${k}" ${failed && k === 'slow_failed' ? html`checked` : ''}> ${l}</label>`)}
       </fieldset>
       <label>Details (optional)<textarea id="reviewComment" maxlength="4000" rows="3"
         placeholder="What did you expect, what went wrong, and where?"></textarea></label>
@@ -1325,7 +1353,7 @@ function showReview(j) {
         stored if you ask for a follow-up, and only used for that.</p>
       <button type="submit" class="secondary" id="reviewSend">Send</button>
       <div id="reviewMsg" class="hint" role="status"></div>
-    </form>`;
+    </form>`);
   $('reviewFollowup').onchange = () => {
     $('reviewContact').hidden = !$('reviewFollowup').checked;
     if ($('reviewFollowup').checked) $('reviewEmail').focus();
@@ -1364,8 +1392,8 @@ async function submitReview(e) {
     const d = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(describeError(d));
     markReviewed(j.id);
-    $('review').innerHTML = `<p class="hint review-done">Thanks! Your ${problems.length ? 'report' : 'review'} was saved`
-      + `${followup ? ' and we\'ll get back to you by email' : ''}.</p>`;
+    setHtml($('review'), html`<p class="hint review-done">Thanks! Your ${problems.length ? 'report' : 'review'} was saved${
+      followup ? " and we'll get back to you by email" : ''}.</p>`);
   } catch (err) {
     $('reviewSend').disabled = false;
     msg.textContent = `Couldn't send: ${err.message}`;
@@ -1608,7 +1636,7 @@ function showFailure(j) {
   $('failTitle').textContent = j.title || FAIL_TITLES[j.error_kind] || "The model couldn't be built";
   $('failCause').textContent = j.error || '';
   const advice = j.advice || [];
-  $('failAdvice').innerHTML = advice.map((a) => `<li>${escapeHtml(a)}</li>`).join('');
+  setHtml($('failAdvice'), html`${advice.map((a) => html`<li>${a}</li>`)}`);
   $('failAdviceHead').hidden = !advice.length;
   const stats = [];
   if (j.seconds) stats.push(`stopped after ${Math.round(j.seconds)} s`);

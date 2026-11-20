@@ -23,8 +23,11 @@ __OG_IMAGE_META__
   <meta name="twitter:description" content="__OG_DESCRIPTION__">
   <meta name="twitter:image" content="__OG_IMAGE__">
   <meta name="twitter:image:alt" content="__OG_IMAGE_ALT__">
+  <!-- third-party files are pinned: Subresource Integrity (sha384 of the exact files the CDN
+       serves); the server's Content-Security-Policy allows only these URLs and, by hash, the
+       inline scripts below (maptomesh/server.py works the hashes out from this file) -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+        integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H" crossorigin="anonymous">
   <link rel="stylesheet" href="/static/style.css">
   <script>
     // colour theme before the first paint (no flash): the saved choice, else the system setting
@@ -39,11 +42,18 @@ __OG_IMAGE_META__
     } catch (e) { document.documentElement.dataset.mode = 'simple'; }
   </script>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+          integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
+  <!-- "integrity": each three.js module web/app.js loads (browsers without import-map integrity
+       ignore the key; the CSP still limits scripts to three@0.170.0) -->
   <script type="importmap">
     {"imports": {
       "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
       "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+    },
+    "integrity": {
+      "https://unpkg.com/three@0.170.0/build/three.module.js": "sha384-GY5FqjttLCFRt/McQbyaVdCk2O1IQtOeX8Py6NfD89BIAsIyJFRl4UgSXrk2vXAk",
+      "https://unpkg.com/three@0.170.0/examples/jsm/controls/OrbitControls.js": "sha384-aJoe4qqS/DgF2jh9njAuvA6QIveJYoCuYOfYjdFY8P3eawzmc9bEQ40jq2TvOyuP",
+      "https://unpkg.com/three@0.170.0/examples/jsm/utils/BufferGeometryUtils.js": "sha384-wOjwauvHlJO7K6APr7FmMGH2nupQa3Ndzas9bJZhsAMOK055efJud8ns4aYmASKv"
     }}
   </script>
 </head>
@@ -199,7 +209,7 @@ __OG_IMAGE_META__
       </div>
     </div>
     <div class="adv">
-      <h2 style="margin-top:14px">Printer</h2>
+      <h2 class="printer-head">Printer</h2>
       <div class="row">
         <label title="Colour boundaries, water surfaces and band heights are aligned to this layer grid">
           Layer height (mm)<input autocomplete="off" id="layerH" max="1" type="number" min="0.04" step="0.02" value="0.2"></label>

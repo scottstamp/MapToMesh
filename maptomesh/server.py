@@ -34,20 +34,84 @@ from .worker import scrub
 
 log = logging.getLogger("maptomesh")
 
-# no interactive API docs or schema in public: the page is the only client
-app = FastAPI(title="MapToMesh", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
-
-
-# ---------------------------------------------------------------- middleware (plain ASGI: streams pass through)
+# ---------------------------------------------------------------- security headers (plain ASGI: streams pass through)
 
 _SECURITY_HEADERS = ((b"x-content-type-options", b"nosniff"),
                      (b"referrer-policy", b"strict-origin-when-cross-origin"),
                      (b"x-frame-options", b"DENY"))
 
+# Content-Security-Policy. The page (/ and /static/*.html): scripts only from this site, the pinned
+# CDN files (Subresource Integrity in web/index.html) and its inline scripts by hash; styles from
+# this site and Leaflet's (Leaflet and three.js style elements through the CSSOM, which CSP allows;
+# web/app.js does the same); images from this site, the map tiles, blob: (models built on the
+# device) and data:; data from any https host (builds on the device fetch the agencies' services
+# directly); blob: workers only for app.js's module-worker feature test.
+CDN_SCRIPTS = ("https://unpkg.com/leaflet@1.9.4/dist/leaflet.js", "https://unpkg.com/three@0.170.0/")
+CDN_STYLES = ("https://unpkg.com/leaflet@1.9.4/dist/leaflet.css",)
+MAP_IMAGES = ("https://tile.openstreetmap.org", "https://unpkg.com/leaflet@1.9.4/dist/images/")
+# The build worker (web/browser-worker.js, a module worker: its policy comes with its own response,
+# not the page's): Pyodide's JavaScript is imported from blob: URLs once its hashes are checked,
+# and it compiles WebAssembly (Python and its packages).
+WORKER_CSP = ("default-src 'none'; script-src 'self' blob: 'wasm-unsafe-eval'; connect-src 'self' https:; "
+              "frame-ancestors 'none'")
+# Everything else (JSON, models, images; the data proxy sets its own): nothing runs from it.
+API_CSP = "default-src 'none'; frame-ancestors 'none'; sandbox"
+_INLINE_SCRIPT = re.compile(r"<script\b(?![^>]*\bsrc\s*=)[^>]*>(.*?)</script\s*>", re.S | re.I)
+
+
+def inline_script_hashes(page: str) -> list[str]:
+    """CSP hash sources of a page's inline scripts (index.html: the colour theme, the import map)."""
+    import base64
+    import hashlib
+    return [f"'sha256-{base64.b64encode(hashlib.sha256(s.encode('utf-8')).digest()).decode()}'"
+            for s in _INLINE_SCRIPT.findall(page)]
+
+
+def page_csp(page: str) -> str:
+    return "; ".join((
+        "default-src 'self'",
+        "script-src " + " ".join(("'self'", *CDN_SCRIPTS, *inline_script_hashes(page))),
+        "style-src " + " ".join(("'self'", *CDN_STYLES)),
+        "img-src " + " ".join(("'self'", "data:", "blob:", *MAP_IMAGES)),
+        "connect-src 'self' https: blob:",
+        "worker-src 'self' blob:",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+    ))
+
+
+_PAGE_CSP: dict[str, tuple[float, bytes]] = {}
+
+
+def _html_csp(name: str) -> bytes:
+    """The page CSP of web/<name> (hashes of its inline scripts; worked out again when it changes)."""
+    try:
+        path = (config.WEB_DIR / name).resolve()
+        if path.parent != config.WEB_DIR.resolve():
+            raise FileNotFoundError(name)
+        mtime = path.stat().st_mtime
+        hit = _PAGE_CSP.get(name)
+        if hit is None or hit[0] != mtime:
+            hit = _PAGE_CSP[name] = (mtime, page_csp(path.read_text(encoding="utf-8")).encode())
+        return hit[1]
+    except (OSError, ValueError):
+        return page_csp("").encode()
+
+
+def csp_for(path: str) -> bytes:
+    if path == "/":
+        return _html_csp("index.html")
+    if path.startswith("/static/"):
+        return _html_csp(path[len("/static/"):]) if path.endswith(".html") else WORKER_CSP.encode()
+    return API_CSP.encode()
+
 
 class _Headers:
-    """Security headers on every response (kept where a route set its own, e.g. the proxy's
-    sandbox CSP), and ``Cache-Control: no-cache`` on the UI so browsers revalidate it after updates."""
+    """Security headers and a Content-Security-Policy on every response (kept where a route set its
+    own, e.g. the proxy's sandbox CSP), and ``Cache-Control: no-cache`` on the UI so browsers
+    revalidate it after updates."""
 
     def __init__(self, app):
         self.app = app
@@ -63,12 +127,24 @@ class _Headers:
                 headers = [(k, v) for k, v in msg.get("headers", []) if not (ui and k.lower() == b"cache-control")]
                 have = {k.lower() for k, _ in headers}
                 headers += [(k, v) for k, v in _SECURITY_HEADERS if k not in have]
+                if b"content-security-policy" not in have:
+                    headers.append((b"content-security-policy", csp_for(path)))
                 if ui:
                     headers.append((b"cache-control", b"no-cache"))
                 msg = {**msg, "headers": headers}
             await send(msg)
 
         await self.app(scope, receive, send_)
+
+
+class _App(FastAPI):
+    def build_middleware_stack(self):
+        # outermost, around Starlette's ServerErrorMiddleware too: its 500s get the headers as well
+        return _Headers(super().build_middleware_stack())
+
+
+# no interactive API docs or schema in public: the page is the only client
+app = _App(title="MapToMesh", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
 
 
 # Request bodies: the API takes small JSON documents (settings, reports) and the proxy forwards
@@ -145,8 +221,7 @@ class _BodyLimit:
             await self._refuse(send)
 
 
-app.add_middleware(_BodyLimit)
-app.add_middleware(_Headers)       # outermost: every response, the 413s too
+app.add_middleware(_BodyLimit)     # (_Headers wraps the whole stack: _App)
 
 
 # ---------------------------------------------------------------- jobs
