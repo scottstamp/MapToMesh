@@ -82,6 +82,8 @@ def get_elevation(opts: Options, progress: ProgressFn, cancel: threading.Event) 
 
 
 TREES_MIN_KNOWN = 0.9   # share of the area whose data shows trees, for trees to be drawn at all
+TREE_MAX_M = 120.0      # tallest trees ~115 m: taller "canopy" is noise (or an unclassified tower)
+RAISED_MAX_M = 1000.0   # tallest building 828 m: returns higher above the ground are noise
 
 MAPTERHORN_FIRST = os.environ.get("MAPTOMESH_MAPTERHORN_FIRST", "1") != "0"
 
@@ -212,6 +214,7 @@ class Surface:
     surface_land: np.ndarray = None  # same for the printed surface
     river: np.ndarray = None         # OSM river / stream centreline corridors (never dropped)
     notes: list[str] = field(default_factory=list)
+    deck_water: np.ndarray = None    # bridge decks taken out of the water mask (over water)
 
 
 def _close_and_fill(values: np.ndarray, mask: np.ndarray, min_cells: int) -> tuple[np.ndarray, np.ndarray]:
@@ -284,7 +287,7 @@ def _smooth_steep(G: np.ndarray, step: float, strength: float) -> np.ndarray:
     return G1 + w * (S - G1)
 
 
-def _osm_bridges(osm_br, BRm, BRv, U, Gf, W, opts, notes, step):
+def _osm_bridges(osm_br, BRm, BRv, U, Gf, W, opts, notes, step, bld=None):
     """Add OpenStreetMap bridges that the data has no bridge class for.
 
     Elevation models (and LiDAR projects without class 17) carry no bridge information, so the
@@ -304,6 +307,7 @@ def _osm_bridges(osm_br, BRm, BRv, U, Gf, W, opts, notes, step):
     if not nb.any():
         return BRm, BRv
     deck = np.where(nb & np.isfinite(U) & (np.nan_to_num(U, nan=-1e9) > Gf + 1.0), U, np.nan)
+    deck = _deck_plausible(deck, nb, U, Gf, step, bld)
     if BRm.any():
         dist, (bi, bj) = ndimage.distance_transform_edt(~BRm, return_indices=True)
         beside = nb & (dist <= max(2.0, 8.0 / step))
@@ -331,6 +335,53 @@ def _osm_bridges(osm_br, BRm, BRv, U, Gf, W, opts, notes, step):
     BRv = np.where(nb, filled, BRv)
     notes.append("Bridges without a bridge class in the elevation data come from OpenStreetMap.")
     return BRm | nb, BRv
+
+
+def _deck_plausible(deck: np.ndarray, nb: np.ndarray, U: np.ndarray, Gf: np.ndarray, step: float,
+                    bld: np.ndarray | None = None) -> np.ndarray:
+    """Surface heights on OpenStreetMap bridges that can be their decks; on the others NaN, so the
+    heights of the bridge's ends carry across. Without a bridge class the surface over a bridge
+    may be tree canopy (a 30 m lane bridge over a stream in the woods took the 15 m canopy as
+    its deck). A bridge's heights are canopy when both:
+
+    - its surroundings (``bld``: mapped buildings left out - skybridges run between towers) are
+      mostly raised (> 2 m above the ground) to about the same height: canopy over a bridge
+      continues the canopy around it, while a deck stands apart from what is beside it (water,
+      roads, ground below, or taller trees);
+    - it stands higher above the ground than a deck of its length would (max(4 m, 0.35 x
+      length): approach grades): flyovers lined with trees of their height are long.
+
+    (Smoothness doesn't tell them apart at these cell sizes: real decks in surface models
+    deviate from their neighbours by 0.5-2 m - slopes, edges blurred into the drop beside them.)"""
+    fin = np.isfinite(deck)
+    if not fin.any():
+        return deck
+    out = deck.copy()
+    lab, n = ndimage.label(nb, structure=np.ones((3, 3)))
+    ring_w = max(2, int(round(10.0 / step)))
+    for k, sl in enumerate(ndimage.find_objects(lab), start=1):
+        if sl is None:
+            continue
+        sl2 = tuple(slice(max(0, s.start - ring_w), s.stop + ring_w) for s in sl)
+        m = lab[sl2] == k
+        dg = (deck - Gf)[sl2][m]
+        dg = dg[np.isfinite(dg)]
+        if not dg.size:
+            continue
+        length = step * float(np.hypot(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start))
+        if float(np.median(dg)) <= max(4.0, 0.35 * length):
+            continue
+        ring = ndimage.binary_dilation(m, iterations=ring_w) & ~(lab[sl2] > 0)
+        if bld is not None:
+            ring &= ~bld[sl2]
+        if ring.sum() < 8:
+            continue
+        rg = (U - Gf)[sl2][ring]
+        raised = np.isfinite(rg) & (np.nan_to_num(rg, nan=-1e9) > 2.0)
+        if raised.mean() >= 0.6 and abs(float(np.median(dg)) - float(np.median(rg[raised]))) < 3.0:
+            view = out[sl2]
+            view[m] = np.nan
+    return out
 
 
 def _planar_components(U: np.ndarray, mask: np.ndarray, step: float) -> np.ndarray:
@@ -444,9 +495,15 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
     def above(v, d):
         return np.isfinite(v) & (np.nan_to_num(v, nan=-1e9) > Gf + d)
 
-    bld_v, veg_v = a["building"].copy(), a["veg"].copy()
+    # returns higher above the ground than any building are noise (birds, clouds, haze, multipath:
+    # Burlington has clusters of hundreds of unclassified cells 1.1-1.5 km above Lake Ontario,
+    # which despike - isolated cells only - keeps)
+    def plausible(v):
+        return np.where(np.isfinite(v) & (np.nan_to_num(v, nan=-1e9) > Gf + RAISED_MAX_M), np.nan, v)
+
+    bld_v, veg_v = plausible(a["building"]), plausible(a["veg"])
     # route unclassified (0/1) returns depending on what the owning project classifies
-    U = a["unclass"]
+    U = plausible(a["unclass"])
     bcls, vcls = a["bld_cls"].astype(bool), a["veg_cls"].astype(bool)
     Uf = despike(np.where(np.isfinite(U), U, Gf), np.isfinite(U), thresh=12.0, size=5)
     um = above(Uf, 2.0) & np.isfinite(U)
@@ -472,20 +529,29 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
                 notes.append("Part of the data has no building class: OpenStreetMap footprints identified "
                              "buildings, other raised objects count as trees.")
         else:
-            is_b = _planar_components(Uf, cand, step) & cand
+            # (not over water: a flat sheet of returns there is haze or a cloud, not a roof)
+            is_b = _planar_components(Uf, cand & ~W, step) & cand
             if show:
                 notes.append("Part of the data has no building class; a roof-flatness heuristic was used "
                              "(OpenStreetMap footprints give better results).")
         bld_v = np.where(is_b, np.fmax(bld_v, Uf), bld_v)
         to_veg |= unknown & ~is_b
+    if has_osm and to_veg.any():
+        # taller than any tree inside a mapped footprint: an unclassified tower, not a tree
+        tower = to_veg & near & (Uf > Gf + TREE_MAX_M)
+        bld_v = np.where(tower, np.fmax(bld_v, Uf), bld_v)
+        to_veg &= ~tower
     veg_v = np.where(to_veg, np.fmax(veg_v, Uf), veg_v)
+    # nothing taller than the tallest trees (~115 m) is a tree: noise clusters printed as
+    # kilometre-high needles; they become ground
+    veg_v = np.where(np.isfinite(veg_v) & (np.nan_to_num(veg_v, nan=-1e9) > Gf + TREE_MAX_M), np.nan, veg_v)
     known = a.get("veg_known")
     notes += osm.get("building_notes", [])
     if known is not None and opts.show_buildings:
         bld_v = _bare_earth_buildings(bld_v, Gf, ~known.astype(bool), a.get("surface_only"), osm, step, notes)
     Bm, Bv = _close_and_fill(bld_v, above(bld_v, 2.0), cells(12))
     BRm, BRv = _close_and_fill(a["bridge"], above(a["bridge"], 1.0), cells(20))
-    BRm, BRv = _osm_bridges(osm.get("bridges"), BRm, BRv, a["unclass"], Gf, W, opts, notes, step)
+    BRm, BRv = _osm_bridges(osm.get("bridges"), BRm, BRv, U, Gf, W, opts, notes, step, osm_bld)
     if BRm.any():
         # a deck is smooth: cell-to-cell noise (railings, vehicles, returns off its edges) printed
         # as dents and bumps along every bridge
@@ -517,7 +583,9 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
     # --- water: clean the mask, one flat level per water body
     W = remove_small(W, cells(60))
     W |= ~W & ~remove_small(~W, cells(40))  # fill pin-holes (wave dropouts, boats)
+    deck_water = zeros.copy()
     if opts.show_bridges:
+        deck_water = W & BRm
         W &= ~BRm
     # rivers / streams: OSM centrelines (continuous, printable width) - the LiDAR only sees
     # scattered water returns on narrow streams, which printed as dashed colour islands
@@ -530,6 +598,7 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
         if osm_bld is not None:
             river &= ~osm_bld
         if opts.show_bridges:
+            deck_water |= river & BRm
             river &= ~BRm                 # rail / foot bridges too (not in the road mask)
     if river.any() and W.any():
         # LiDAR water returns along a stream belong to the stream, not to separate ponds: absorb
@@ -576,6 +645,9 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
         Gf = np.where(river, Lr, Gf)
         L = np.where(river, Lr, L)
     W_area = W.copy()
+    # no canopy over lakes and the sea (returns there are noise, boats, or trees on the shore the
+    # water outline overlaps); streams keep the canopy that overhangs them
+    Vm &= ~W_area
     W = W | river
     if W.any():
         _, (ri, ci) = ndimage.distance_transform_edt(~W, return_indices=True)
@@ -623,13 +695,20 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
     else:
         ground_land, surface_land = Gf, S
     return Surface(Gf, S, roof, canopy, bridge, level, masks,
-                   BRm if opts.show_bridges else zeros, ground_land, surface_land, river, notes)
+                   BRm if opts.show_bridges else zeros, ground_land, surface_land, river, notes,
+                   deck_water=deck_water)
 
 
 # ---------------------------------------------------------------- parts
 
 MODEL = 6
 BAND0 = 10
+# outline thresholds of the smoothed indicators: water 0.5; others distinct from it (and each
+# other), so two outlines never cross a grid edge at the very same point (a pinch: non-manifold)
+DECK_TH = 0.5 + 0.0173 * 5
+# the water stops where the deck indicator passes this: inside the deck outline in every mode
+# (above DECK_TH, and above the roads' 0.5 + 3 * 0.0173 that holds land cover's decks)
+DECK_KEEP = DECK_TH + 0.0173
 
 
 @dataclass
@@ -673,7 +752,6 @@ def _iso_distance(diag: np.ndarray, f: np.ndarray, th: float, reach: float,
     field ``f`` on the grid triangulated like ``Partition(R, C, diag)`` - the exact line the
     partition cuts along. Positive where ``f < th``; NaN farther than ``reach`` cells, and where
     the (optional) vertex mask ``query`` is False."""
-    W1 = f.shape[1]
     out = np.full(f.size, np.nan)
     wg = f >= th
     coarse = ndimage.distance_transform_edt(~wg) + ndimage.distance_transform_edt(wg)
@@ -765,11 +843,33 @@ def _shore_cap(diag: np.ndarray, ind: np.ndarray, wtop: np.ndarray, wall: float,
     return out.reshape(top.shape)
 
 
-def _water_indicator(lakes: np.ndarray, rivers: np.ndarray, min_cells: int, sigma: float) -> np.ndarray | None:
+def _water_indicator(lakes: np.ndarray, rivers: np.ndarray, min_cells: int, sigma: float,
+                     decks: np.ndarray | None = None, deck_field: np.ndarray | None = None) -> np.ndarray | None:
     """Field whose 0.5 iso-line is the water outline. Lake and sea shores are smoothed with
     ``sigma`` (cells; about the printable feature size - LiDAR water edges wobble from cell to
     cell, which printed as a ragged coast), rivers keep a tight outline so narrow streams
-    survive."""
+    survive.
+
+    Bridge decks over the water (``decks``) were gaps in it, which the smoothing closed over (a
+    deck near the minimum printable width kept 20-60% of its length) or left strips of land
+    along. They count as water here, and the water stops where the deck's own indicator
+    ``deck_field`` passes ``DECK_KEEP``, inside the deck outline cut later: the deck meets the
+    water directly. (One field for the water keeps the land, and the ground body under it, the
+    complement of a single outline; cutting the decks first and the water after them pinched the
+    body where the two outlines met.)"""
+    if decks is not None and decks.any():
+        # ... except near the banks: there the shore bulges round the deck's foot as before (filled
+        # up to the bank, the water left specks between the deck's rounded corners and the bank)
+        land = ~(lakes | rivers | decks)
+        if land.any():
+            decks = decks & (ndimage.distance_transform_edt(~land) > 2.0 * max(sigma, 0.7) + 1.0)
+    if decks is not None and decks.any():
+        on_river = np.zeros_like(decks)
+        if rivers.any():
+            lab, _ = ndimage.label(decks, structure=np.ones((3, 3)))
+            ids = np.unique(lab[ndimage.binary_dilation(rivers, iterations=2) & (lab > 0)])
+            on_river = np.isin(lab, ids[ids > 0])
+        lakes, rivers = lakes | (decks & ~on_river), rivers | on_river
     wet = lakes | rivers
     if not wet.any():
         return None
@@ -780,35 +880,45 @@ def _water_indicator(lakes: np.ndarray, rivers: np.ndarray, min_cells: int, sigm
     frag = _land_fragments(ind < 0.5, ~wet, 4 * max(min_cells, 1))
     if frag.any():
         ind = np.where(frag, 1.0, ind)
+    if deck_field is not None:
+        ind = np.minimum(ind, 0.5 + DECK_KEEP - deck_field)
     return ind
 
 
 def _land_fragments(land: np.ndarray, land0: np.ndarray, max_cells: int) -> np.ndarray:
     """Specks the smoothing broke off land narrower than it (a pier or breakwater about one cell
     wide keeps only its wider spots: a dashed line of tiny islands into the water). A piece of the
-    smoothed ``land`` is a fragment when it is smaller than ``max_cells`` and the unsmoothed land
-    ``land0`` it came from is at least three times its size; small islands that survive whole
-    stay."""
+    smoothed ``land`` is a fragment when it is smaller than ``max_cells``, the unsmoothed land
+    ``land0`` it came from is at least three times its size, and that land kept a larger piece
+    (the coast a pier leaves, or the biggest dash). A skerry the smoothing shrank as a whole keeps
+    its piece (Lofoten: skerries of 400-800 m2 were deleted as "fragments" of themselves)."""
     st = np.ones((3, 3), bool)
     lab, n = ndimage.label(land, structure=st)
     if n == 0:
         return np.zeros_like(land)
     size = np.bincount(lab.ravel(), minlength=n + 1)
-    lab0, _ = ndimage.label(land0, structure=st)
-    size0 = np.bincount(lab0.ravel())
+    lab0, n0 = ndimage.label(land0, structure=st)
+    size0 = np.bincount(lab0.ravel(), minlength=n0 + 1)
     size0[0] = 0
-    ids = np.arange(1, n + 1)
     src = _label_reduce(np.maximum, size0[lab0], lab, n)   # the largest land each piece touches
+    # the largest smoothed piece each unsmoothed land kept, and the largest of those per piece
+    kept0 = np.zeros(n0 + 1, np.int64)
+    if n0:
+        kept0[1:] = np.maximum(_label_reduce(np.maximum, np.where(lab > 0, size[lab], 0), lab0, n0), 0)
+    bigger = _label_reduce(np.maximum, kept0[lab0], lab, n)
     bad = np.zeros(n + 1, bool)
-    bad[1:] = (size[1:] < max_cells) & (src >= 3 * size[1:])
+    bad[1:] = (size[1:] < max_cells) & (src >= 3 * size[1:]) & (bigger > size[1:])
     return bad[lab]
 
 
 def _cut_water(part: Partition, lakes: np.ndarray, rivers: np.ndarray, min_cells: int,
-               land: Partition | None = None, sigma: float = 0.7) -> np.ndarray | None:
+               land: Partition | None = None, sigma: float = 0.7,
+               decks: np.ndarray | None = None, deck_field: np.ndarray | None = None) -> np.ndarray | None:
     """One outline for all water (label WATER), then the river share of it relabelled RIVER.
-    Returns the indicator field whose 0.5 iso-line is the water outline."""
-    ind = _water_indicator(lakes, rivers, min_cells, sigma)
+    ``decks`` / ``deck_field``: bridge decks over the water and the field their outline is cut
+    along next (``_water_indicator``). Returns the indicator field whose 0.5 iso-line is the
+    water's shore without the decks (for the shore cap: land descends to the real shore)."""
+    ind = _water_indicator(lakes, rivers, min_cells, sigma, decks, deck_field)
     if ind is None:
         return None
     part.step(ind, 0.5, above=WATER)
@@ -821,6 +931,8 @@ def _cut_water(part: Partition, lakes: np.ndarray, rivers: np.ndarray, min_cells
             part.step(split, 0.0123, above=RIVER, only=WATER)
         else:
             part.step(np.ones(ind.shape), 0.0, above=RIVER, only=WATER)
+    if deck_field is not None:
+        ind = _water_indicator(lakes, rivers, min_cells, sigma)
     return ind
 
 
@@ -856,7 +968,6 @@ def _drop_swap_patches(masks: dict[int, np.ndarray], tops: dict[int, np.ndarray]
             continue
         lm, n = ndimage.label(m, structure=np.ones((3, 3)))
         labels[lab] = lm
-        idx = np.arange(1, n + 1)
         area = np.bincount(lm.ravel(), minlength=n + 1)[1:] * cell_mm * cell_mm
         hi = np.ceil(_label_reduce(np.maximum, tops[lab], lm, n) / layer).astype(int)
         base_f = tops[lab] if lab in (WATER, RIVER) else ground
@@ -1156,9 +1267,9 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
 
     def cut_structures(p: Partition) -> list[int]:
         labs = []
-        for lab, m, i in ((BUILDING, bld_m, 2), (BRIDGE, brg_m, 5)):
+        for lab, m, th in ((BUILDING, bld_m, 0.5 + 0.0173 * 2), (BRIDGE, brg_m, DECK_TH)):
             if m.any():
-                p.step(_indicator(m, min_cells), 0.5 + 0.0173 * i, above=lab)
+                p.step(_indicator(m, min_cells), th, above=lab)
                 labs.append(lab)
         return [lab for lab in labs if (p.tri_label == lab).any() or (p.p_label == lab).any()]
 
@@ -1219,13 +1330,19 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         progress(0.1, "Cutting colour regions")
         # Water is cut first, so "land" is exactly the complement of the water outline. A second
         # partition with only the outline + water cut then gives one seamless ground-coloured body
-        # under all land colours (no walls along every colour boundary). LiDAR bridges were
-        # already removed from the water mask, so they survive as roads.
+        # under all land colours (no walls along every colour boundary). The water stops at the
+        # bridge decks (its smoothed shore swallowed narrow ones: _water_indicator), which are cut
+        # right after it.
         land = part.copy()
+        decks = b_ind = None
+        if bridge_m.any():
+            b_ind = _indicator(bridge_m, min_cells)
+            decks = P(surf.deck_water) & bridge_m if surf.deck_water is not None else None
         # all water (lakes, sea, rivers) is cut as ONE region, then divided into lake / river
         # inside it - separate outlines would leave slivers of land between a river and LiDAR
         # water patches or a lake it runs into
-        ind = _cut_water(part, cmasks[WATER], cmasks[RIVER], min_cells, land=land, sigma=shore_sigma)
+        ind = _cut_water(part, cmasks[WATER], cmasks[RIVER], min_cells, land=land, sigma=shore_sigma,
+                         decks=decks, deck_field=b_ind)
         if ind is not None and shore_k > 0:
             # on the water side G_mm drops below the water: only the shore edge interpolates it
             G_mm = _shore_cap(diag, ind, fields[WATER], shore_wall, shore_k, G_mm)
@@ -1237,9 +1354,12 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
                 # same point (which would pinch the region between them to a single point)
                 sigma = 1.2 if lab == VEG else 0.7  # tree canopies are ragged: smoother outline
                 part.step(_indicator(m, min_cells, sigma), 0.5 + 0.0173 * i, above=lab)
-        if bridge_m.any() and cmasks[ROAD].any():
-            # decks inside the roads (the road mask holds them): no slivers where deck meets road
-            part.step(_indicator(bridge_m, min_cells), 0.5, above=BRIDGE, only=ROAD)
+        if b_ind is not None and cmasks[ROAD].any():
+            # decks inside the roads (the road mask holds them): no slivers where deck meets road.
+            # Over the water only deck is left there (the water stops at DECK_KEEP, above the
+            # roads' threshold), so the deck meets the water directly.
+            part.step(b_ind, 0.5, above=BRIDGE, only=ROAD)
+        del b_ind
         part.finish(GROUND)
         land.finish(GROUND)
         default = GROUND
@@ -1284,7 +1404,14 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         water_sep = opts.elevation_water and wmask.any()
         if water_sep:  # flat, recessed water in its own colour; bands cover the land only
             progress(0.08, "Cutting water")
-            ind = _cut_water(part, P(surf.masks[WATER]), P(surf.masks[RIVER]), min_cells, sigma=shore_sigma)
+            # the water stops at the decks: its smoothed shore swallowed narrow ones (_water_indicator)
+            decks = b_ind = None
+            if brg_m.any():
+                b_ind = _indicator(brg_m, min_cells)
+                decks = P(surf.deck_water) & brg_m if surf.deck_water is not None else None
+            ind = _cut_water(part, P(surf.masks[WATER]), P(surf.masks[RIVER]), min_cells, sigma=shore_sigma,
+                             decks=decks, deck_field=b_ind)
+            del b_ind
             wtop = np.maximum(np.round(zmm(surf.level), 3) - opts.water_recess_mm, lowest)
             wet_e = P(surf.masks[WATER] | surf.masks[RIVER])
             _, (wi, wj) = ndimage.distance_transform_edt(~wet_e, return_indices=True)
