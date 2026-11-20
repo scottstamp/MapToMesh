@@ -844,7 +844,8 @@ def _shore_cap(diag: np.ndarray, ind: np.ndarray, wtop: np.ndarray, wall: float,
 
 
 def _water_indicator(lakes: np.ndarray, rivers: np.ndarray, min_cells: int, sigma: float,
-                     decks: np.ndarray | None = None, deck_field: np.ndarray | None = None) -> np.ndarray | None:
+                     decks: np.ndarray | None = None, deck_field: np.ndarray | None = None,
+                     shore: list | None = None) -> np.ndarray | None:
     """Field whose 0.5 iso-line is the water outline. Lake and sea shores are smoothed with
     ``sigma`` (cells; about the printable feature size - LiDAR water edges wobble from cell to
     cell, which printed as a ragged coast), rivers keep a tight outline so narrow streams
@@ -856,14 +857,18 @@ def _water_indicator(lakes: np.ndarray, rivers: np.ndarray, min_cells: int, sigm
     ``deck_field`` passes ``DECK_KEEP``, inside the deck outline cut later: the deck meets the
     water directly. (One field for the water keeps the land, and the ground body under it, the
     complement of a single outline; cutting the decks first and the water after them pinched the
-    body where the two outlines met.)"""
+    body where the two outlines met.) ``shore``: a list that receives the field without the decks
+    (the real shore: no fill, no keep-out)."""
     if decks is not None and decks.any():
         # ... except near the banks: there the shore bulges round the deck's foot as before (filled
         # up to the bank, the water left specks between the deck's rounded corners and the bank)
         land = ~(lakes | rivers | decks)
         if land.any():
             decks = decks & (ndimage.distance_transform_edt(~land) > 2.0 * max(sigma, 0.7) + 1.0)
-    if decks is not None and decks.any():
+    filled = decks is not None and decks.any()
+    if shore is not None and filled:
+        shore.append(_water_indicator(lakes, rivers, min_cells, sigma))
+    if filled:
         on_river = np.zeros_like(decks)
         if rivers.any():
             lab, _ = ndimage.label(decks, structure=np.ones((3, 3)))
@@ -880,6 +885,8 @@ def _water_indicator(lakes: np.ndarray, rivers: np.ndarray, min_cells: int, sigm
     frag = _land_fragments(ind < 0.5, ~wet, 4 * max(min_cells, 1))
     if frag.any():
         ind = np.where(frag, 1.0, ind)
+    if shore is not None and not filled:
+        shore.append(ind)
     if deck_field is not None:
         ind = np.minimum(ind, 0.5 + DECK_KEEP - deck_field)
     return ind
@@ -918,7 +925,8 @@ def _cut_water(part: Partition, lakes: np.ndarray, rivers: np.ndarray, min_cells
     ``decks`` / ``deck_field``: bridge decks over the water and the field their outline is cut
     along next (``_water_indicator``). Returns the indicator field whose 0.5 iso-line is the
     water's shore without the decks (for the shore cap: land descends to the real shore)."""
-    ind = _water_indicator(lakes, rivers, min_cells, sigma, decks, deck_field)
+    shore: list = []
+    ind = _water_indicator(lakes, rivers, min_cells, sigma, decks, deck_field, shore)
     if ind is None:
         return None
     part.step(ind, 0.5, above=WATER)
@@ -931,9 +939,7 @@ def _cut_water(part: Partition, lakes: np.ndarray, rivers: np.ndarray, min_cells
             part.step(split, 0.0123, above=RIVER, only=WATER)
         else:
             part.step(np.ones(ind.shape), 0.0, above=RIVER, only=WATER)
-    if deck_field is not None:
-        ind = _water_indicator(lakes, rivers, min_cells, sigma)
-    return ind
+    return shore[0]
 
 
 def _label_reduce(op, values: np.ndarray, lab: np.ndarray, n: int) -> np.ndarray:
