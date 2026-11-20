@@ -66,6 +66,237 @@ def test_glb_axes_and_rtc():
     assert np.allclose(p2, np.column_stack([pts[:, 0], -pts[:, 2], pts[:, 1]]) + [1.0, 2.0, 3.0])
 
 
+def _malformed_glbs() -> dict[str, bytes]:
+    """Damaged versions of a small uncompressed glb."""
+    pts = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
+    good = _glb(pts, np.array([[0, 1, 2]]), np.array([0, 0, 1]))
+    plateau._glb_parts(good)
+
+    def edit(fn) -> bytes:
+        jl, = struct.unpack_from("<I", good, 12)
+        gj = json.loads(good[20:20 + jl])
+        fn(gj)
+        js = json.dumps(gj).encode()
+        js += b" " * ((4 - len(js) % 4) % 4)
+        rest = good[20 + jl:]
+        body = struct.pack("<I4s", len(js), b"JSON") + js + rest
+        return struct.pack("<4sII", b"glTF", 2, 12 + len(body)) + body
+
+    def count(gj):
+        gj["accessors"][0]["count"] = 10 ** 6
+
+    def offset(gj):
+        gj["accessors"][0]["byteOffset"] = 1 << 20
+
+    def stride(gj):
+        gj["bufferViews"][0]["byteStride"] = 4
+
+    def view(gj):
+        gj["bufferViews"][0]["byteLength"] = 1 << 20
+
+    def neg(gj):
+        gj["accessors"][0]["count"] = -1
+
+    def ctype(gj):
+        gj["accessors"][0]["componentType"] = 9999
+
+    def ids(gj):
+        gj["accessors"][1]["count"] = 2
+
+    def cycle(gj):
+        gj["nodes"][0]["children"] = [0]
+
+    bad = {"truncated": good[:len(good) - 20], "truncated more": good[:90]}
+    bad.update({fn.__name__: edit(fn) for fn in (count, offset, stride, view, neg, ctype, ids, cycle)})
+    oob = _glb(pts, np.array([[0, 1, 7]]), np.array([0, 0, 1]))       # an index past the points
+    bad["index"] = oob
+    return bad
+
+
+def test_glb_malformed():
+    """Damaged uncompressed glbs raise ValueError (the fetch skips the tile) instead of reading
+    outside their buffer: truncated files, accessors / bufferViews past the end, bad strides,
+    indices past the points, mismatched feature ids, node cycles."""
+    for name, g in _malformed_glbs().items():
+        try:
+            plateau._glb_parts(g)
+        except ValueError:
+            continue
+        raise AssertionError(f"{name}: no error")
+
+
+def test_to_grid():
+    """The fitted local map matches pyproj per point to well under 1 cm over a tile-sized box,
+    and falls back to pyproj where it can't (a box far larger than any tile)."""
+    from pyproj import Transformer
+
+    from maptomesh.geo import AOI, Grid
+    aoi = AOI(35.6812, 139.7671, 1500.0, 1500.0)
+    g = Grid.for_aoi(aoi, 600)
+    to_ecef = Transformer.from_crs(4979, 4978, always_xy=True)
+    rng = np.random.default_rng(1)
+    for km, fitted in ((0.5, True), (2.0, True), (40.0, False)):
+        tg = plateau._ToGrid(aoi, g)
+        d = km / 111.0
+        lon = 139.7671 + rng.uniform(-d / 2, d / 2, 5000)
+        lat = 35.6812 + rng.uniform(-d / 2, d / 2, 5000)
+        p = np.column_stack(to_ecef.transform(lon, lat, rng.uniform(35.0, 400.0, 5000)))
+        xy, h = tg(p)
+        e = tg.exact(p)
+        assert (tg.fitted == 1) == fitted, (km, tg.fitted)
+        assert np.hypot(*(xy - e[:, :2]).T).max() * g.step < 0.01 and np.abs(h - e[:, 2]).max() < 0.01, km
+        assert xy.flags.c_contiguous and xy.shape == (5000, 2)
+
+
+def _building_glb(aoi, x: float, y: float, height: float, size: float = 40.0) -> bytes:
+    """A glb (CESIUM_RTC) with one box building centred at local (x, y): a flat roof ``height``
+    above its base, and walls (edge-on: no area) down to the base."""
+    from pyproj import Transformer
+    to_ecef = Transformer.from_crs(4979, 4978, always_xy=True)
+    hx = np.array([-1, 1, 1, -1]) * size / 2 + x
+    hy = np.array([-1, -1, 1, 1]) * size / 2 + y
+    lon, lat = aoi.to_lonlat.transform(np.r_[hx, hx], np.r_[hy, hy])
+    ecef = np.column_stack(to_ecef.transform(lon, lat, np.r_[np.full(4, 40.0 + height), np.full(4, 40.0)]))
+    rtc = ecef.mean(0)
+    d = ecef - rtc
+    gl = np.column_stack([d[:, 0], d[:, 2], -d[:, 1]])          # 3D Tiles z-up -> glTF y-up
+    faces = np.array([[0, 1, 2], [0, 2, 3], [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5]])
+    return _glb(gl, faces, np.zeros(8), rtc=rtc.tolist())
+
+
+def _fake_fetch(aoi, grid, files: dict, window: int):
+    """plateau.fetch over in-memory tiles (no index, no network)."""
+    from maptomesh import httpcache
+
+    class Cache:
+        def read(self, url, start, n, session=None):
+            return files[url][start:start + n]
+
+    saved = (plateau.cities_for, plateau._leaves, httpcache.RANGE_CACHE, plateau.WINDOW)
+    plateau.cities_for = lambda bbox: [{"code": "13101", "name": "test-ku", "year": "2025", "url": "t", "lod": "LoD2"}]
+    plateau._leaves = lambda url, bbox, out: out.extend((u, None) for u in files)
+    httpcache.RANGE_CACHE = Cache()
+    plateau.WINDOW = window
+    try:
+        return plateau.fetch(aoi, grid)
+    finally:
+        plateau.cities_for, plateau._leaves, httpcache.RANGE_CACHE, plateau.WINDOW = saved
+
+
+def test_fetch_windows():
+    """The windowed fetch: buildings at their measured height, a damaged tile skipped and
+    reported, and the same building ids whatever the window."""
+    if not native.enabled() or not hasattr(native.ext, "decode_draco"):
+        print("  (native extension not built: skipped)")
+        return
+    from maptomesh.geo import AOI, Grid
+    aoi = AOI(35.6812, 139.7671, 400.0, 400.0)
+    g = Grid.for_aoi(aoi, 200)
+    spots = [(-120.0, -100.0, 30.0), (0.0, 0.0, 80.0), (110.0, 90.0, 12.0), (-100.0, 120.0, 45.0)]
+    files = {f"https://example.org/t{k}.glb": _building_glb(aoi, x, y, h) for k, (x, y, h) in enumerate(spots)}
+    whole = files["https://example.org/t1.glb"]
+    files["https://example.org/bad.glb"] = whole[:len(whole) // 2] + bytes(len(whole) - len(whole) // 2)
+    a = _fake_fetch(aoi, g, files, 1)
+    b = _fake_fetch(aoi, g, files, 8)
+    assert np.array_equal(a["id"], b["id"]) and np.array_equal(a["rel"], b["rel"], equal_nan=True)
+    assert len(a["failed"]) == 1 and a["failed"][0].startswith("bad.glb"), a["failed"]
+    for k, (x, y, h) in enumerate(spots):
+        c, r = int(round((x - g.x0) / g.step)), int(round((y - g.y0) / g.step))
+        assert abs(a["rel"][r, c] - h) < 0.01, (k, a["rel"][r, c], h)
+    assert len(np.unique(a["id"][a["id"] > 0])) == len(spots)
+
+
+def test_json_cache():
+    """Indexes / tilesets: a plain GET kept on disk for its TTL, refreshed after it, and the
+    stale copy used when the refresh fails."""
+    import tempfile
+    import time
+
+    import requests
+
+    from maptomesh import config
+    calls = []
+
+    class Resp:
+        def __init__(self, body):
+            self.content = body
+
+        def raise_for_status(self):
+            pass
+
+    def get(url, **kw):
+        calls.append(url)
+        if fail:
+            raise requests.ConnectionError("offline")
+        return Resp(json.dumps({"v": len(calls)}).encode())
+
+    saved = (config.CACHE_DIR, requests.get)
+    with tempfile.TemporaryDirectory() as d:
+        config.CACHE_DIR = Path(d)
+        requests.get = get
+        try:
+            fail = False
+            url = "https://api.example.org/datacatalog/tileset.json"
+            assert plateau._get_json(url, 3600) == {"v": 1}
+            assert plateau._get_json(url, 3600) == {"v": 1} and len(calls) == 1     # from disk
+            time.sleep(0.05)
+            assert plateau._get_json(url, 0.01) == {"v": 2} and len(calls) == 2     # expired: refreshed
+            fail = True
+            time.sleep(0.05)
+            assert plateau._get_json(url, 0.01) == {"v": 2} and len(calls) == 3     # offline: stale copy
+            try:
+                plateau._get_json(url + "?other", 3600)
+            except requests.ConnectionError:
+                pass
+            else:
+                raise AssertionError("no copy and no network: must raise")
+        finally:
+            config.CACHE_DIR, requests.get = saved
+
+
+def test_cancel():
+    """A set cancel event always propagates (as ``Cancelled``); an ordinary error that happens to
+    say "Cancelled" is just a warning."""
+    import threading
+    from types import SimpleNamespace
+
+    from maptomesh import buildings
+    from maptomesh.buildings import overture
+    opts = SimpleNamespace(show_buildings=True)
+    elev = SimpleNamespace(arrays={"veg_known": np.zeros((50, 50), bool)})
+    grid = SimpleNamespace(step=10.0)
+
+    def boom(*a, **k):
+        raise RuntimeError("Cancelled order for the upstream service")
+
+    saved = (plateau.fetch, overture.fetch)
+    plateau.fetch = boom
+    overture.fetch = lambda *a, **k: None
+    try:
+        out, _, warnings = buildings.fetch_buildings(opts, elev, None, grid, cancel=threading.Event())
+        assert "plateau" not in out and len(warnings) == 1, warnings
+        ev = threading.Event()
+        ev.set()
+        try:
+            buildings.fetch_buildings(opts, elev, None, grid, cancel=ev)
+        except buildings.Cancelled:
+            pass
+        else:
+            raise AssertionError("cancellation swallowed")
+
+        def cancelled(*a, **k):
+            raise buildings.Cancelled()
+        plateau.fetch = cancelled
+        try:
+            buildings.fetch_buildings(opts, elev, None, grid, cancel=None)
+        except buildings.Cancelled:
+            pass
+        else:
+            raise AssertionError("Cancelled swallowed")
+    finally:
+        plateau.fetch, overture.fetch = saved
+
+
 def test_raster_max():
     if not native.enabled():
         print("  (native extension not built: skipped)")
@@ -112,14 +343,14 @@ def test_leaves():
         node(139.5, 35.5, 140.0, 36.0, "b.b3dm", refine="ADD", kids=[node(139.6, 35.6, 139.7, 35.7, "b1.b3dm")]),
     ])}
     saved = plateau._get_json
-    plateau._get_json = lambda url: ts
-    plateau._tilesets.clear()
+    plateau._get_json = lambda url, ttl=0: ts
+    plateau._memo.clear()
     try:
         out = []
         plateau._leaves("https://example.org/city/tileset.json", (139.1, 35.1, 139.65, 35.65), out)
     finally:
         plateau._get_json = saved
-        plateau._tilesets.clear()
+        plateau._memo.clear()
     names = sorted(u.rsplit("/", 1)[1] for u, _ in out)
     assert names == ["a1.b3dm", "a2.b3dm", "b.b3dm", "b1.b3dm"], names
 
@@ -158,7 +389,8 @@ def test_merge():
 
 
 if __name__ == "__main__":
-    for fn in (test_glb_axes_and_rtc, test_raster_max, test_fill_cracks, test_leaves, test_merge):
+    for fn in (test_glb_axes_and_rtc, test_glb_malformed, test_to_grid, test_fetch_windows, test_json_cache,
+               test_cancel, test_raster_max, test_fill_cracks, test_leaves, test_merge):
         fn()
         print(f"{fn.__name__}: ok")
     print("all passed")

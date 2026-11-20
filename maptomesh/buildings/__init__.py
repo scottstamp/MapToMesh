@@ -23,6 +23,13 @@ class TooLarge(Exception):
     """The area needs more of a source's data than a job may download."""
 
 
+class Cancelled(RuntimeError):
+    """The job was cancelled while a building source was being read (always propagates)."""
+
+    def __init__(self, msg: str = "Cancelled"):
+        super().__init__(msg)
+
+
 MIN_BARE_M2 = 20000.0          # less bare-earth area than this: OSM heights are enough
 
 
@@ -49,9 +56,11 @@ def fetch_buildings(opts, elev, aoi, grid, progress=lambda f, m: None, cancel=No
             credits.append(r["credit"])
     except TooLarge as e:        # OSM / Overture heights instead
         notes.append(f"PLATEAU 3D buildings not used ({e}): OpenStreetMap heights instead.")
+    except Cancelled:
+        raise
     except Exception as e:  # noqa: BLE001 - building sources are optional
-        if "Cancelled" in str(e):
-            raise
+        if cancel is not None and cancel.is_set():
+            raise Cancelled() from e
         log.warning("PLATEAU failed: %r", e)
         warnings.append(f"Warning: PLATEAU 3D buildings unavailable ({e}); using OpenStreetMap heights")
     if "plateau" not in out:
@@ -63,9 +72,11 @@ def fetch_buildings(opts, elev, aoi, grid, progress=lambda f, m: None, cancel=No
                 credits.append(overture.CREDIT)
         except TooLarge as e:
             notes.append(f"Overture building heights not used ({e}).")
+        except Cancelled:
+            raise
         except Exception as e:  # noqa: BLE001
-            if "Cancelled" in str(e):
-                raise
+            if cancel is not None and cancel.is_set():
+                raise Cancelled() from e
             log.warning("Overture failed: %r", e)
             warnings.append(f"Warning: Overture buildings unavailable ({e}); using OpenStreetMap heights only")
     if notes:

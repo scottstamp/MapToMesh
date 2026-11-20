@@ -152,8 +152,136 @@ def test_proxy_allowlist() -> None:
     assert set(proxy.NO_CORS) <= {h for h, _ in proxy.RULES}
 
 
+def _response(status: int, body: bytes, headers: dict | None = None):
+    import requests
+    from requests.structures import CaseInsensitiveDict
+    r = requests.models.Response()
+    r.status_code, r._content, r.headers, r.reason = status, body, CaseInsensitiveDict(headers or {}), ""
+    return r
+
+
+class _Server:
+    """A file over HTTP: honours Range (206 + Content-Range) unless ``ranges`` is False; sends a
+    (weak) ETag if ``etag``."""
+
+    def __init__(self, body: bytes, ranges: bool = True, etag: bool = True):
+        self.body, self.ranges, self.etag, self.calls = body, ranges, etag, 0
+
+    def get(self, headers: dict | None):
+        self.calls += 1
+        rng = (headers or {}).get("Range")
+        if not rng or not self.ranges:
+            return _response(200, self.body, {"ETag": f'W/"{hash(self.body)}"'} if self.etag else {})
+        lo, hi = (int(v) for v in rng.split("=")[1].split("-"))
+        part = self.body[lo:hi + 1]
+        return _response(206, part, {"Content-Range": f"bytes {lo}-{lo + len(part) - 1}/{len(self.body)}"})
+
+
+def test_range_cache_whole_file() -> None:
+    """A server that ignores Range (PLATEAU's API) answers 200 with the whole file: the server
+    cache takes it as the file (its size, every block replaced), so a file that changed is never
+    stitched from blocks of two versions, and later reads need no request."""
+    from maptomesh import httpcache
+    rng = np.random.default_rng(3)
+    v1 = rng.integers(0, 255, 100_000, dtype=np.uint8).tobytes()
+    v2 = rng.integers(0, 255, 230_000, dtype=np.uint8).tobytes()
+    url = "https://api.example.org/datacatalog/index.json"
+    srv = _Server(v1, ranges=False)
+    saved = httpcache.http_request
+    httpcache.http_request = lambda session, method, u, headers=None, **kw: srv.get(headers)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        c = httpcache.RangeCache(Path(d) / "c.sqlite", 1 << 30)
+        try:
+            assert c.read(url, 0, 1 << 28) == v1 and srv.calls == 1
+            assert c.read(url, 0, 1 << 28) == v1 and srv.calls == 1      # size known: no request
+            assert c.read(url, 70_000, 50) == v1[70_000:70_050] and srv.calls == 1
+            # an old entry without a size (as cached before): the file has grown upstream since
+            con = c._conn()
+            con.execute("UPDATE urls SET size = NULL")
+            con.commit()
+            srv.body = v2
+            assert c.read(url, 0, 1 << 28) == v2 and srv.calls == 2
+            assert c.size(url) == len(v2)
+            n = con.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
+            assert n == -(-len(v2) // httpcache.BLOCK), n
+            # a server honouring Range: reads across blocks, at odd offsets, past the end
+            url2 = "https://example.org/file.bin"
+            srv2 = _Server(v2)
+            httpcache.http_request = lambda session, method, u, headers=None, **kw: srv2.get(headers)
+            for s, k in ((0, 10), (65_530, 20), (1000, 140_000), (229_990, 100), (5, 1)):
+                assert c.read(url2, s, k) == v2[s:s + k], (s, k)
+            assert c.read(url2, 300_000, 10) == b""
+            # a short block cached as the file's end, the file grown since: refetched, not stitched
+            con.execute("UPDATE urls SET size = NULL WHERE url = ?", (url2,))
+            uid = con.execute("SELECT id FROM urls WHERE url = ?", (url2,)).fetchone()[0]
+            con.execute("UPDATE blocks SET data = ? WHERE url_id = ? AND block = 1", (v2[65536:70000], uid))
+            con.commit()
+            assert c.read(url2, 60_000, 80_000) == v2[60_000:140_000]
+        finally:
+            httpcache.http_request = saved
+            c._conn().close()
+
+
+def test_browser_cache_whole_file() -> None:
+    """``BrowserRangeCache``: the same for a whole-file answer, from a server without validators
+    (blocks in memory; the persistent cache is off outside a browser)."""
+    from maptomesh import browser
+    rng = np.random.default_rng(4)
+    v1 = rng.integers(0, 255, 100_000, dtype=np.uint8).tobytes()
+    v2 = rng.integers(0, 255, 230_000, dtype=np.uint8).tobytes()
+    url = "https://api.example.org/datacatalog/index.json"
+    srv = _Server(v1, ranges=False, etag=False)
+    saved = browser.http_many, browser.http
+    browser.http_many = lambda reqs: [srv.get(h) for _, h in reqs]
+    browser.http = lambda u, headers=None, method="GET", body=None: srv.get(headers)
+    try:
+        c = browser.BrowserRangeCache()
+        assert c.read(url, 0, 1 << 28) == v1 and c.sizes[url] == len(v1)
+        calls = srv.calls
+        assert c.read(url, 70_000, 50) == v1[70_000:70_050] and srv.calls == calls
+        del c.sizes[url]                      # size forgotten; the file changed upstream
+        srv.body = v2
+        assert c.read(url, 0, 200_000) == v2[:200_000] and c.sizes[url] == len(v2)   # not v1's first blocks
+        assert {b for u, b in c.blocks if u == url} == set(range(-(-len(v2) // c.block)))
+        srv2 = _Server(v2)
+        browser.http_many = lambda reqs: [srv2.get(h) for _, h in reqs]
+        for s, k in ((0, 10), (65_530, 20), (1000, 140_000), (229_990, 100)):
+            assert c.read("https://example.org/f.bin", s, k) == v2[s:s + k], (s, k)
+    finally:
+        browser.http_many, browser.http = saved
+
+
+def test_inline_executor_forgets_results() -> None:
+    """The browser's thread-pool stand-in drops tasks once run, so a caller streaming tasks
+    through a window doesn't have every result kept alive by the executor."""
+    import gc
+    import weakref
+
+    from maptomesh import browser
+
+    class Big:
+        pass
+
+    ex = browser.InlineExecutor()
+    refs = []
+    window = []
+    for _ in range(500):
+        window.append(ex.submit(Big))
+        if len(window) > 4:
+            obj = window.pop(0).result()
+            refs.append(weakref.ref(obj))
+            del obj
+    gc.collect()
+    alive = sum(r() is not None for r in refs)
+    assert alive <= 70, alive                 # at most the tasks since the last compaction
+    assert len(ex.pending) < 140, len(ex.pending)
+    assert all(f.result() is not None for f in window)
+    ex.shutdown()
+
+
 if __name__ == "__main__":
-    for fn in (test_geotiff_native, test_geotiff_python, test_reproject_numpy, test_ascii_grid, test_proxy_allowlist):
+    for fn in (test_geotiff_native, test_geotiff_python, test_reproject_numpy, test_ascii_grid, test_proxy_allowlist,
+               test_range_cache_whole_file, test_browser_cache_whole_file, test_inline_executor_forgets_results):
         fn()
         print(f"{fn.__name__}: ok")
     print("all passed")
