@@ -15,6 +15,7 @@ Review the latest reports::
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 import threading
@@ -115,6 +116,16 @@ def rate_limited(addr: str) -> bool:
         return False
 
 
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _safe(s, keep_newlines: bool = False) -> str:
+    """Printable form of client-supplied text: control bytes (ESC etc.) become U+FFFD."""
+    s = "" if s is None else str(s)
+    s = s.replace("\r", "") if keep_newlines else s.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    return _CTRL.sub("\ufffd", s)
+
+
 def _main(argv: list[str]) -> None:
     n = int(argv[0]) if argv else 20
     rows = store().recent(n)
@@ -127,15 +138,15 @@ def _main(argv: list[str]) -> None:
         where = (f"{o.get('lat', 0):.4f},{o.get('lon', 0):.4f} {o.get('width_m', 0) / 1000:g}x{o.get('height_m', 0) / 1000:g} km "
                  f"{o.get('grid_cells')} cells {o.get('color_mode')} {o.get('source')}") if o else "-"
         py = env.get("python") or {}
-        print(f"#{r['id']} {r['created_at']} [{r['kind']}] {r['message'][:200]}")
+        print(f"#{r['id']} {r['created_at']} [{r['kind']}] {_safe(r['message'][:200])}")
         print(f"    model: {where}")
         print(f"    device: {'phone' if env.get('phone') else 'desktop'}, {env.get('memory_mb')} MB allowed, "
               f"{env.get('device_memory_gb')} GB RAM, {env.get('cores')} cores, secure={env.get('secure')}, "
               f"python ready={py.get('ready')} jspi={py.get('jspi')} native={py.get('native')}")
-        print(f"    stage: {r['stage'][:160]}")
-        print(f"    browser: {r['user_agent'][:160]}")
+        print(f"    stage: {_safe(r['stage'][:160])}")
+        print(f"    browser: {_safe(r['user_agent'][:160])}")
         if r["trace"]:
-            print("    trace: " + r["trace"][-600:].replace("\n", "\n           "))
+            print("    trace: " + _safe(r["trace"][-600:], True).replace("\n", "\n           "))
         print()
 
 

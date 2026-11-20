@@ -76,8 +76,19 @@ def masked_median(a: np.ndarray, mask: np.ndarray, where: np.ndarray, size: int,
     for k in range(0, len(rows), 20000):    # bounded temporaries (WebAssembly memory)
         i, j = rows[k:k + 20000], cols[k:k + 20000]
         w = win[i - r0, j - c0].reshape(len(i), -1)
-        ok = np.isfinite(w).any(axis=1)
-        out[i[ok], j[ok]] = np.nanmedian(w[ok], axis=1) if q == 50.0 else np.nanpercentile(w[ok], q, axis=1)
+        w = np.sort(w, axis=1)                  # NaN sorts last
+        cnt = np.isfinite(w).sum(axis=1)
+        ok = cnt > 0
+        if not ok.any():
+            continue
+        w, cnt = w[ok], cnt[ok]
+        pos = (cnt - 1) * (q / 100.0)           # numpy's default 'linear' percentile
+        lo = np.floor(pos).astype(np.intp)
+        hi = np.minimum(lo + 1, cnt - 1)
+        frac = pos - lo
+        v0 = np.take_along_axis(w, lo[:, None], axis=1)[:, 0]
+        v1 = np.take_along_axis(w, hi[:, None], axis=1)[:, 0]
+        out[i[ok], j[ok]] = v0 + (v1 - v0) * frac
     return out
 
 
@@ -158,11 +169,14 @@ def rasterize_lines(lines: list[tuple[np.ndarray, float]], shape: tuple[int, int
             center[r[ok], c[ok]] = True
         if not center.any():
             continue
-        if hw <= 0.5:
-            out |= center
-        else:
-            d = ndimage.distance_transform_edt(~center)
-            out |= d <= hw
+        # at least 3 vertices wide: a 1-vertex line does not survive the smoothed colour-region cut
+        hw = max(hw, 1.0)
+        rr, cc = np.nonzero(center.any(axis=1))[0], np.nonzero(center.any(axis=0))[0]
+        m = int(np.ceil(hw)) + 1                # the distance transform only needs the line's box
+        r0, r1 = max(rr[0] - m, 0), min(rr[-1] + m + 1, H)
+        c0, c1 = max(cc[0] - m, 0), min(cc[-1] + m + 1, W)
+        d = ndimage.distance_transform_edt(~center[r0:r1, c0:c1])
+        out[r0:r1, c0:c1] |= d <= hw
     return out
 
 
