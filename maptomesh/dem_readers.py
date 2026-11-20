@@ -55,7 +55,7 @@ def _trim_service_cache() -> None:
 
 
 def _dst_transform(grid: Grid):
-    from rasterio.transform import Affine
+    from affine import Affine   # rasterio's own (also in the browser, where rasterio isn't)
     # pixel centres on vertices; raster rows run north -> south
     return Affine(grid.step, 0, grid.x0 - grid.step / 2, 0, -grid.step,
                   grid.y0 + grid.ny * grid.step + grid.step / 2)
@@ -88,13 +88,16 @@ def src_bbox(aoi: AOI, grid: Grid, crs, margin_cells: float = 3.0) -> tuple[floa
 def reproject_array(arr: np.ndarray, transform, crs, aoi: AOI, grid: Grid, nodata=None,
                     resampling: str = "bilinear") -> np.ndarray:
     """A source array (rows north -> south) with its affine transform and CRS -> vertex grid."""
-    from rasterio.enums import Resampling
-    from rasterio.warp import reproject
-    H, W = grid.vshape
-    dst = np.full((H, W), np.nan, dtype=np.float32)
     src = np.asarray(arr, dtype=np.float32)
     if nodata is not None and np.isfinite(nodata):
         src = np.where(src == nodata, np.nan, src)
+    try:
+        from rasterio.enums import Resampling
+        from rasterio.warp import reproject
+    except ImportError:   # in the browser (Pyodide): no GDAL
+        return _reproject_numpy(src, transform, crs, aoi, grid, resampling)
+    H, W = grid.vshape
+    dst = np.full((H, W), np.nan, dtype=np.float32)
     reproject(source=src, destination=dst, src_transform=transform, src_crs=_crs(crs), src_nodata=np.nan,
               dst_transform=_dst_transform(grid), dst_crs=_dst_crs(aoi), dst_nodata=np.nan,
               resampling=getattr(Resampling, resampling))
@@ -149,10 +152,6 @@ def read_cog(url: str, aoi: AOI, grid: Grid, src_crs=None, nodata=None, band: in
              scale: float = 1.0) -> np.ndarray:
     """Window of a (Cloud-Optimized) GeoTIFF on the vertex grid, from the coarsest overview that is
     still finer than half a grid cell. ``src_crs`` / ``nodata`` override missing file metadata."""
-    import rasterio
-    from rasterio.enums import Resampling
-    from rasterio.warp import reproject
-
     H, W = grid.vshape
     if grid.read_blocks:   # only the rectangles under the gaps (Grid.read_blocks)
         out = np.full((H, W), np.nan)
@@ -160,6 +159,13 @@ def read_cog(url: str, aoi: AOI, grid: Grid, src_crs=None, nodata=None, band: in
             sub = Grid(int(c1 - c0 - 1), int(r1 - r0 - 1), grid.step, grid.x0 + c0 * grid.step, grid.y0 + r0 * grid.step)
             out[r0:r1, c0:c1] = read_cog(url, aoi, sub, src_crs, nodata, band, scale)
         return out
+    try:
+        import rasterio
+        from rasterio.enums import Resampling
+        from rasterio.warp import reproject
+    except ImportError:   # in the browser (Pyodide): no GDAL
+        out = _read_cog_nogdal(url, aoi, grid, src_crs, nodata, band)
+        return out * scale if scale != 1.0 else out
     dst = np.full((H, W), np.nan, dtype=np.float32)
     with _open(url) as src0:
         res = abs(src0.res[0])
@@ -182,10 +188,152 @@ def read_cog(url: str, aoi: AOI, grid: Grid, src_crs=None, nodata=None, band: in
     return out * scale if scale != 1.0 else out
 
 
+def _crs_of(c):
+    """pyproj CRS from an EPSG int, a string (WKT, "EPSG:x") or a rasterio CRS."""
+    from pyproj import CRS
+    return CRS.from_user_input(c.to_wkt() if hasattr(c, "to_wkt") else c)
+
+
+MAX_WINDOW_PX = 64_000_000   # GDAL-free reads: larger windows (no overview fine enough) are refused
+
+
+def _read_cog_nogdal(url: str, aoi: AOI, grid: Grid, src_crs=None, nodata=None, band: int = 1) -> np.ndarray:
+    """``read_cog`` with ``maptomesh.geotiff`` instead of GDAL (overview choice as above)."""
+    from .geotiff import GeoTiff, UrlSource
+    g = GeoTiff(UrlSource(url))
+    crs = src_crs if src_crs is not None else g.crs
+    if crs is None:
+        raise ValueError(f"{url}: no CRS in the GeoTIFF (pass src_crs)")
+    level = _nogdal_level(g, crs, aoi, grid)
+    return _read_tiff_window(g, level, crs, aoi, grid, nodata, band, "bilinear" if level == 0 else "average")
+
+
+def _nogdal_level(g, crs, aoi: AOI, grid: Grid) -> int:
+    """The coarsest overview with pixels at most half a grid cell (0 = full resolution)."""
+    res = abs(g.transform0.a)
+    if _crs_of(crs).is_geographic:
+        res *= 111_320.0 * math.cos(math.radians(aoi.lat))
+    level = 0
+    for k, f in enumerate(g.factors, 1):
+        if res * f <= grid.step / 2:
+            level = k
+    return level
+
+
+def _tiff_window(g, level: int, crs, aoi: AOI, grid: Grid) -> tuple[int, int, int, int] | None:
+    """(row0, row1, col0, col1) of the area at ``level``, None if outside the file."""
+    tf = g.transform(level)
+    h, w = g.shape(level)
+    x0, y0, x1, y1 = src_bbox(aoi, grid, crs)
+    inv = ~tf
+    cols, rows = zip(*(inv * (x, y) for x in (x0, x1) for y in (y0, y1)))
+    c0, c1 = max(0, int(math.floor(min(cols))) - 1), min(w, int(math.ceil(max(cols))) + 1)
+    r0, r1 = max(0, int(math.floor(min(rows))) - 1), min(h, int(math.ceil(max(rows))) + 1)
+    if c1 <= c0 or r1 <= r0:
+        return None
+    return r0, r1, c0, c1
+
+
+def cog_download_bytes(url: str, aoi: AOI, grid: Grid, src_crs=None) -> int:
+    """Bytes the GDAL-free reader (the browser) downloads to read the area from ``url``: the
+    compressed tiles of the window at its overview level, from the file's header (fetched; cached),
+    plus the header itself. 0 if the file doesn't exist or misses the area."""
+    from .geotiff import GeoTiff, UrlSource
+    try:
+        g = GeoTiff(UrlSource(url))
+    except Exception:  # noqa: BLE001 - missing tile (sea): the job skips it too
+        return 0
+    crs = src_crs if src_crs is not None else g.crs
+    if crs is None:
+        return 0
+    level = _nogdal_level(g, crs, aoi, grid)
+    win = _tiff_window(g, level, crs, aoi, grid)
+    if win is None:
+        return 0
+    r0, r1, c0, c1 = win
+    im = g.images[level]
+    ty0, ty1 = r0 // im.th, (r1 - 1) // im.th + 1
+    tx0, tx1 = c0 // im.tw, (c1 - 1) // im.tw + 1
+    total = 1 << 16
+    for ty in range(ty0, ty1):
+        a = ty * im.across + tx0
+        total += int(np.asarray(im._entries(im.counts, a, a + (tx1 - tx0)), np.int64).sum())
+    return total
+
+
+def _read_tiff_window(g, level: int, crs, aoi: AOI, grid: Grid, nodata, band: int, resampling: str) -> np.ndarray:
+    from affine import Affine
+    tf = g.transform(level)
+    win = _tiff_window(g, level, crs, aoi, grid)
+    if win is None:
+        return np.full(grid.vshape, np.nan)
+    r0, r1, c0, c1 = win
+    if (r1 - r0) * (c1 - c0) > MAX_WINDOW_PX:
+        raise RuntimeError(f"{(r1 - r0) * (c1 - c0) / 1e6:.0f} M pixels to read (no coarser overview)")
+    arr = g.read(level, (r0, r1, c0, c1), band, nodata)
+    return reproject_array(arr, tf * Affine.translation(c0, r0), crs, aoi, grid, resampling=resampling)
+
+
+class RasterBytes:
+    """Band of a raster file held in memory: ``arr`` (as stored; NaN where nodata on the GDAL-free
+    path), ``nodata``, ``crs`` (rasterio CRS, EPSG int or WKT), ``transform``, ``res``."""
+
+    def __init__(self, arr, nodata, crs, transform):
+        self.arr, self.nodata, self.crs, self.transform = arr, nodata, crs, transform
+        self.res = abs(transform.a)
+
+
+def read_raster_bytes(data: bytes, ext: str = ".tif", band: int = 1) -> RasterBytes:
+    """A GeoTIFF / ESRI ASCII grid from a service or a zip: GDAL when present, else
+    ``maptomesh.geotiff`` / a plain-text parser (the browser)."""
+    try:
+        from rasterio.io import MemoryFile
+    except ImportError:
+        if data.lstrip()[:5].lower() == b"ncols":
+            return _ascii_grid(data)
+        from .geotiff import BytesSource, GeoTiff
+        g = GeoTiff(BytesSource(data))
+        return RasterBytes(g.read(0, None, band), g.nodata, g.crs, g.transform0)
+    with MemoryFile(data, ext=ext) as mf, mf.open() as src:
+        return RasterBytes(src.read(band), src.nodata, src.crs, src.transform)
+
+
+def _ascii_grid(data: bytes) -> RasterBytes:
+    """ESRI ASCII grid (ncols, nrows, xllcorner / xllcenter, cellsize, NODATA_value, then the
+    rows); the format has no CRS (callers pass src_crs)."""
+    from affine import Affine
+    lines = data.split(b"\n", 8)
+    head, i = {}, 7
+    for k, ln in enumerate(lines[:7]):
+        parts = ln.split()
+        if len(parts) == 2 and parts[0][:1].isalpha():
+            head[parts[0].decode().lower()] = float(parts[1])
+        else:
+            i = k
+            break
+    body = b"\n".join(lines[i:])
+    nc, nr, cs = int(head["ncols"]), int(head["nrows"]), head["cellsize"]
+    x0 = head["xllcorner"] if "xllcorner" in head else head.get("xllcenter", 0.0) - cs / 2
+    y0 = head["yllcorner"] if "yllcorner" in head else head.get("yllcenter", 0.0) - cs / 2
+    arr = np.array(body.split(), dtype=np.float32)[:nc * nr].reshape(nr, nc)
+    nd = head.get("nodata_value")
+    if nd is not None:
+        arr[arr == np.float32(nd)] = np.nan
+    return RasterBytes(arr, nd, None, Affine(cs, 0, x0, 0, -cs, y0 + nr * cs))
+
+
 def read_geotiff_bytes(data: bytes, aoi: AOI, grid: Grid, src_crs=None, nodata=None,
                        band: int = 1) -> np.ndarray:
     """A GeoTIFF returned by a service (WCS / exportImage / WMS) -> vertex grid."""
-    from rasterio.io import MemoryFile
+    try:
+        from rasterio.io import MemoryFile
+    except ImportError:   # in the browser (Pyodide): no GDAL
+        from .geotiff import BytesSource, GeoTiff
+        g = GeoTiff(BytesSource(data))
+        crs = src_crs if src_crs is not None else g.crs
+        if crs is None:
+            raise ValueError("service GeoTIFF has no CRS (pass src_crs)")
+        return reproject_array(g.read(0, None, band, nodata), g.transform0, crs, aoi, grid)
     with MemoryFile(data) as mf, mf.open() as src:
         arr = src.read(band).astype(np.float32)
         nd = nodata if nodata is not None else src.nodata
@@ -193,6 +341,58 @@ def read_geotiff_bytes(data: bytes, aoi: AOI, grid: Grid, src_crs=None, nodata=N
         if crs is None:
             raise ValueError("service GeoTIFF has no CRS (pass src_crs)")
         return reproject_array(arr, src.transform, crs, aoi, grid, nodata=nd)
+
+
+def _reproject_numpy(src: np.ndarray, transform, crs, aoi: AOI, grid: Grid, resampling: str,
+                     lattice: int = 8, rows: int = 256) -> np.ndarray:
+    """``reproject_array`` without GDAL: bilinear (or nearest) sampling, NaN-aware like GDAL's
+    (weights renormalised over valid neighbours), NaN outside the source. Source positions are
+    projected exactly on a lattice of every ``lattice``-th vertex and interpolated between (the
+    projections are smooth over a few cells), then sampled ``rows`` grid rows at a time."""
+    from pyproj import CRS, Transformer
+    from scipy import ndimage
+    H, W = grid.vshape
+    k = lattice
+    ci, cj = np.arange(0, H + k, k), np.arange(0, W + k, k)
+    xx, yy = np.meshgrid(grid.x0 + cj * grid.step, grid.y0 + ci * grid.step)
+    c = crs.to_wkt() if hasattr(crs, "to_wkt") else crs
+    sx, sy = Transformer.from_crs(aoi.crs, CRS.from_user_input(c), always_xy=True).transform(xx, yy)
+    inv = ~transform
+    scol = inv.a * sx + inv.b * sy + inv.c - 0.5        # pixel-centre coordinates
+    srow = inv.d * sx + inv.e * sy + inv.f - 0.5
+    valid = np.isfinite(src)
+    vals = np.where(valid, src, 0.0).astype(np.float32)
+    wts = valid.astype(np.float32)
+    order = 0 if resampling == "nearest" else 1
+    if order == 1:
+        # Downsampling: GDAL widens the bilinear tent to the output pixel (half-width s source
+        # pixels). Pre-filter with a tent of half-width sqrt(s^2 - 1) so that, followed by the 1-pixel
+        # tent of map_coordinates, the spread (variance) matches.
+        s_col = float(np.median(np.abs(np.diff(scol, axis=1)))) / k
+        s_row = float(np.median(np.abs(np.diff(srow, axis=0)))) / k
+        for axis, s in ((1, s_col), (0, s_row)):
+            a = math.sqrt(s * s - 1.0) if s > 1.0 else 0.0
+            r = int(math.floor(a))
+            if r >= 1:
+                kern = np.maximum(0.0, 1.0 - np.abs(np.arange(-r, r + 1)) / a).astype(np.float32)
+                kern /= kern.sum()
+                vals = ndimage.convolve1d(vals, kern, axis=axis, mode="constant", cval=0.0)
+                wts = ndimage.convolve1d(wts, kern, axis=axis, mode="constant", cval=0.0)
+    sh, sw = src.shape
+    out = np.full((H, W), np.nan, np.float32)
+    jj = np.arange(W) / k
+    for i0 in range(0, H, rows):
+        ii = np.arange(i0, min(H, i0 + rows)) / k
+        I, J = np.meshgrid(ii, jj, indexing="ij")
+        c_ = ndimage.map_coordinates(scol, [I, J], order=1)
+        r_ = ndimage.map_coordinates(srow, [I, J], order=1)
+        v = ndimage.map_coordinates(vals, [r_, c_], order=order, mode="grid-constant", cval=0.0, prefilter=False)
+        w = ndimage.map_coordinates(wts, [r_, c_], order=order, mode="grid-constant", cval=0.0, prefilter=False)
+        ok = (c_ >= -0.5) & (c_ <= sw - 0.5) & (r_ >= -0.5) & (r_ <= sh - 0.5) & (w > 1e-3)
+        blk = np.full(v.shape, np.nan, np.float32)
+        blk[ok] = v[ok] / w[ok]
+        out[i0:i0 + len(ii)] = blk
+    return out.astype(np.float64)   # rows already south -> north, like the vertex grid
 
 
 def merge_fill(dst: np.ndarray, part: np.ndarray) -> np.ndarray:
@@ -288,7 +488,6 @@ def read_xyz(template: str, zoom: int, decode: Callable[[bytes], np.ndarray | No
     """Mosaic of XYZ elevation tiles (Web Mercator) at ``zoom`` -> vertex grid. ``decode(bytes)``
     returns a (tile_px, tile_px) float array (NaN = no data) or None for a missing tile; 404s count
     as missing. Tiles go through the persistent range cache."""
-    from rasterio.transform import Affine
     from .httpcache import RANGE_CACHE
 
     w, s, e, n = aoi.lonlat_bbox(margin=grid.step * 3)
@@ -299,6 +498,10 @@ def read_xyz(template: str, zoom: int, decode: Callable[[bytes], np.ndarray | No
     if len(xs) * len(ys) > max_tiles:
         raise RuntimeError(f"{len(xs) * len(ys)} tiles at zoom {zoom} (limit {max_tiles})")
     mosaic = np.full((len(ys) * tile_px, len(xs) * tile_px), np.nan, dtype=np.float32)
+    from .httpcache import hint
+    for ty in ys:
+        for tx in xs:
+            hint(template.format(z=zoom, x=tx, y=ty), 0, 1 << 24)
     for j, ty in enumerate(ys):
         for i, tx in enumerate(xs):
             if cancel is not None and cancel.is_set():
@@ -324,7 +527,15 @@ def read_xyz(template: str, zoom: int, decode: Callable[[bytes], np.ndarray | No
 
 def decode_png(data: bytes) -> np.ndarray:
     """RGB(A) pixels of a PNG/WebP tile as a (H, W, C) uint8 array."""
-    from rasterio.io import MemoryFile
+    try:
+        from rasterio.io import MemoryFile
+    except ImportError:   # in the browser (Pyodide): Pillow (palettes expanded, transparency kept)
+        import io
+
+        from PIL import Image
+        im = Image.open(io.BytesIO(data))
+        alpha = im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
+        return np.asarray(im.convert("RGBA" if alpha else "RGB"))
     with MemoryFile(data) as mf, mf.open() as src:
         return np.moveaxis(src.read(), 0, -1)
 

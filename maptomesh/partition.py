@@ -286,7 +286,7 @@ class Partition:
         pvalid = np.arange(self.M)[None, :] < pcnt[:, None]
         pkeys = self.p_keys[pp][pvalid]          # flat, row-major
         pxy = self.p_xy[pp][pvalid]
-        ptri = np.repeat(self.p_tri[pp], pcnt)
+        ptri = np.repeat(self.p_tri[pp], pcnt.astype(np.intp))   # intp: 32-bit in WebAssembly
         poff = np.concatenate([[0], np.cumsum(pcnt)])
 
         all_keys = np.concatenate([full.ravel(), pkeys])

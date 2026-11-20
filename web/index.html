@@ -126,15 +126,23 @@ __OG_IMAGE_META__
         <option value="planetary">Microsoft Planetary Computer (COPC snapshot to ~2022)</option>
       </select>
     </label>
+    <label class="adv" title="Mapterhorn (mapterhorn.com) serves ~150 national terrain models as one set of shared tiles: a few MB per model instead of many requests to each agency's servers. For bare terrain it also replaces the point clouds where its models are as fine as the grid. The agencies' own services may have newer releases.">Elevation models
+      <select autocomplete="off" id="demPref">
+        <option value="mapterhorn" selected>Mapterhorn shared tiles first (light, spares agency servers)</option>
+        <option value="official">Agencies' own services first (newest releases)</option>
+      </select>
+    </label>
     <label>Surface
       <select autocomplete="off" id="surface">
         <option value="terrain">Bare terrain</option>
+        <option value="bridges">Terrain + bridges</option>
         <option value="buildings" selected>Terrain + buildings &amp; bridges</option>
         <option value="full">Full surface (incl. trees)</option>
       </select>
     </label>
     <label>Detail: <b id="gridCellsOut"></b> cells on long side
       <input autocomplete="off" id="gridCells" type="range" min="150" max="2000" step="50" value="600">
+      <span id="gridCap" class="hint" hidden></span>
     </label>
     <div id="detailInfo" class="hint"></div>
     <label class="adv">Terrain smoothing <b id="smoothingOut"></b>
@@ -322,6 +330,37 @@ __OG_IMAGE_META__
   <div id="topview" hidden><img id="topImg" alt=""></div>
 </main>
 
+<dialog id="failDialog" aria-labelledby="failTitle">
+  <div class="about fail">
+    <button type="button" class="about-close" id="failClose" aria-label="Close">×</button>
+    <h2 id="failTitle">The model couldn't be built</h2>
+    <p id="failCause" class="fail-cause"></p>
+    <p class="fail-sub" id="failAdviceHead">To make it work:</p>
+    <ul id="failAdvice"></ul>
+    <p id="failStats" class="fail-stats"></p>
+    <div class="fail-actions">
+      <button type="button" class="primary" id="failRetry" hidden>Retry</button>
+      <button type="button" class="secondary" id="failServer" hidden>Build on the server</button>
+      <button type="button" class="secondary" id="failOk">Close</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="dataDialog" aria-labelledby="dataTitle">
+  <div class="about fail">
+    <button type="button" class="about-close" id="dataClose" aria-label="Close">×</button>
+    <h2 id="dataTitle">Download the data on this device?</h2>
+    <p class="fail-cause" id="dataLead">Building on this device downloads this area's map and elevation data over your connection.</p>
+    <ul id="dataParts"></ul>
+    <p class="fail-stats" id="dataNote"></p>
+    <label class="check"><input type="checkbox" id="dataNoAsk"> Don't ask again on this device</label>
+    <div class="fail-actions">
+      <button type="button" class="primary" id="dataGo">Download and build</button>
+      <button type="button" class="secondary" id="dataCancel">Cancel</button>
+    </div>
+  </div>
+</dialog>
+
 <dialog id="aboutDialog" aria-labelledby="aboutTitle">
   <div class="about">
     <button type="button" class="about-close" id="aboutClose" aria-label="Close">×</button>
@@ -330,7 +369,7 @@ __OG_IMAGE_META__
     <ul>
       <li>Pick any area <b>on Earth</b>: a coastline, a mountain, your neighbourhood. Canada, the US and France
         get classified LiDAR point clouds; much of Europe, Japan, New Zealand and parts of Australia get
-        0.5-5 m elevation models; everywhere else uses the 30 m Copernicus model.</li>
+        0.5-5 m elevation models; everywhere else uses a 30 m global model.</li>
       <li>Elevation comes from public LiDAR surveys (NRCan CanElevation and USGS 3DEP); water, roads and
         building outlines come from OpenStreetMap.</li>
       <li>You get a <b>3MF file with one part per colour</b>, ready for Bambu Studio, OrcaSlicer or PrusaSlicer,
@@ -344,9 +383,9 @@ __OG_IMAGE_META__
 
     <div class="donate">
       <h3>Help keep it running</h3>
-      <p>MapToMesh is free, but hosting it isn't: every model is built on the server, and the elevation and
-        map data it downloads take bandwidth and storage. If it saved you time, or you're printing something
-        you love, a donation helps keep it online and free for everyone. Thank you!</p>
+      <p>MapToMesh is free, but running it isn't: hosting the site, relaying map data and building models
+        for devices that can't all cost money. If it saved you time, or you're printing something you love,
+        a donation helps keep it online and free for everyone. Thank you!</p>
       <a class="paypal" href="https://www.paypal.me/scottstamp" target="_blank" rel="noopener">Donate with PayPal</a>
       <div class="crypto">
         <div class="addr"><span class="coin">Ethereum</span><code>0x19B9CFdd9E601e87b523F1FDE3a4bf50879B0C12</code>

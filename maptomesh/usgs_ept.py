@@ -176,6 +176,7 @@ class Plan:
     project: EptProject
     keys: list[str]
     footprint: list[np.ndarray]  # rings in vertex-grid coordinates (col, row)
+    points: int = 0              # points in those nodes (download-size estimates)
 
 
 def plan(project: EptProject, aoi, grid, resolution: float, max_nodes: int = MAX_NODES) -> Plan:
@@ -198,6 +199,7 @@ def plan(project: EptProject, aoi, grid, resolution: float, max_nodes: int = MAX
     hier: dict[str, int] = {}
     hier.update(_json(f"{project.url}ept-hierarchy/0-0-0-0.json"))
     keys: list[str] = []
+    points = 0
     queue = ["0-0-0-0"]
     while queue:
         k = queue.pop()
@@ -216,6 +218,7 @@ def plan(project: EptProject, aoi, grid, resolution: float, max_nodes: int = MAX
             continue
         if cnt > 0:
             keys.append(k)
+            points += cnt
             if len(keys) > max_nodes:
                 raise RuntimeError(f"USGS 3DEP project {project.name}: over {max_nodes} octree nodes "
                                    "for this area - pick a smaller area or lower detail.")
@@ -230,4 +233,4 @@ def plan(project: EptProject, aoi, grid, resolution: float, max_nodes: int = MAX
     for r in project.rings:
         lx, ly = to_local.transform(r[:, 0], r[:, 1])
         fp.append(np.column_stack([(np.asarray(lx) - grid.x0) / grid.step, (np.asarray(ly) - grid.y0) / grid.step]))
-    return Plan(project, keys, fp)
+    return Plan(project, keys, fp, points)

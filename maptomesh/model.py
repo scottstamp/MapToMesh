@@ -21,13 +21,15 @@ from .mesh import Mesh
 from .options import Options
 from .partition import DROPPED, FieldSpec, Partition, shape_field
 from . import labels as lbl
-from .raster import despike, fill_nan, remove_small, smooth
+from .raster import despike, fill_nan, masked_median, remove_small, smooth
 
 ProgressFn = Callable[[float, str], None]
 
 # region labels
 FRAME, GROUND, VEG, WATER, ROAD, BUILDING = 0, 1, 2, 3, 4, 5
 RIVER = 7  # rivers / streams: water colour, but sloped (lakes and sea are flat WATER)
+BRIDGE = 30  # bridge decks: a region of their own (deck height); road colour in land cover
+BLD_BAND0, BRG_BAND0 = 40, 60  # elevation bands of buildings / bridge decks (band 0: BUILDING / BRIDGE)
 LABEL, LIP = 8, 9
 LABEL_NAMES = {GROUND: "ground", VEG: "vegetation", WATER: "water", ROAD: "roads", BUILDING: "buildings"}
 
@@ -80,6 +82,22 @@ def get_elevation(opts: Options, progress: ProgressFn, cancel: threading.Event) 
     return elev
 
 
+TREES_MIN_KNOWN = 0.9   # share of the area whose data shows trees, for trees to be drawn at all
+
+MAPTERHORN_FIRST = os.environ.get("MAPTOMESH_MAPTERHORN_FIRST", "1") != "0"
+
+
+def _models_suffice(opts: Options, aoi: AOI, grid: Grid) -> bool:
+    """Bare-terrain jobs where Mapterhorn's elevation models are at least as fine as the grid
+    cells over the whole area: its tiles (a few MB) replace the point clouds (often hundreds of MB
+    from the agencies' servers). The ground then differs by a few cm (median) to a few dm on steep
+    slopes - hundredths of a millimetre on the print."""
+    if not (MAPTERHORN_FIRST and opts.ground_only and opts.dem_preference == "mapterhorn"):
+        return False
+    from .providers.mapterhorn import models_suffice
+    return models_suffice(aoi, grid)
+
+
 def _fetch_elevation(opts: Options, aoi: AOI, grid: Grid, progress: ProgressFn,
                      cancel: threading.Event) -> tuple[dict, dict]:
     """Best available elevation for the area, as per-vertex arrays:
@@ -96,17 +114,31 @@ def _fetch_elevation(opts: Options, aoi: AOI, grid: Grid, progress: ProgressFn,
     from .pointcloud import empty_result, fetch_lidar, provider_credit, provider_licence_note
 
     sub = lambda a, b: (lambda f, m: progress(a + (b - a) * f, m))  # noqa: E731
-    if opts.source == "lidar":
+    lidar = opts.source == "lidar"
+    models_suffice = lidar and _models_suffice(opts, aoi, grid)
+    lidar = lidar and not models_suffice
+    if lidar:
         from .lidar_index import INDEX
+        from .limits import lidar_caps
+        max_tiles, max_ept_km2 = lidar_caps(opts)
         r = fetch_lidar(aoi, grid, INDEX.get() if INDEX.ready else None, sub(0.0, 0.8), cancel,
-                        max_tiles=config.MAX_TILES, us_source=opts.us_source, allow_empty=True,
-                        ground_only=opts.ground_only)
+                        max_tiles=max_tiles, us_source=opts.us_source, allow_empty=True,
+                        ground_only=opts.ground_only, max_ept_km2=max_ept_km2)
     else:
         r = empty_result(grid)
     info = r.info
+    if models_suffice:
+        info.setdefault("skipped", []).append(
+            "LiDAR point clouds: not needed for bare terrain at this detail (the elevation models "
+            "are as fine as the grid)")
     ground, unclass = r.ground.copy(), r.unclass.copy()
     water, density = r.water_frac.copy(), r.density.astype(np.float32)
     bld_cls, veg_cls, covered = r.bld_classified.copy(), r.veg_classified.copy(), r.covered.copy()
+    # where the data can show trees: point clouds, and elevation models with a surface model (DSM);
+    # bare-earth models (FABDEM, Mapterhorn, ...) can't
+    veg_known = covered.copy()
+    # surface-only fallbacks (Copernicus 30 m, ...): their "ground" holds buildings and trees, blurred
+    surface_only = np.zeros(covered.shape, bool)
     sources = []
     credits = []
     warnings = [w for w in (provider_licence_note(k) for k in r.info.get("providers", [])) if w]
@@ -117,9 +149,10 @@ def _fetch_elevation(opts: Options, aoi: AOI, grid: Grid, progress: ProgressFn,
         credits += [provider_credit(k)[1] for k in r.info.get("providers", [])]
     need = ~covered
     if need.any():
-        lo = 0.8 if opts.source == "lidar" else 0.0
+        lo = 0.8 if lidar else 0.0
         comp = best_dems(aoi, grid, need=need, ref=np.where(covered, ground, np.nan),
-                         progress=sub(lo, 1.0), cancel=cancel, dsm=not opts.ground_only)
+                         progress=sub(lo, 1.0), cancel=cancel, dsm=not opts.ground_only,
+                         shared_first=opts.dem_preference == "mapterhorn")
         take = need & np.isfinite(comp.dtm)
         ground[take] = comp.dtm[take]
         water[take] = 0.0
@@ -127,6 +160,10 @@ def _fetch_elevation(opts: Options, aoi: AOI, grid: Grid, progress: ProgressFn,
         unclass[raised] = comp.dsm[raised]
         bld_cls[take] = False
         veg_cls[take] = False
+        veg_known[take] = np.isfinite(comp.dsm[take])
+        so = [i for i, u in enumerate(comp.used) if u.get("surface_only")]
+        if so:
+            surface_only[take] = np.isin(comp.source[take], so)
         density[take] = np.maximum(density[take], 1.0)  # data, not a void (voids become water)
         covered |= take
         for u in comp.used:
@@ -145,7 +182,7 @@ def _fetch_elevation(opts: Options, aoi: AOI, grid: Grid, progress: ProgressFn,
     info["coverage"] = float(covered.mean())
     arrays = {"ground": ground, "water": water, "building": r.building, "bridge": r.bridge,
               "veg": r.veg, "unclass": unclass, "bld_cls": bld_cls, "veg_cls": veg_cls,
-              "density": density, "covered": covered}
+              "density": density, "covered": covered, "veg_known": veg_known, "surface_only": surface_only}
     return arrays, info
 
 
@@ -248,20 +285,35 @@ def _smooth_steep(G: np.ndarray, step: float, strength: float) -> np.ndarray:
     return G1 + w * (S - G1)
 
 
-def _osm_bridges(osm_br, BRm, BRv, U, Gf, W, opts, notes):
+def _osm_bridges(osm_br, BRm, BRv, U, Gf, W, opts, notes, step):
     """Add OpenStreetMap bridges that the data has no bridge class for.
 
     Elevation models (and LiDAR projects without class 17) carry no bridge information, so the
     water cut swallowed every deck (London's Thames bridges). The deck height comes from the
     surface heights on the bridge (DSM / class-1 returns) where they stand clear of the ground or
-    water below; spans without them carry the height of the bridge's ends across."""
-    if osm_br is None or not osm_br.any() or opts.surface == "terrain":
+    water below; spans without them carry the height of the bridge's ends across.
+
+    OpenStreetMap ways are drawn wider than many decks (or a little offset): cells beside a deck
+    the data does classify take that deck's height. The returns there are railings, lamp posts,
+    lift-bridge towers and cables, or the ground below; taken as the deck they printed as a comb
+    of spikes along the bridge (QEW Burlington). What stands on a deck elsewhere (posts, lift
+    towers, cables) is removed by a low percentile along each bridge: the deck is the lowest
+    surface above the ground or water, and it is smooth."""
+    if osm_br is None or not osm_br.any() or not opts.show_bridges:
         return BRm, BRv
     nb = osm_br & ~BRm
     if not nb.any():
         return BRm, BRv
     deck = np.where(nb & np.isfinite(U) & (np.nan_to_num(U, nan=-1e9) > Gf + 1.0), U, np.nan)
-    ends = nb & ~W & np.isnan(deck)          # approaches on land: at least the ground
+    if BRm.any():
+        dist, (bi, bj) = ndimage.distance_transform_edt(~BRm, return_indices=True)
+        beside = nb & (dist <= max(2.0, 8.0 / step))
+        deck = np.where(beside, BRv[bi, bj], deck)
+    # approaches on land: at least the ground; cells near deck heights (e.g. the edge of a wide
+    # way where the returns miss) are interpolated instead of dropping to the ground mid-span
+    r = max(1, int(round(4.0 / step)))
+    near = ndimage.maximum_filter(np.isfinite(deck), size=2 * r + 1)
+    ends = nb & ~W & np.isnan(deck) & ~near
     deck = np.where(ends, Gf, deck)
     if not np.isfinite(deck[nb]).any():
         return BRm, BRv
@@ -275,6 +327,8 @@ def _osm_bridges(osm_br, BRm, BRv, U, Gf, W, opts, notes):
         if np.isfinite(d).any():
             filled[sl] = np.where(m, fill_nan(d), filled[sl])
     nb &= np.isfinite(filled)
+    size = min(11, max(3, int(round(30.0 / step)) | 1))     # ~30 m: wider than a lift tower
+    filled = masked_median(filled, nb, nb, size, q=20.0)
     BRv = np.where(nb, filled, BRv)
     notes.append("Bridges without a bridge class in the elevation data come from OpenStreetMap.")
     return BRm | nb, BRv
@@ -292,6 +346,67 @@ def _planar_components(U: np.ndarray, mask: np.ndarray, step: float) -> np.ndarr
     size = np.asarray(ndimage.sum_labels(np.ones_like(U), lab, idx))
     ok = (rough < max(0.35, 0.12 * step)) & (size * step * step >= 25)
     return np.concatenate([[False], ok])[lab]
+
+
+def _bare_earth_buildings(bld_v, Gf, bare, so, osm, step, notes):
+    """Buildings where the elevation data is bare earth (no point cloud, no surface model), which
+    shows none: PLATEAU 3D city models where there are some (Japan; ``maptomesh.buildings``), else
+    OpenStreetMap footprints raised to their mapped heights (LoD1 blocks), with heights OSM lacks
+    (and footprints it doesn't have) from Overture."""
+    cells = lambda m2: max(1, int(round(m2 / (step * step))))  # noqa: E731
+    h = osm.get("building_h")
+    h = np.full(Gf.shape, np.nan) if h is None else np.asarray(h, dtype=np.float64)
+    osm_b = osm.get("buildings")
+    osm_b = np.isfinite(h) if osm_b is None else osm_b
+    pl, ov = osm.get("plateau"), osm.get("overture")
+    memo = {}
+
+    def ground(where):
+        """The ground buildings stand on. A 30 m surface model already holds the buildings,
+        blurred: roofs go on the ground under them (an opening ~150 m wide removes such bumps and
+        keeps slopes)."""
+        if "b" not in memo:
+            memo["b"] = Gf
+        if "o" not in memo and so is not None and (where & so).any():
+            k = max(3, int(round(150.0 / step)) | 1)
+            memo["b"] = np.where(so, np.minimum(Gf, ndimage.grey_opening(Gf, size=(k, k), mode="nearest")), Gf)
+            memo["o"] = True
+        return memo["b"]
+
+    if ov is not None:
+        # OpenMapTiles' render_height is 5 m where OSM has no height or floors: Overture's (OSM tags
+        # again, Microsoft ML heights in North America, ...) where it has one; its footprints from
+        # other datasets where OSM has no building
+        unknown = osm_b & ~(np.nan_to_num(h, nan=0.0) > 5.0)
+        filled = unknown & np.isfinite(ov["h"]) & bare
+        new = ov["other"] & ~ndimage.binary_dilation(osm_b, iterations=1) & bare
+        h = np.where(filled, ov["h"], h)
+        h = np.where(new, np.where(np.isfinite(ov["h"]), ov["h"], 5.0), h)
+        if filled.sum() + new.sum() >= cells(200):
+            notes.append("Buildings OpenStreetMap has no height for (or no footprint) take Overture Maps' "
+                         "heights and footprints where it has them.")
+    if pl is not None:
+        rel, ids = pl["rel"], pl["id"]
+        pm = np.isfinite(rel) & bare
+        if pm.sum() >= cells(200):
+            # OSM buildings PLATEAU also has give way to its (surveyed, roof-shaped) ones
+            lab, _ = ndimage.label(np.isfinite(h) & bare)
+            dup = np.unique(lab[ndimage.binary_dilation(pm, iterations=1) & (lab > 0)])
+            h = np.where(np.isin(lab, dup), np.nan, h)
+            # each building stands on its lowest ground
+            lab_b = np.where(pm, ids, 0)
+            idx = np.unique(lab_b[lab_b > 0])
+            lut = np.zeros(int(ids.max()) + 1)
+            lut[idx] = ndimage.minimum(ground(pm), lab_b, idx)
+            bld_v = np.where(pm, np.fmax(bld_v, lut[ids] + rel), bld_v)
+            notes.append(f"Buildings: Project PLATEAU 3D city models ({', '.join(pl.get('cities', []))}): "
+                         "surveyed roof shapes (LoD2) or blocks at the measured height (LoD1).")
+    lift = bare & np.isfinite(h)
+    if lift.sum() >= cells(200):
+        bld_v = np.where(lift, np.fmax(bld_v, ground(lift) + h), bld_v)
+        notes.append("Buildings where the elevation data is bare earth are OpenStreetMap footprints at "
+                     "their mapped heights (tagged height or floors, otherwise a default).")
+    return bld_v
 
 
 def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] | None = None) -> Surface:
@@ -336,7 +451,7 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
     bcls, vcls = a["bld_cls"].astype(bool), a["veg_cls"].astype(bool)
     Uf = despike(np.where(np.isfinite(U), U, Gf), np.isfinite(U), thresh=12.0, size=5)
     um = above(Uf, 2.0) & np.isfinite(U)
-    if osm.get("bridges") is not None and opts.surface != "terrain":
+    if osm.get("bridges") is not None and opts.show_bridges:
         # decks over water in surface models are bridges (_osm_bridges), not trees or buildings
         um &= ~ndimage.binary_dilation(osm["bridges"], iterations=max(1, int(round(3.0 / step))))
     to_veg = um & bcls & ~vcls        # buildings classified -> class 1 is mostly trees
@@ -351,7 +466,7 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
         # at ~120 m, Willis Tower is class 1); inside a mapped footprint that is the building
         bld_v = np.where(both & near, np.fmax(bld_v, Uf), bld_v)
     if cand.any():
-        show = opts.surface != "terrain"  # bare terrain uses no buildings
+        show = opts.show_buildings
         if has_osm:
             is_b = cand & near
             if show:
@@ -365,19 +480,45 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
         bld_v = np.where(is_b, np.fmax(bld_v, Uf), bld_v)
         to_veg |= unknown & ~is_b
     veg_v = np.where(to_veg, np.fmax(veg_v, Uf), veg_v)
+    known = a.get("veg_known")
+    notes += osm.get("building_notes", [])
+    if known is not None and opts.show_buildings:
+        bld_v = _bare_earth_buildings(bld_v, Gf, ~known.astype(bool), a.get("surface_only"), osm, step, notes)
     Bm, Bv = _close_and_fill(bld_v, above(bld_v, 2.0), cells(12))
     BRm, BRv = _close_and_fill(a["bridge"], above(a["bridge"], 1.0), cells(20))
-    BRm, BRv = _osm_bridges(osm.get("bridges"), BRm, BRv, a["unclass"], Gf, W, opts, notes)
+    BRm, BRv = _osm_bridges(osm.get("bridges"), BRm, BRv, a["unclass"], Gf, W, opts, notes, step)
+    if BRm.any():
+        # a deck is smooth: cell-to-cell noise (railings, vehicles, returns off its edges) printed
+        # as dents and bumps along every bridge
+        k = min(9, max(3, int(round(10.0 / step)) | 1))
+        BRv = np.where(BRm, masked_median(np.where(BRm, BRv, np.nan), BRm, BRm, k), BRv)
+        # small steps (twin decks a metre or two apart: the Skyway) followed the grid diagonally,
+        # a zigzag groove along the deck; softened into a ramp. Larger ones (one bridge over
+        # another, a deck beside its ramp) stay.
+        num = ndimage.gaussian_filter(np.where(BRm, BRv, 0.0), 1.0, mode="nearest")
+        den = ndimage.gaussian_filter(BRm.astype(np.float64), 1.0, mode="nearest")
+        soft = np.divide(num, den, out=np.zeros_like(num), where=den > 1e-3)
+        BRv = np.where(BRm & (np.abs(soft - BRv) < 2.5), soft, BRv)
     vfin = np.isfinite(veg_v)
     V0 = despike(np.where(vfin, veg_v, Gf), vfin, thresh=10.0, size=5)
     vmask = vfin & (V0 > Gf + 1.5) & ~Bm
     Vm, Vv = _close_and_fill(V0, vmask, cells(25))
     Vm &= ~Bm
+    # trees only where (nearly) the whole area has data that shows them: a patch of forest that
+    # ends at a data boundary reads as a real edge; plain ground everywhere doesn't mislead
+    known = a.get("veg_known")
+    land = cov & ~W                   # (water can't hold trees: a sea filled by a bare-earth model doesn't count)
+    if known is not None and Vm.any() and land.any():
+        frac = float(known[land].mean())
+        if frac < TREES_MIN_KNOWN:
+            Vm[:] = False
+            notes.append(f"Trees left out: only {100 * frac:.0f}% of the area has data that shows them (LiDAR or "
+                         "elevation models with a surface model); the rest is bare-earth elevation.")
 
     # --- water: clean the mask, one flat level per water body
     W = remove_small(W, cells(60))
     W |= ~W & ~remove_small(~W, cells(40))  # fill pin-holes (wave dropouts, boats)
-    if opts.surface != "terrain":
+    if opts.show_bridges:
         W &= ~BRm
     # rivers / streams: OSM centrelines (continuous, printable width) - the LiDAR only sees
     # scattered water returns on narrow streams, which printed as dashed colour islands
@@ -389,7 +530,7 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
             river &= ~osm_roads           # roads cross over streams (bridges / culverts)
         if osm_bld is not None:
             river &= ~osm_bld
-        if opts.surface != "terrain":
+        if opts.show_bridges:
             river &= ~BRm                 # rail / foot bridges too (not in the road mask)
     if river.any() and W.any():
         # LiDAR water returns along a stream belong to the stream, not to separate ponds: absorb
@@ -444,17 +585,18 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
         level = Gf.copy()
 
     S = Gf.copy()
-    if opts.surface in ("buildings", "full"):
+    if opts.show_buildings:
         S = np.where(Bm, np.maximum(S, Bv), S)
+    if opts.show_bridges:
         S = np.where(BRm, np.maximum(S, BRv), S)
     if opts.surface == "full":
         S = np.where(Vm, np.maximum(S, Vv), S)
 
     roads = osm_roads.copy() if osm_roads is not None else zeros.copy()
-    if opts.surface != "terrain":
+    if opts.show_bridges:
         roads |= BRm
     masks = {
-        BUILDING: Bm if opts.surface != "terrain" else zeros,
+        BUILDING: Bm if opts.show_buildings else zeros,
         ROAD: roads,
         WATER: W_area,
         RIVER: river,
@@ -462,6 +604,11 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
     }
     roof = np.maximum(np.where(np.isfinite(Bv), Bv, Gf), Gf)
     canopy = np.maximum(np.where(np.isfinite(Vv), Vv, Gf), Gf)
+    if BRm.any():
+        # beyond the deck: its nearest height, so the deck's colour outline (between grid
+        # vertices) meets the deck height rather than a slope down to the ground (build_parts)
+        _, (bi, bj) = ndimage.distance_transform_edt(~BRm, return_indices=True)
+        BRv = np.where(BRm, BRv, BRv[bi, bj])
     bridge = np.maximum(np.where(np.isfinite(BRv), BRv, Gf), Gf)
     # Land surface continued over the water: where a land part meets the (separate, flat) water
     # part, the shore becomes one clean vertical wall along the smooth outline instead of the
@@ -477,7 +624,7 @@ def compute_surface(elev: Elevation, opts: Options, osm: dict[str, np.ndarray] |
     else:
         ground_land, surface_land = Gf, S
     return Surface(Gf, S, roof, canopy, bridge, level, masks,
-                   BRm if opts.surface != "terrain" else zeros, ground_land, surface_land, river, notes)
+                   BRm if opts.show_bridges else zeros, ground_land, surface_land, river, notes)
 
 
 # ---------------------------------------------------------------- parts
@@ -589,7 +736,31 @@ def _water_indicator(lakes: np.ndarray, rivers: np.ndarray, min_cells: int, sigm
     if sigma > 0.7 + 1e-6 and lakes.any():
         wide = _indicator(wet, min_cells, sigma)
         ind = np.maximum(wide, _indicator(rivers, min_cells)) if rivers.any() else wide
+    frag = _land_fragments(ind < 0.5, ~wet, 4 * max(min_cells, 1))
+    if frag.any():
+        ind = np.where(frag, 1.0, ind)
     return ind
+
+
+def _land_fragments(land: np.ndarray, land0: np.ndarray, max_cells: int) -> np.ndarray:
+    """Specks the smoothing broke off land narrower than it (a pier or breakwater about one cell
+    wide keeps only its wider spots: a dashed line of tiny islands into the water). A piece of the
+    smoothed ``land`` is a fragment when it is smaller than ``max_cells`` and the unsmoothed land
+    ``land0`` it came from is at least three times its size; small islands that survive whole
+    stay."""
+    st = np.ones((3, 3), bool)
+    lab, n = ndimage.label(land, structure=st)
+    if n == 0:
+        return np.zeros_like(land)
+    size = np.bincount(lab.ravel(), minlength=n + 1)
+    lab0, _ = ndimage.label(land0, structure=st)
+    size0 = np.bincount(lab0.ravel())
+    size0[0] = 0
+    ids = np.arange(1, n + 1)
+    src = np.asarray(ndimage.maximum(size0[lab0], lab, ids))   # the largest land each piece touches
+    bad = np.zeros(n + 1, bool)
+    bad[1:] = (size[1:] < max_cells) & (src >= 3 * size[1:])
+    return bad[lab]
 
 
 def _cut_water(part: Partition, lakes: np.ndarray, rivers: np.ndarray, min_cells: int,
@@ -828,7 +999,7 @@ def _label_field(opts: Options, nx: int, ny: int, pad: int, frame_cells: float, 
 
 # threads meshing parts: each holds large temporaries (a 3 M-cell model peaks at 4.3 GB with 1,
 # 6.0 GB with 2, 8.0 GB with 4 workers; build 30 / 25 / 23 s)
-PART_WORKERS = int(os.environ.get("MAPTOMESH_PART_WORKERS", "2"))
+from .limits import PART_WORKERS  # noqa: E402 - 1 on small servers (memory), 2 above ~6 GB per job
 
 
 def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: ProgressFn) -> BuildResult:
@@ -907,28 +1078,67 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
     color_changes: list[dict] = []
     flat = lambda a: np.ascontiguousarray(a, dtype=np.float64).ravel()  # noqa: E731
 
+    # --- buildings and bridge decks: regions of their own, cut along smooth outlines, each with its
+    # own top (roof / deck, continued past the outline so the cut takes its height). As part of one
+    # height surface they dropped to the ground across one grid cell along the staircase edge of
+    # their raster masks: sloped sawtooth walls that cost print time.
+    bld_m = P(surf.masks[BUILDING])
+    if bld_m.any():
+        bld_m = _min_features({BUILDING: bld_m}, opts.min_feature_mm / cell_mm / 2)[BUILDING]
+    brg_m = P(surf.bridge_mask)
+    roof_mm, deck_mm = np.round(zmm(surf.roof), 3), np.round(zmm(surf.bridge), 3)
+
+    def terrain_mm(over_water: bool) -> np.ndarray:
+        """The surface without buildings and bridge decks (trees stay in a full surface);
+        ``over_water``: the land continued over the water (``Surface.ground_land``)."""
+        g = surf.ground_land if over_water else surf.ground
+        if opts.surface == "full":
+            g = np.where(surf.masks[VEG], np.maximum(surf.canopy, g), g)
+        return np.round(zmm(g), 3)
+
+    def cut_structures(p: Partition) -> list[int]:
+        labs = []
+        for lab, m, i in ((BUILDING, bld_m, 2), (BRIDGE, brg_m, 5)):
+            if m.any():
+                p.step(_indicator(m, min_cells), 0.5 + 0.0173 * i, above=lab)
+                labs.append(lab)
+        return [lab for lab in labs if (p.tri_label == lab).any() or (p.p_label == lab).any()]
+
     if opts.color_mode == "single":
+        T = terrain_mm(False)
+        labs = cut_structures(part)
         part.finish(MODEL)
-        defs.append(("model", "Model", col.single, {MODEL}, FieldSpec(flat(S_mm)), FieldSpec(0.0)))
-        default, label_color = MODEL, {MODEL: col.single}
+        defs.append(("model", "Model", col.single, {MODEL}, FieldSpec(flat(T)), FieldSpec(0.0)))
+        if BUILDING in labs:
+            defs.append(("model", "Buildings", col.single, {BUILDING},
+                         FieldSpec(flat(np.maximum(roof_mm, T))), FieldSpec(0.0)))
+        if BRIDGE in labs:
+            defs.append(("model", "Bridges", col.single, {BRIDGE},
+                         FieldSpec(flat(np.maximum(deck_mm, T))), FieldSpec(0.0)))
+        default, label_color = MODEL, {MODEL: col.single, BUILDING: col.single, BRIDGE: col.single}
     elif opts.color_mode == "landcover":
         G_mm = np.round(zmm(surf.ground_land), 3)
-        roof_mm, canopy_mm = np.round(zmm(surf.roof), 3), np.round(zmm(surf.canopy), 3)
-        bridge_mm, bridge_v = np.round(zmm(surf.bridge), 3), P(surf.bridge_mask)
+        canopy_mm = np.round(zmm(surf.canopy), 3)
+        # Bridge decks are a region of their own inside the roads, cut along a smooth outline:
+        # their side walls are clean vertical cuts. As part of the roads (one height field for
+        # both), a deck dropped to the ground across one grid cell along the staircase edge of
+        # its raster mask - steep sawtooth walls that cost print time. The deck height field
+        # continues past the deck (``Surface.bridge``), so the outline takes the deck's height.
+        bridge_mm, bridge_m = deck_mm, brg_m
 
         def land_fields(G: np.ndarray) -> dict:
-            road = np.where(bridge_v, np.maximum(bridge_mm, G), G) + opts.road_emboss_mm
             return {GROUND: G, BUILDING: np.maximum(roof_mm, G),
                     VEG: np.maximum(canopy_mm, G) if opts.surface == "full" else G,
-                    ROAD: np.maximum(road, lowest)}
+                    ROAD: np.maximum(G + opts.road_emboss_mm, lowest),
+                    BRIDGE: np.maximum(np.maximum(bridge_mm, G) + opts.road_emboss_mm, lowest)}
 
         fields = land_fields(G_mm)
         fields[WATER] = np.maximum(np.round(zmm(surf.level), 3) - opts.water_recess_mm, lowest)
         fields[RIVER] = fields[WATER]
         names = {GROUND: "Ground", BUILDING: "Buildings", WATER: "Water", ROAD: "Roads", VEG: "Trees",
-                 RIVER: "Rivers"}
+                 RIVER: "Rivers", BRIDGE: "Bridges"}
         label_color = {GROUND: col.ground, BUILDING: col.buildings, WATER: col.water, RIVER: col.water,
-                       ROAD: col.roads,
+                       ROAD: col.roads, BRIDGE: col.roads,
                        VEG: col.vegetation}
         cmasks = {lab: P(surf.masks[lab]) for lab in (BUILDING, ROAD, WATER, RIVER, VEG)}
         cmasks = _min_features(cmasks, opts.min_feature_mm / cell_mm / 2)
@@ -940,9 +1150,11 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
             fields[WATER] = np.maximum(np.where(lake_owned, lg.snap(fields[WATER]), fields[WATER]), lowest)
             fields[RIVER] = fields[WATER]
         if opts.color_depth_mm > 0 and opts.swap_patch_budget_mm2 > 0:
+            tops = {lab: fields[lab] for lab in cmasks}
+            tops[ROAD] = np.where(bridge_m, fields[BRIDGE], fields[ROAD])
+            keep = bridge_m | P(surf.river) if surf.river is not None else bridge_m
             cmasks, n_rm, a_rm, saved = _drop_swap_patches(
-                cmasks, {lab: fields[lab] for lab in cmasks}, G_mm, opts.color_depth_mm, cell_mm,
-                opts.swap_patch_budget_mm2, keep=P(surf.river) if surf.river is not None else None)
+                cmasks, tops, G_mm, opts.color_depth_mm, cell_mm, opts.swap_patch_budget_mm2, keep=keep)
             if n_rm:
                 notes.append(f"Recoloured {n_rm} small patch(es) ({a_rm:.0f} mm2) that each forced their colour "
                              f"into extra layers: ~{saved} fewer filament changes.")
@@ -968,6 +1180,9 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
                 # same point (which would pinch the region between them to a single point)
                 sigma = 1.2 if lab == VEG else 0.7  # tree canopies are ragged: smoother outline
                 part.step(_indicator(m, min_cells, sigma), 0.5 + 0.0173 * i, above=lab)
+        if bridge_m.any() and cmasks[ROAD].any():
+            # decks inside the roads (the road mask holds them): no slivers where deck meets road
+            part.step(_indicator(bridge_m, min_cells), 0.5, above=BRIDGE, only=ROAD)
         part.finish(GROUND)
         land.finish(GROUND)
         default = GROUND
@@ -982,7 +1197,7 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
             I = FieldSpec(flat(_terraced(np.maximum(G_mm, lowest) + min(0.0, opts.road_emboss_mm), d, base, lg)))
             # one ground-coloured body under all land (outline + water cut only)
             defs.append(("body", "Body", col.ground, {GROUND}, I, FieldSpec(base)))
-        for lab in (GROUND, BUILDING, WATER, RIVER, ROAD, VEG):
+        for lab in (GROUND, BUILDING, WATER, RIVER, ROAD, BRIDGE, VEG):
             if lab not in present:
                 continue
             T = flat(fields[lab])
@@ -1019,15 +1234,41 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
             wtop = np.maximum(np.where(P(surf.masks[WATER])[wi, wj], lg.snap(wtop), wtop), lowest)
         # with separate water the bands only cover land: use the land surface continued over
         # the water so shores are clean walls (see Surface.surface_land)
-        Sb_mm = np.round(zmm(surf.surface_land), 3) if water_sep else S_mm
+        Sb_mm = terrain_mm(water_sep)
         if water_sep and ind is not None and shore_k > 0:
             Sb_mm = np.minimum(Sb_mm, _shore_cap(diag, ind, wtop, shore_wall, shore_k, float(Sb_mm.max())))
+        # buildings and decks: their own regions, banded by their own tops (band 0 keeps the label)
+        labs = cut_structures(part)
+        tops = {BAND0: Sb_mm}
+        firsts = {BAND0: BAND0}
+        if BUILDING in labs:
+            tops[BUILDING], firsts[BUILDING] = np.maximum(roof_mm, Sb_mm), BLD_BAND0
+        if BRIDGE in labs:
+            tops[BRIDGE], firsts[BRIDGE] = np.maximum(deck_mm, Sb_mm), BRG_BAND0
+        # a surface lying exactly on a band floor (heights are rounded to 1 um, floors snapped to
+        # the layer grid; quantised models make whole plateaus tie) would give that band zero
+        # thickness inside its region: top and floor touching along an edge, a non-manifold pinch.
+        # Those cells go to the band below: 0.5 um down, so the contour still crosses a third of
+        # the way along the next edge (no slivers).
+        for key, t in tops.items():
+            for lo in lo_mm[1:]:
+                t = np.where(np.abs(t - lo) < 2.5e-4, lo - 5e-4, t)
+            tops[key] = t
+        Sb_mm = tops[BAND0]
         progress(0.1, "Cutting elevation contours")
         for k in range(nb - 1, 0, -1):
             part.step(flat(Sb_mm), lo_mm[k], above=BAND0 + k)
+            for lab in labs:
+                part.step(flat(tops[lab]), lo_mm[k], above=firsts[lab] + k, only=lab)
         part.finish(BAND0)
         default = BAND0
         label_color = {BAND0 + k: bands[k] for k in range(nb)}
+        for lab in labs:
+            label_color.update({lab: bands[0]} | {firsts[lab] + k: bands[k] for k in range(1, nb)})
+
+        def band_labels(lab: int, k: int) -> set:
+            """Labels of the pieces at band ``k`` or above (band 0 of a structure is its own label)."""
+            return {lab if j == 0 else firsts[lab] + j for j in range(k, nb)}
         present_w = [lab for lab in (WATER, RIVER)
                      if water_sep and ((part.tri_label == lab).any() or (part.p_label == lab).any())]
         if present_w:
@@ -1047,8 +1288,12 @@ def build_parts(elev: Elevation, surf: Surface, opts: Options, progress: Progres
         for k in range(nb):
             hi = lo_mm[k + 1] if k + 1 < nb else np.inf
             lbl = f"Band {k + 1}" + (f" ({th[k - 1]:.0f} m+)" if k else "")
-            defs.append(("band", lbl, bands[k], {BAND0 + j for j in range(k, nb)},
+            defs.append(("band", lbl, bands[k], band_labels(BAND0, k),
                          FieldSpec(flat(Sb_mm), hi=hi), FieldSpec(lo_mm[k])))
+            for lab, what in ((BUILDING, "buildings"), (BRIDGE, "bridges")):
+                if lab in labs:
+                    defs.append(("band", f"{lbl}: {what}", bands[k], band_labels(lab, k),
+                                 FieldSpec(flat(tops[lab]), hi=hi), FieldSpec(lo_mm[k])))
             if k > 0:
                 color_changes.append({"z_mm": round(lo_mm[k], 2), "color": bands[k],
                                       "elevation_m": round(float(th[k - 1]), 1)})

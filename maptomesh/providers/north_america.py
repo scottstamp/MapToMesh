@@ -50,6 +50,16 @@ class Hrdem(DemProvider):
                     break
         return DemArrays(dtm, dsm if np.isfinite(dsm).any() else None, ", ".join(used))
 
+    def cog_urls(self, aoi, grid, dsm):
+        from ..hrdem import COLLECTIONS, stac_items
+        bbox = aoi.lonlat_bbox(margin=grid.step * 2)
+        for coll in COLLECTIONS:   # fetch stops after a collection covering the area (usually the first)
+            urls = [it["assets"][name]["href"] for it in stac_items(bbox, coll)
+                    for name in (("dtm", "dsm") if dsm else ("dtm",)) if it["assets"].get(name, {}).get("href")]
+            if urls:
+                return urls
+        return []
+
 
 class Usgs3depSeamless(DemProvider):
     key = "usgs_3dep_13"

@@ -17,9 +17,12 @@ DEMs (``best_dems`` asks the finest first and fills only remaining gaps):
 * Ireland - Geological Survey Ireland open LiDAR tiles (GSI, OPW, TII, ...): 1-2 m DTM / DSM in small
   zips (GeoTIFF or ASCII grid) listed by ArcGIS coverage layers, CC BY 4.0. Patchy coverage.
 * Spain - IGN MDT05 5 m through the INSPIRE WCS (integer metres; above Copernicus as a fallback).
+* Tuscany (IT) - Regione Toscana Geoscopio WMS: 1 m LiDAR DTM 2019-21 (Italian Remote Sensing, partial
+  coverage) as float32 GeoTIFF from GetMap; 0 outside the surveys. CC BY-NC-SA: a non-commercial
+  warning goes with the model, and it ranks after unrestricted models of equal detail.
 
 Not implemented: CNIG LiDAR / MDT02 (portal only), Portugal DGT (login), Northern Ireland (blocked
-downloads), MASE PST (web app), Tuscany (non-commercial), Sardinia / Emilia-Romagna WCS (unreliable).
+downloads), MASE PST (web app), Sardinia / Emilia-Romagna WCS (unreliable).
 """
 
 from __future__ import annotations
@@ -71,13 +74,13 @@ def _nanify(a: np.ndarray, nodata=None, zero_is_nodata: bool = False, min_valid:
 def _raster_to_grid(data: bytes, aoi, grid, src_crs=None, ext: str = ".tif", zero_is_nodata: bool = False,
                     nodata=None, min_valid: float = -1e5) -> np.ndarray:
     """Raster bytes (GeoTIFF / ASCII grid) -> vertex grid, with every kind of fill value as NaN."""
-    from rasterio.io import MemoryFile
-    with MemoryFile(data, ext=ext) as mf, mf.open() as src:
-        arr = _nanify(src.read(1), src.nodata if nodata is None else nodata, zero_is_nodata, min_valid)
-        crs = src_crs if src_crs is not None else src.crs
-        if crs is None:
-            raise ValueError("raster has no CRS")
-        return reproject_array(arr, src.transform, crs, aoi, grid, nodata=None)
+    from ..dem_readers import read_raster_bytes
+    src = read_raster_bytes(data, ext)
+    arr = _nanify(src.arr, src.nodata if nodata is None else nodata, zero_is_nodata, min_valid)
+    crs = src_crs if src_crs is not None else src.crs
+    if crs is None:
+        raise ValueError("raster has no CRS")
+    return reproject_array(arr, src.transform, crs, aoi, grid, nodata=None)
 
 
 def _snap(b: tuple, res: float) -> tuple:
@@ -161,6 +164,7 @@ class WalesLidar(DemProvider):
 
 class EnglandEaLidar(DemProvider):
     key = "ea_lidar_composite_1m"
+    read_kind = "service"   # download estimates (maptomesh.estimate)
     label = "Environment Agency LiDAR 1 m (England)"
     res_m = 1.0
     has_dsm = True
@@ -233,10 +237,11 @@ def _srsp_note(name: str, restriction: str) -> str:
     short = name.split("lidar/")[-1].rsplit("/", 1)[0]   # one note per collection, not per DTM / DSM
     if restriction == "non-commercial":
         return (f"Scottish LiDAR collection '{short}' is under the Non-Commercial Government Licence (or a "
-                "non-OGL licence): prints of this area must not be sold or used commercially.")
+                "non-OGL licence): prints of this area must not be sold or used commercially; terms: "
+                "https://www.nationalarchives.gov.uk/doc/non-commercial-government-licence/version/2/")
     return (f"Scottish LiDAR collection '{short}' is released under the Open Government Licence, but its "
             "terms state that the survey contractor (Fugro) retains the commercial copyright: check the "
-            "terms before selling prints of this area.")
+            "terms before selling prints of this area: https://remotesensingdata.gov.scot/")
 
 
 def _srsp_collections() -> list[tuple[float, str, str, str | None]]:
@@ -382,6 +387,7 @@ def _gsi_members(blob: bytes) -> dict[str, tuple[bytes, str]]:
 
 class IrelandGsi(DemProvider):
     key = "gsi_lidar_ie"
+    read_kind = "file"   # download estimates (maptomesh.estimate)
     label = "GSI / OPW open LiDAR 1-2 m (Ireland, partial)"
     res_m = 1.0
     has_dsm = True
@@ -431,6 +437,7 @@ class IrelandGsi(DemProvider):
 
 class SpainIgnMdt05(DemProvider):
     key = "ign_es_mdt05"
+    read_kind = "service"   # download estimates (maptomesh.estimate)
     label = "IGN MDT05 5 m (Spain)"
     res_m = 5.0
     attribution = "MDT05 CC BY 4.0 scne.es - © Instituto Geográfico Nacional de España"
@@ -476,6 +483,7 @@ class _SouthTyrol(DemProvider):
 
 class SouthTyrol05(_SouthTyrol):
     key = "bz_dtm_05m"
+    read_kind = "service"   # download estimates (maptomesh.estimate)
     label = "South Tyrol LiDAR DTM/DSM 0.5 m (Italy, valleys)"
     res_m = 0.5
     suffix = "0.5m"
@@ -485,11 +493,53 @@ class SouthTyrol05(_SouthTyrol):
 
 class SouthTyrol25(_SouthTyrol):
     key = "bz_dtm_25m"
+    read_kind = "service"   # download estimates (maptomesh.estimate)
     label = "South Tyrol DTM/DSM 2.5 m (Italy)"
     res_m = 2.5
     suffix = "2.5m"
     max_area_km2 = 2500.0
     sample = (46.5300, 11.6000, 5000)   # Schlern / Seiser Alm
+
+
+# -------------------------------------------------------------------------------------------- Tuscany
+
+TOS_WMS = "https://www502.regione.toscana.it/wmsraster/com.rt.wms.RTmap/wms"
+TOS_TERMS = "http://www502.regione.toscana.it/geoscopio/servizi/wms/MORFOLOGIA.htm"
+
+
+class TuscanyIrs1m(DemProvider):
+    key = "rt_tos_dtm1m_irs"
+    read_kind = "file"   # download estimates (maptomesh.estimate)
+    label = "Tuscany LiDAR DTM 1 m 2019-21 (Italy, partial, non-commercial)"
+    res_m = 1.0
+    attribution = ("DTM LiDAR 1 m 2019-2021 © Italian Remote Sensing S.r.l., distributed by Regione Toscana "
+                   "(Geoscopio), CC BY-NC-SA")
+    licence = f"CC BY-NC-SA (version not stated), data owned by Italian Remote Sensing S.r.l. ({TOS_TERMS})"
+    licence_note = ("Tuscany 1 m LiDAR DTM 2019-21 (owned by Italian Remote Sensing S.r.l., distributed by Regione "
+                    "Toscana for use by public bodies) is under CC BY-NC-SA: prints of this area must not be sold or "
+                    "used commercially, and derived files you share must keep the same licence; terms: " + TOS_TERMS)
+    regions = ((9.66, 42.20, 12.42, 44.48),)
+    max_area_km2 = 2500.0
+    sample = (42.8875, 11.6230, 3000)   # Monte Amiata
+    prefer = 2
+
+    def fetch(self, aoi, grid, progress, cancel):
+        res = request_res(self.res_m, grid)
+        bbox = _snap(src_bbox(aoi, grid, 25832), res)
+        out = np.full(grid.vshape, np.nan)
+        n = 0
+        for (x0, y0, x1, y1), w, h in service_tiles(bbox, res, 4000):   # service limit 4096 px
+            _cancelled(cancel)
+            n += 1
+            progress(0.1, f"Tuscany DTM 1 m request {n}")
+            data = service_get(TOS_WMS, {
+                "map": "wmsmorfologia", "SERVICE": "WMS", "VERSION": "1.3.0", "REQUEST": "GetMap",
+                "LAYERS": "rt_morfologia.iddtm.1m.irs", "STYLES": "", "CRS": "EPSG:25832",
+                "BBOX": f"{x0:.2f},{y0:.2f},{x1:.2f},{y1:.2f}", "WIDTH": w, "HEIGHT": h, "FORMAT": "image/tiff"},
+                timeout=180)
+            # float32 heights; exactly 0 outside the surveyed sheets (no nodata tag)
+            merge_fill(out, _raster_to_grid(data, aoi, grid, src_crs=25832, zero_is_nodata=True))
+        return DemArrays(out, None, f"WMS rt_morfologia.iddtm.1m.irs, {res:.1f} m, {n} request(s)")
 
 
 register(ScotlandSrsp())
@@ -499,3 +549,4 @@ register(EnglandEaLidar())
 register(IrelandGsi())
 register(SouthTyrol25())
 register(SpainIgnMdt05())
+register(TuscanyIrs1m())

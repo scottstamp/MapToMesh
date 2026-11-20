@@ -57,7 +57,8 @@ CASES: dict[str, dict] = {
                               base_separate=True, name="St Johns base separate"),
     "stj_bands_base_separate": dict(lat=47.5550, lon=-52.7300, width_m=6000, height_m=6000, shape="circle",
                                     grid_cells=500, surface="terrain", color_mode="elevation",
-                                    z_exaggeration=2.5, base_separate=True, name="St Johns bands base"),
+                                    z_exaggeration=2.5, base_separate=True, dem_preference="official",
+                                    name="St Johns bands base"),
     # frame label + separate base with locating lip, 2 tiles (staggered base seams)
     "stj_label_lip_tiles": dict(lat=47.5660, lon=-52.6950, width_m=3200, height_m=2400, grid_cells=600,
                                 color_mode="landcover", osm_roads="medium", frame=True, frame_width_mm=8,
@@ -76,7 +77,8 @@ CASES: dict[str, dict] = {
                            us_source="usgs", color_mode="landcover", surface="buildings", osm_roads="medium",
                            name="Seattle"),
     "us_grand_canyon_ept": dict(lat=36.0570, lon=-112.1180, width_m=4000, height_m=4000, grid_cells=500,
-                                us_source="usgs", surface="terrain", color_mode="elevation", name="Grand Canyon"),
+                                us_source="usgs", surface="terrain", color_mode="elevation",
+                                dem_preference="official", name="Grand Canyon"),
     # regressions: buildings unclassified (Ottawa 2020), trees unclassified (Hamilton 2021)
     # outside North America: best available source per area, fallbacks down to Copernicus 30 m
     "fr_paris_ign": dict(lat=48.8530, lon=2.3499, width_m=2000, height_m=1500, grid_cells=600,
@@ -84,11 +86,12 @@ CASES: dict[str, dict] = {
     "nl_amsterdam_ahn": dict(lat=52.3731, lon=4.8922, width_m=2000, height_m=1500, grid_cells=600,
                              color_mode="landcover", surface="buildings", osm_roads="medium", name="Amsterdam"),
     "ch_matterhorn": dict(lat=45.9763, lon=7.6586, width_m=4000, height_m=4000, grid_cells=500, surface="terrain",
-                          color_mode="elevation", name="Matterhorn"),
+                          color_mode="elevation", dem_preference="official", name="Matterhorn"),
     "uk_london_ea": dict(lat=51.5055, lon=-0.0754, width_m=2000, height_m=1500, grid_cells=600,
                          color_mode="landcover", surface="buildings", osm_roads="medium", name="London"),
     "uk_snowdon_wales": dict(lat=53.0685, lon=-4.0763, width_m=3000, height_m=3000, grid_cells=500,
-                             surface="terrain", color_mode="elevation", name="Snowdon"),
+                             surface="terrain", color_mode="elevation", dem_preference="official",
+                             name="Snowdon"),
     "at_hallstatt_bev": dict(lat=47.5622, lon=13.6493, width_m=3000, height_m=3000, grid_cells=500,
                              color_mode="landcover", surface="terrain", name="Hallstatt"),
     "de_cologne_nrw": dict(lat=50.9413, lon=6.9583, width_m=2000, height_m=1500, grid_cells=600,
@@ -103,16 +106,36 @@ CASES: dict[str, dict] = {
                         color_mode="elevation", name="Fuji"),
     "hk_central_cedd": dict(lat=22.2820, lon=114.1588, width_m=3000, height_m=3000, grid_cells=500,
                             color_mode="landcover", surface="buildings", osm_roads="medium", name="Hong Kong"),
-    "no_lofoten_arcticdem": dict(lat=67.9320, lon=13.0890, width_m=4000, height_m=4000, grid_cells=500,
-                                 color_mode="landcover", surface="terrain", name="Reine"),
+    "no_lofoten_mapterhorn": dict(lat=67.9320, lon=13.0890, width_m=4000, height_m=4000, grid_cells=500,
+                                  color_mode="landcover", surface="terrain", name="Reine"),
+    "ru_khibiny_arcticdem": dict(lat=67.6500, lon=33.7200, width_m=6000, height_m=6000, grid_cells=500,
+                                 color_mode="landcover", surface="terrain", name="Khibiny"),
+    # Mapterhorn-only coverage: Denmark 0.4 m (buildings from OSM), Norway 1 m bare terrain
+    "dk_mons_klint_mapterhorn": dict(lat=54.9700, lon=12.5450, width_m=3000, height_m=3000, grid_cells=600,
+                                     color_mode="landcover", surface="buildings", osm_roads="medium",
+                                     name="Mons Klint"),
+    "no_geiranger_mapterhorn": dict(lat=62.1008, lon=7.2059, width_m=5000, height_m=5000, grid_cells=500,
+                                    surface="terrain", color_mode="elevation", name="Geiranger"),
     "es_teide_ign": dict(lat=28.2724, lon=-16.6425, width_m=10000, height_m=10000, grid_cells=500,
-                         surface="terrain", color_mode="elevation", name="Teide"),
-    "global_everest_copernicus": dict(lat=27.9881, lon=86.9250, width_m=20000, height_m=20000, grid_cells=400,
+                         surface="terrain", color_mode="elevation", dem_preference="official", name="Teide"),
+    "global_everest_fabdem": dict(lat=27.9881, lon=86.9250, width_m=20000, height_m=20000, grid_cells=400,
                                       surface="terrain", color_mode="elevation", name="Everest"),
     "ottawa_landcover": dict(lat=45.4236, lon=-75.7009, width_m=2000, height_m=1500, shape="rounded", grid_cells=700,
                              frame=True, osm_roads="medium", color_mode="landcover", name="Ottawa"),
     "hamilton_bands": dict(lat=43.2385, lon=-79.8950, width_m=3000, height_m=2598, shape="hexagon", grid_cells=500,
-                           surface="terrain", color_mode="elevation", z_exaggeration=2.0, name="Hamilton"),
+                           surface="terrain", color_mode="elevation", z_exaggeration=2.0, dem_preference="official",
+                           name="Hamilton"),  # keeps the LiDAR path (unclassified trees)
+    # QEW Burlington Skyway (~40 m deck over the canal) and the canal lift bridge; no buildings
+    "ca_burlington_bridges": dict(lat=43.2984, lon=-79.7988, width_m=1500, height_m=1500, grid_cells=600,
+                                  surface="bridges", color_mode="landcover", name="Burlington"),
+    # GSI's bare-earth DEM + PLATEAU 3D buildings (LoD2 roofs; Marunouchi towers ~200-250 m)
+    "jp_tokyo_plateau": dict(lat=35.6812, lon=139.7671, width_m=1500, height_m=1500, grid_cells=600,
+                             color_mode="landcover", name="Tokyo Station"),
+    # buildings / bridge decks as their own regions outside land cover too (clean vertical walls)
+    "jp_tokyo_single": dict(lat=35.6812, lon=139.7671, width_m=1500, height_m=1500, grid_cells=600,
+                            color_mode="single", name="Tokyo Station (one colour)"),
+    "ca_burlington_bands": dict(lat=43.2984, lon=-79.7988, width_m=1500, height_m=1500, grid_cells=600,
+                                surface="bridges", color_mode="elevation", name="Burlington (bands)"),
 }
 
 
@@ -137,9 +160,17 @@ EXPECT = {
     "au_brisbane_qld": {"sources": ["Queensland"]},
     "jp_fuji_gsi": {"sources": ["GSI"], "min_relief_mm": 50.0},
     "hk_central_cedd": {"sources": ["CEDD"]},
-    "no_lofoten_arcticdem": {"sources": ["ArcticDEM"]},
+    "no_lofoten_mapterhorn": {"sources": ["Mapterhorn 1 m: Terrengmodellar"]},
+    "ru_khibiny_arcticdem": {"sources": ["ArcticDEM"]},
+    "dk_mons_klint_mapterhorn": {"sources": ["Mapterhorn 0.4 m"]},
+    "no_geiranger_mapterhorn": {"sources": ["Mapterhorn"], "min_relief_mm": 40.0},
+    "stj_10km_bands": {"sources": ["Mapterhorn 2 m"]},   # bare terrain: point clouds skipped
     "es_teide_ign": {"sources": ["IGN MDT05"]},
-    "global_everest_copernicus": {"sources": ["Copernicus"]},
+    "global_everest_fabdem": {"sources": ["FABDEM"]},   # bare earth on land (licence warning)
+    "ca_burlington_bridges": {"projects": ["Hamilton_Niagara"], "min_relief_mm": 4.0},   # the Skyway deck
+    "jp_tokyo_plateau": {"sources": ["GSI"], "notes": ["PLATEAU"], "min_relief_mm": 25.0},
+    "jp_tokyo_single": {"sources": ["GSI"], "notes": ["PLATEAU"], "min_relief_mm": 25.0},
+    "ca_burlington_bands": {"projects": ["Hamilton_Niagara"], "min_relief_mm": 4.0},
 }
 
 
@@ -259,6 +290,10 @@ def run_case(base: str, name: str, body: dict, timeout: float = 1800) -> dict:
     for sub in exp.get("sources", []):
         if not any(sub in u for u in used):
             print(f"  expected elevation from {sub!r}, got {used}")
+            ok = False
+    for sub in exp.get("notes", []):
+        if not any(sub in n for n in res["notes"]):
+            print(f"  expected a note mentioning {sub!r}")
             ok = False
     if res["stats"]["relief_mm"] < exp.get("min_relief_mm", 0):
         print(f"  relief {res['stats']['relief_mm']} mm < {exp['min_relief_mm']} mm (tall buildings missing?)")

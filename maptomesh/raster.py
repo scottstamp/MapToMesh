@@ -60,6 +60,27 @@ def despike(a: np.ndarray, mask: np.ndarray, thresh: float, size: int = 3) -> np
     return out
 
 
+def masked_median(a: np.ndarray, mask: np.ndarray, where: np.ndarray, size: int, q: float = 50.0) -> np.ndarray:
+    """At the ``where`` cells, the median (or the ``q``-th percentile) of ``a`` over the ``mask``
+    cells in a size x size window (others unchanged). Only the bounding box of ``where`` is
+    processed."""
+    out = np.array(a, dtype=np.float64)
+    if not where.any():
+        return out
+    r = size // 2
+    rows, cols = np.nonzero(where)
+    r0, r1 = max(rows.min() - r, 0), min(rows.max() + r + 1, a.shape[0])
+    c0, c1 = max(cols.min() - r, 0), min(cols.max() + r + 1, a.shape[1])
+    vals = np.where(mask[r0:r1, c0:c1], out[r0:r1, c0:c1], np.nan)
+    win = np.lib.stride_tricks.sliding_window_view(np.pad(vals, r, constant_values=np.nan), (size, size))
+    for k in range(0, len(rows), 20000):    # bounded temporaries (WebAssembly memory)
+        i, j = rows[k:k + 20000], cols[k:k + 20000]
+        w = win[i - r0, j - c0].reshape(len(i), -1)
+        ok = np.isfinite(w).any(axis=1)
+        out[i[ok], j[ok]] = np.nanmedian(w[ok], axis=1) if q == 50.0 else np.nanpercentile(w[ok], q, axis=1)
+    return out
+
+
 # ---------------------------------------------------------------- rasterisation
 
 def fill_polygon(rings: list[np.ndarray], shape: tuple[int, int]) -> np.ndarray:
@@ -76,7 +97,7 @@ def fill_polygon(rings: list[np.ndarray], shape: tuple[int, int]) -> np.ndarray:
         lo, hi = np.minimum(y1, y2), np.maximum(y1, y2)
         r0 = np.maximum(np.ceil(lo), 0).astype(np.int64)
         r1 = np.minimum(np.ceil(hi) - 1, H - 1).astype(np.int64)  # rows with lo <= r < hi
-        n = np.maximum(r1 - r0 + 1, 0)
+        n = np.maximum(r1 - r0 + 1, 0).astype(np.intp)   # repeat counts: 32-bit in WebAssembly
         if n.sum() == 0:
             continue
         e = np.repeat(np.arange(len(p)), n)
@@ -127,7 +148,7 @@ def rasterize_lines(lines: list[tuple[np.ndarray, float]], shape: tuple[int, int
                 continue
             a, b = p[:-1], p[1:]
             seg = np.hypot(*(b - a).T)
-            n = np.maximum(np.ceil(seg / 0.5).astype(np.int64), 1) + 1
+            n = np.maximum(np.ceil(seg / 0.5).astype(np.intp), 1) + 1
             e = np.repeat(np.arange(len(a)), n)
             t = (np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n)) / np.repeat(n - 1, n)
             q = a[e] + (b[e] - a[e]) * t[:, None]

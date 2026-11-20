@@ -2,7 +2,7 @@
 name = "maptomesh-native"
 version = "0.1.0"
 edition = "2024"
-description = "Optional native speed-ups for MapToMesh (3MF writer)"
+description = "Optional native speed-ups for MapToMesh (3MF writer, TIFF tiles, Draco meshes)"
 license = "LicenseRef-PolyForm-Noncommercial-1.0.0"  # see ../LICENSE.md
 publish = false
 
@@ -18,6 +18,11 @@ rayon = "1.10"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 crc32fast = "1.4"
 meshopt = "0.7"
+# TIFF tile codecs (pure Rust: also builds for WebAssembly)
+weezl = "0.1"
+ruzstd = "0.8"
+# Draco mesh decoding (PLATEAU 3D Tiles; pure Rust, Apache-2.0)
+draco-core = { version = "2.3", default-features = false, features = ["decoder"] }
 
 [profile.release]
 codegen-units = 1

@@ -62,6 +62,11 @@ def http_request(session: requests.Session, method: str, url: str, **kw) -> requ
     return r
 
 
+class ChangedUpstream(RuntimeError):
+    """A file read under a versioned cache key (``url#version``) was replaced on the server: its
+    cached blocks were dropped; the caller must look up the new version before reading again."""
+
+
 class RangeCache:
     def __init__(self, path, max_bytes: int):
         self.path = str(path)
@@ -213,6 +218,14 @@ class RangeCache:
             lo, hi = run[0] * BLOCK, (run[-1] + 1) * BLOCK - 1
             r = http_request(sess, "GET", url, headers={"Range": f"bytes={lo}-{hi}"}, timeout=120)
             r.raise_for_status()
+            tag = r.headers.get("ETag")
+            if "#" in url and tag:   # a versioned key ("url#version") must never mix two files
+                old = con.execute("SELECT etag FROM urls WHERE id = ?", (uid,)).fetchone()[0]
+                if old and old != tag:
+                    con.execute("DELETE FROM blocks WHERE url_id = ?", (uid,))
+                    con.execute("UPDATE urls SET etag = NULL, size = NULL WHERE id = ?", (uid,))
+                    con.commit()
+                    raise ChangedUpstream(f"{url.split('#')[0]} changed upstream (ETag {old} -> {tag})")
             data = r.content
             total = None
             cr = r.headers.get("Content-Range")  # "bytes lo-hi/total"
@@ -267,6 +280,15 @@ class RangeCache:
 
 RANGE_CACHE = RangeCache(config.CACHE_DIR / "nrcan_range_cache.sqlite",
                          int(float(os.environ.get("MAPTOMESH_DATA_CACHE_GB", "10")) * 1e9))
+
+
+def hint(url: str, start: int = 0, n: int | None = None) -> None:
+    """The caller will soon read ``url`` (``n`` bytes from ``start``; None: the whole file). The
+    server's thread pools need no hint; the browser build (``maptomesh.browser``) starts the
+    download in the background, so reads made one at a time there still overlap."""
+    h = getattr(RANGE_CACHE, "hint", None)
+    if h is not None:
+        h(url, None if n is None else [(start, n)])
 
 
 class CachedHttpFile(io.RawIOBase):

@@ -35,9 +35,13 @@ const state = {
 // ------------------------------------------------------------------ colour inputs
 function colorInput(container, key, label, value) {
   const l = document.createElement('label');
-  l.innerHTML = `<input type="color" data-color="${key}" value="${value}"> ${label}`;
+  const input = document.createElement('input');   // values may come from a share link: no innerHTML
+  input.type = 'color';
+  input.dataset.color = key;
+  input.value = value;
+  l.append(input, ` ${label}`);
   container.appendChild(l);
-  return l.querySelector('input');
+  return input;
 }
 
 function buildColorInputs() {
@@ -135,7 +139,7 @@ function enforceAspect(changed) {
 const map = L.map('map', { zoomControl: true }).setView([state.center.lat, state.center.lon], 14);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · Elevation: NRCan, USGS, national mapping agencies, Copernicus (credits listed with each model)',
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · Elevation: NRCan, USGS, national mapping agencies, Mapterhorn, Copernicus (credits listed with each model)',
 }).addTo(map);
 
 const selection = L.polygon([], { color: '#c8553d', weight: 2, fillOpacity: 0.12, className: 'aoi' }).addTo(map);
@@ -365,6 +369,7 @@ function updateDerived() {
   const size = parseFloat($('sizeMm').value) || 200;
   const cells = parseInt($('gridCells').value);
   $('gridCellsOut').textContent = cells;
+  updateGridCap();
   $('smoothingOut').textContent = $('smoothing').value;
   $('cliffOut').textContent = $('cliffSmoothing').value;
   $('zExOut').textContent = parseFloat($('zEx').value).toFixed(1);
@@ -407,7 +412,9 @@ async function checkCoverage() {
     const r = await fetch('/api/coverage', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ lat: state.center.lat, lon: state.center.lon, width_m: w, height_m: h,
-        grid_cells: parseInt($('gridCells').value), us_source: $('usSource').value, source: $('source').value }),
+        grid_cells: parseInt($('gridCells').value), us_source: $('usSource').value, source: $('source').value,
+        ground_only: $('surface').value === 'terrain' && $('colorMode').value !== 'landcover',
+        dem_preference: $('demPref').value }),
     });
     const d = await r.json();
     box.className = 'info';
@@ -415,6 +422,11 @@ async function checkCoverage() {
     // elevation models that fill whatever the point clouds don't cover (best resolution first)
     const dems = (d.dem_sources || []).filter((x) => x.usable).map((x) => x.label);
     const demText = dems.length ? `Elevation models: ${dems.join(' → ')}` : '';
+    if (d.models_suffice) {
+      box.className = 'info';
+      box.innerText = 'Bare terrain at this detail: the elevation models are as fine as the grid, no point clouds needed.\n' + demText;
+      return;
+    }
     if (!d.tiles && !d.ept_projects) {
       box.className = 'info';
       box.innerText = ($('source').value === 'lidar' ? 'No LiDAR point clouds here.\n' : '') + demText
@@ -425,18 +437,74 @@ async function checkCoverage() {
     const parts = [];
     if (d.tiles) parts.push(`${d.tiles} LiDAR tile${d.tiles > 1 ? 's' : ''}`);
     if (d.ept_projects) parts.push(`${d.ept_projects} USGS 3DEP project${d.ept_projects > 1 ? 's' : ''} (AWS)`);
-    const tooBig = d.tiles > d.max_tiles || (d.ept_projects && d.area_km2 > d.max_tiles);
+    const tooBig = d.tiles > d.max_tiles || (d.ept_projects && d.area_km2 > (d.max_ept_km2 ?? d.max_tiles));
     const big = d.tiles > 300 || (d.ept_projects && d.area_km2 > 300);
     box.className = tooBig ? 'info err' : big ? 'info warn' : 'info';
     box.innerText = parts.join(' + ') +
-      (tooBig ? ` — over the ${d.max_tiles} limit: elevation models will be used` : big ? ' — large request' : '') +
+      (tooBig ? ` — over the limit at this detail (${d.tiles > d.max_tiles ? d.max_tiles + ' tiles' : (d.max_ept_km2 ?? d.max_tiles) + ' km²'}): elevation models will be used` : big ? ' — large request' : '') +
       `\n${projects}` + (demText ? `\nGaps: ${demText}` : '');
   } catch (e) { box.textContent = ''; }
 }
 
+var LIMITS = null;   // var: read by updateDerived during start-up
+// Models are built in the browser ("this device"). The server builds them only for browsers that
+// can't (``deviceSupported``) and, one model at a time, when a build on the device fails and the
+// user takes the failure dialog's offer.
+let buildTarget = 'device';
+let deviceOk = true;
+function onDevice() { return buildTarget === 'device'; }
+// Building on this device needs WebAssembly, module workers and gzip streams (the private file
+// system, for the data cache, is optional); without them, or with under 2 GB of RAM, the server
+// builds.
+function deviceSupported() {
+  if (typeof WebAssembly !== 'object' || typeof Worker !== 'function' || !('DecompressionStream' in window)) return false;
+  if (navigator.deviceMemory && navigator.deviceMemory < 2) return false;
+  let module = false;
+  try {
+    const u = URL.createObjectURL(new Blob([''], { type: 'text/javascript' }));
+    new Worker(u, { get type() { module = true; return 'module'; } }).terminate();
+    URL.revokeObjectURL(u);
+  } catch (e) { return false; }
+  return module;
+}
+function initBuildTarget() {
+  deviceOk = deviceSupported();
+  buildTarget = deviceOk ? 'device' : 'server';
+}
+// space for downloaded data kept between visits (web/opfs-cache.js; at most 30% of the quota)
+function deviceCacheMb() { return COARSE || MOBILE.matches ? 512 : 2048; }
+// Memory a model may use when built in this browser: WebAssembly (32-bit) stops at 4 GB, and a
+// tab gets much less on phones. navigator.deviceMemory (Chrome, Edge; GB, at most 8) when known.
+function deviceMemoryMb() {
+  const ram = navigator.deviceMemory ? navigator.deviceMemory * 1024 : null;
+  const phone = COARSE || MOBILE.matches;
+  let mb = ram ? ram * (phone ? 0.3 : 0.5) : (phone ? 1200 : 2500);
+  return Math.round(Math.max(800, Math.min(phone ? 1600 : 3600, mb)));
+}
+function gridCap(target = buildTarget) {   // largest Detail this device (or the server) accepts (limits.max_cells)
+  if (!LIMITS) return null;
+  const memory = target === 'device' ? deviceMemoryMb() : LIMITS.memory_mb;
+  const { w, h } = areaDims();
+  const aspect = Math.min(w, h) / Math.max(w, h);
+  const mode = $('colorMode').value;
+  const groundOnly = $('surface').value === 'terrain' && mode !== 'landcover';
+  let per = LIMITS.build_mb[mode] || LIMITS.build_mb.landcover;
+  if ($('source').value === 'lidar' && target !== 'device') per = Math.max(per, groundOnly ? LIMITS.fetch_mb.ground : LIMITS.fetch_mb.classes);
+  const mv = Math.max(0.05, (memory * 0.9 - LIMITS.base_mb) / per);
+  return Math.min(2400, Math.floor(Math.sqrt(mv * 1e6 / Math.max(aspect, 0.05)) / 50) * 50);
+}
+function updateGridCap() {
+  const cap = gridCap(), el = $('gridCap');
+  if (cap == null) { el.hidden = true; return; }
+  const cells = parseInt($('gridCells').value);
+  el.hidden = cells <= cap;
+  el.textContent = `Over ${onDevice() ? 'this device' : "this server"}'s limit for these colours: ${cap} cells at most`;
+  el.classList.toggle('warn', cells > cap);
+}
 async function pollIndex() {
   try {
     const d = await (await fetch('/api/status')).json();
+    if (d.limits) { LIMITS = d.limits; updateGridCap(); }
     const el = $('indexStatus');
     if (d.index.ready) {
       el.textContent = `● ${d.index.message}`; el.className = 'status';
@@ -484,12 +552,12 @@ const FIELDS = ['shape', 'widthKm', 'heightKm', 'source', 'surface', 'gridCells'
   'baseLip', 'lipH', 'lipW', 'lipC', 'label', 'labelText', 'labelScale', 'labelNorth', 'layerH', 'firstLayer',
   'minFeature', 'simplify', 'sizeMm', 'baseMm', 'floorMm',
   'zEx', 'maxHeight', 'cornerMm', 'frame', 'frameW', 'frameH', 'tilesX', 'tilesY', 'flattenWater', 'voidsWater', 'osmWater',
-  'usSource', 'waterRecess', 'shoreSlope', 'osmStreams', 'riverMin', 'osmRoads', 'roadMin', 'roadEmboss', 'colorMode', 'bandCount', 'bandMode', 'bandThresholds', 'minRegion',
+  'usSource', 'demPref', 'waterRecess', 'shoreSlope', 'osmStreams', 'riverMin', 'osmRoads', 'roadMin', 'roadEmboss', 'colorMode', 'bandCount', 'bandMode', 'bandThresholds', 'minRegion',
   'colorDepth', 'swapBudget', 'elevWater',
   'name', 'layout', 'showCoverage'];
 
 // option name (server) -> form element id
-const OPTION_IDS = { shape: 'shape', corner_radius_mm: 'cornerMm', source: 'source', us_source: 'usSource', surface: 'surface', grid_cells: 'gridCells',
+const OPTION_IDS = { shape: 'shape', corner_radius_mm: 'cornerMm', source: 'source', us_source: 'usSource', dem_preference: 'demPref', surface: 'surface', grid_cells: 'gridCells',
   smoothing: 'smoothing', cliff_smoothing: 'cliffSmoothing', base_separate: 'baseSeparate', base_lip: 'baseLip',
   lip_height_mm: 'lipH', lip_width_mm: 'lipW', lip_clearance_mm: 'lipC', label: 'label', label_text: 'labelText',
   label_scale_bar: 'labelScale', label_north: 'labelNorth', layer_height_mm: 'layerH', first_layer_mm: 'firstLayer',
@@ -656,7 +724,7 @@ function buildOptions() {
   return {
     lat: state.center.lat, lon: state.center.lon, width_m: w, height_m: h,
     shape: $('shape').value, corner_radius_mm: num('cornerMm', 12),
-    source: $('source').value, us_source: $('usSource').value, surface: $('surface').value,
+    source: $('source').value, us_source: $('usSource').value, dem_preference: $('demPref').value, surface: $('surface').value,
     grid_cells: parseInt($('gridCells').value), smoothing: num('smoothing', 0),
     cliff_smoothing: num('cliffSmoothing', 1),
     size_mm: num('sizeMm', 200), base_mm: num('baseMm', 3), floor_mm: num('floorMm', 1.5),
@@ -732,7 +800,8 @@ function setRunning(on) {
   mg.classList.toggle('primary', !on); mg.classList.toggle('secondary', on);
 }
 
-async function generate() {
+async function generate({ keepUrl = false, target = buildTarget } = {}) {
+  if (!keepUrl && location.search) history.replaceState(null, '', location.pathname);
   const bad = invalidFields();
   if (bad.length) {
     showSettingsNote(`Fix these settings first:\n${bad.map((el) => `${fieldLabel(el)}: ${el.value} (allowed ${rangeText(el)})`).join('\n')}`);
@@ -751,9 +820,21 @@ async function generate() {
   setProgress(0, 'Starting…');
   $('result').hidden = true;
   hideReview();
+  if (target === 'device') { runOnDevice(body); return; }
+  if (!deviceOk) setProgress(0, "Building on the server: this browser can't build models itself");
+  runOnServer(body);
+}
+
+async function runOnServer(body) {
   try {
     const r = await fetch('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const d = await r.json();
+    if (!r.ok && d.error_kind) {   // refused up front: too large / server busy
+      finish();
+      setProgress(null, `Not started: ${d.detail}`, true);
+      showFailure({ error_kind: d.error_kind, error: d.detail, advice: d.advice, suggest: d.suggest });
+      return;
+    }
     if (!r.ok) throw new Error(describeError(d));
     state.jobId = d.id;
     poll();
@@ -786,16 +867,302 @@ async function poll() {
       setProgress(null, j.state === 'error' ? `Error: ${j.error}` : 'Cancelled', j.state === 'error');
       $('miniDetails').hidden = j.state !== 'error';
       if (j.state === 'error') showReview(j);
+      if (j.state === 'error' && FAIL_TITLES[j.error_kind]) showFailure(j);
       return;
     }
   } catch (e) { /* transient */ }
   state.pollTimer = setTimeout(poll, 700);
 }
 
+// ------------------------------------------------------------------ building on this device
+// "Build on: this device": a Web Worker (web/browser-worker.js) runs the maptomesh Python package
+// compiled to WebAssembly (Pyodide); the server only serves files and forwards data from hosts
+// without CORS. The results stay in the browser (blob URLs).
+// fullScipy: this device needed a part of SciPy that the trimmed copy leaves out (remembered)
+const FULL_SCIPY_KEY = 'maptomesh.fullScipy';
+const device = { worker: null, ready: false, t0: 0, log: [], urls: [], opts: null,
+                 fullScipy: (() => { try { return localStorage.getItem(FULL_SCIPY_KEY) === '1'; } catch (e) { return false; } })() };
+
+function cancelJob() {
+  if (!state.running) return;
+  if (state.onDevice) {
+    if (device.worker) device.worker.terminate();   // its Python goes too; the next run starts afresh
+    device.worker = null;
+    state.onDevice = false;
+    finish();
+    setProgress(null, 'Cancelled');
+    return;
+  }
+  if (state.jobId) fetch(`/api/jobs/${state.jobId}/cancel`, { method: 'POST' });
+}
+
+function localJobId() {   // the server's job-id format, so a review of this model can be sent
+  return [...crypto.getRandomValues(new Uint8Array(6))].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+function deviceLog(msg) {
+  if (device.log.length && device.log[device.log.length - 1].endsWith(`  ${msg}`)) return;
+  device.log.push(`${((performance.now() - device.t0) / 1000).toFixed(1)}s  ${msg}`);
+  $('log').textContent = device.log.join('\n');
+  $('log').scrollTop = 1e9;
+}
+
+async function runOnDevice(body, { retry = false } = {}) {
+  const cap = gridCap();
+  if (cap != null && body.grid_cells > cap) {
+    finish();
+    const msg = `${body.grid_cells} cells of detail need more memory than a browser tab on this device can use.`;
+    setProgress(null, `Not started: ${body.grid_cells} cells is over this device's limit (${cap})`, true);
+    reportDeviceFailure('too_large', msg, '', body);
+    showFailure({ error_kind: 'too_large', device: true, title: 'This model is too large for this device',
+                  error: msg, advice: [`Lower Detail to ${cap} cells or less.`], suggest: { grid_cells: cap }, server: body });
+    return;
+  }
+  if (!retry && onPhone() && !localStorage.getItem(NOASK_KEY) && !builtBefore(body)) {
+    setProgress(0, 'Waiting for your go-ahead to download the data…');
+    if (!(await confirmDownload(body))) { finish(); setProgress(null, 'Not started'); return; }
+  }
+  state.onDevice = true;
+  state.jobId = null;
+  if (!retry) {                     // a retry keeps the first attempt's log
+    device.t0 = performance.now();
+    device.log = [];
+  }
+  device.opts = body;
+  device.setup = null;
+  startWorker();
+  // Chromium grants persistent storage silently (no prompt; Firefox would ask): the kept Python
+  // and data then survive storage pressure on phones
+  if (navigator.userAgentData && navigator.storage?.persist) navigator.storage.persist().catch(() => {});
+  device.worker.postMessage({ type: 'run', opts: body, memory_mb: deviceMemoryMb(), cache_mb: deviceCacheMb(),
+                             full_scipy: device.fullScipy });
+}
+
+function startWorker() {
+  if (device.worker) return;
+  device.ready = false;   // until its Python has loaded
+  device.worker = new Worker('/static/browser-worker.js', { type: 'module' });
+  device.worker.onmessage = onDeviceMessage;
+  device.worker.onerror = (e) => {
+    if (state.onDevice) deviceFailed({ message: e.message || 'The build worker could not start', fatal: true });
+    else { device.worker?.terminate(); device.worker = null; }
+  };
+}
+
+// Python takes a few seconds to start even when it's kept on the device (more on phones): start
+// it in the background once the page is idle, for people building here - never when that would
+// download it (first visit: the build asks first on phones)
+async function prewarmDevice() {
+  if (device.worker || !onDevice() || state.running || document.hidden) return;
+  if (!(await runtimeCached())) return;
+  if (onPhone() && !builtList().length) return;
+  startWorker();
+  device.worker.postMessage({ type: 'init', full_scipy: device.fullScipy });
+}
+
+async function gunzipToUrl(bytes, type) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return URL.createObjectURL(new Blob([await new Response(stream).arrayBuffer()], { type }));
+}
+
+async function onDeviceMessage(e) {
+  const m = e.data;
+  if (m.type === 'setup') { device.ready = true; device.setup = m.setup; }
+  if (m.early) {                      // started ahead of a build
+    if (m.type === 'error') { device.worker?.terminate(); device.worker = null; }
+    return;
+  }
+  if (!state.onDevice) return;
+  if (m.type === 'progress') {
+    setProgress(m.f, m.msg);
+    deviceLog(m.msg);
+  } else if (m.type === 'setup') {
+    const x = m.setup;
+    const secs = (x.runtime_s + x.packages_s + x.code_s).toFixed(1);
+    const where = m.waited_s < 0.5 ? 'started earlier in the background' : `started in ${secs} s`;
+    deviceLog(x.runtime_cached
+      ? `Python ready (${where} from this device: nothing downloaded${x.native ? '' : ', without the Rust extension'})`
+      : `Python ready (${where}${x.native ? '' : ', without the Rust extension'})`);
+    const rf = x.runtime_files;
+    if (rf && !x.runtime_cached && x.secure !== false) {
+      deviceLog(`Python files: ${rf.cached} kept on this device, ${rf.downloaded} downloaded`
+        + (x.downloaded_mb ? ` (${x.downloaded_mb.toFixed(1)} MB)` : '') + (x.scipy ? `, ${x.scipy} SciPy` : '')
+        + ((x.runtime_errors || []).length ? ` (couldn't keep: ${x.runtime_errors.join('; ')})` : ''));
+    }
+    if (x.secure === false) deviceLog('This page is not on a secure connection (https): browsers don\'t let it keep Python or data on this device.');
+  } else if (m.type === 'done') {
+    device.urls.forEach((u) => URL.revokeObjectURL(u));
+    device.urls = [];
+    const f = m.files, r = m.res;
+    const blob = (name, type) => {
+      if (!name || !f[name]) return null;
+      const u = URL.createObjectURL(new Blob([f[name]], { type }));
+      device.urls.push(u);
+      return u;
+    };
+    const urls = { model: blob(r.file, 'model/3mf'), stl: blob(r.stl_file, 'application/zip'), base: blob(r.base_file, 'model/3mf'),
+                   thumb: blob('thumbnail.png', 'image/png'),
+                   preview: await gunzipToUrl(f[`preview_${PREVIEW_LOD}.bin.gz`], 'application/octet-stream') };
+    device.urls.push(urls.preview);
+    const j = { id: localJobId(), state: 'done', result: r, options: device.opts, log: device.log, urls,
+                device: { seconds: m.total_s, downloaded_mb: (r.browser?.net?.bytes || 0) / 1e6,
+                          cache_mb: m.cache?.persistent ? m.cache.hit_mb : null } };
+    state.onDevice = false;
+    rememberBuilt(device.opts);
+    finish();
+    showResult(j);
+    showReview(j);
+  } else if (m.type === 'error') {
+    deviceFailed(m);
+  }
+}
+
+function deviceFailed(m) {
+  if (m.missing_scipy && !device.fullScipy && device.opts) {
+    // the trimmed SciPy (native/trim_scipy.py) lacks a part this model needs: reported so it can be
+    // added; this device switches to the full SciPy (~7 MB more, once) and the build runs again
+    reportDeviceFailure('error', `Trimmed SciPy lacks ${m.missing_scipy}: retried with the full SciPy`, m.trace || '', device.opts);
+    device.fullScipy = true;
+    try { localStorage.setItem(FULL_SCIPY_KEY, '1'); } catch (e) { /* private mode */ }
+    device.worker?.terminate();
+    device.worker = null;
+    deviceLog(`Loading the rest of SciPy (${m.missing_scipy} is needed) and building again`);
+    state.onDevice = false;
+    runOnDevice(device.opts, { retry: true });
+    return;
+  }
+  const started = device.ready;
+  const body = device.opts;
+  const kind = m.error_kind === 'memory' || m.error_kind === 'too_large' ? m.error_kind : started ? 'error' : 'startup';
+  reportDeviceFailure(kind, m.message, m.trace || '', body);
+  state.onDevice = false;
+  finish();
+  if (m.fatal && device.worker) { device.worker.terminate(); device.worker = null; }
+  setProgress(null, `Error: ${m.message}`, true);
+  deviceLog(`Error: ${m.message}`);
+  $('miniDetails').hidden = false;
+  if (kind === 'memory') {
+    const cells = Math.max(150, Math.floor(parseInt($('gridCells').value) * 0.7 / 50) * 50);
+    showFailure({ error_kind: 'memory', device: true, error: 'This browser tab ran out of memory building the model.',
+                  advice: [`Lower Detail (e.g. ${cells} cells).`, 'Close other tabs.'], suggest: { grid_cells: cells }, server: body });
+  } else if (kind === 'too_large') {
+    showFailure({ error_kind: 'too_large', device: true, title: 'This model is too large for this device', error: m.message,
+                  advice: (m.advice || []).filter((a) => !/server/i.test(a)), suggest: m.suggest || {}, server: body });
+  } else {
+    showFailure({ error_kind: kind, device: true, error: m.message, server: body,
+                  title: kind === 'startup' ? "This browser couldn't start the build" : "The model couldn't be built on this device" });
+  }
+}
+
+// a failed build on the device, for review on the server (maptomesh/device_failures.py): the
+// error, the model's settings and facts about the browser - no personal data
+function reportDeviceFailure(kind, message, trace, options) {
+  const x = device.setup;
+  const body = {
+    kind, message: String(message || '').slice(0, 2000), trace: String(trace || '').slice(-8000),
+    stage: (device.log[device.log.length - 1] || '').slice(0, 300), options: options || null,
+    env: {
+      memory_mb: deviceMemoryMb(), device_memory_gb: navigator.deviceMemory ?? null, cores: navigator.hardwareConcurrency ?? null,
+      phone: onPhone(), secure: isSecureContext, seconds: device.t0 ? +((performance.now() - device.t0) / 1000).toFixed(1) : null,
+      python: x ? { ready: true, jspi: x.jspi, native: x.native, pyodide: x.pyodide, runtime_cached: x.runtime_cached } : { ready: false },
+      log: device.log.slice(-15),
+    },
+  };
+  fetch('/api/device-failures', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify(body), keepalive: true }).catch(() => {});
+}
+
+// ------------------------------------------------------------------ phones: confirm the download
+// Before building on a phone (mobile data), show what the build will download: the area's data
+// (server estimate: maptomesh/estimate.py) and, the first time, Python itself. Not asked again for
+// an area already built on this device (its data is in the cache), or after "Don't ask again".
+const RUNTIME_CACHE = 'maptomesh-runtime-pyodide-314.0.8';   // as in web/browser-worker.js
+const RUNTIME_MB = 23;   // Python, its packages and the trimmed SciPy
+const NOASK_KEY = 'maptomesh.dataNoAsk';
+const BUILT_KEY = 'maptomesh.deviceBuilt.v1';
+
+function onPhone() { return COARSE || MOBILE.matches; }
+function dataKey(o) {
+  return [o.lat.toFixed(5), o.lon.toFixed(5), Math.round(o.width_m), Math.round(o.height_m), o.grid_cells, o.source,
+          o.us_source, o.dem_preference, o.surface, o.color_mode].join('|');
+}
+function builtList() { try { return JSON.parse(localStorage.getItem(BUILT_KEY) || '[]'); } catch (e) { return []; } }
+function builtBefore(o) { return builtList().includes(dataKey(o)); }
+function rememberBuilt(o) {
+  if (!o) return;
+  const k = dataKey(o);
+  try { localStorage.setItem(BUILT_KEY, JSON.stringify(builtList().filter((x) => x !== k).concat(k).slice(-100))); } catch (e) { /* full */ }
+}
+async function runtimeCached() {
+  try {
+    if (!(await caches.has(RUNTIME_CACHE))) return false;
+    return !!(await (await caches.open(RUNTIME_CACHE)).match('/__runtime_complete__'));
+  } catch (e) { return false; }
+}
+const fmtMb = (mb) => (mb < 0.1 ? 'under 0.1 MB' : mb < 10 ? `${mb.toFixed(1)} MB` : `${Math.round(mb)} MB`);
+
+function confirmDownload(body) {
+  return new Promise((resolve) => {
+    const dlg = $('dataDialog');
+    let settled = false;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      if (v && $('dataNoAsk').checked) localStorage.setItem(NOASK_KEY, '1');
+      if (dlg.open) dlg.close();
+      resolve(v);
+    };
+    $('dataParts').innerHTML = '<li>Working out the download size…</li>';
+    $('dataNote').textContent = '';
+    $('dataNoAsk').checked = false;
+    $('dataTitle').textContent = 'Download the data on this device?';
+    $('dataGo').onclick = () => done(true);
+    $('dataCancel').onclick = () => done(false);
+    $('dataClose').onclick = () => done(false);
+    dlg.onclose = () => done(false);             // Esc / back gesture
+    dlg.showModal();
+    fillDownload(body).catch(() => {
+      $('dataParts').innerHTML = '';
+      $('dataNote').textContent = "Couldn't work out the download size. Areas with LiDAR point clouds can need 100 MB or more.";
+    });
+  });
+}
+
+async function fillDownload(body) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 25000);
+  try {
+    const [est, cached] = await Promise.all([
+      fetch('/api/estimate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ctl.signal })
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.status)))),
+      runtimeCached(),
+    ]);
+    const rows = est.parts.map((p) => [p.label, p.mb, p.exact]);
+    if (!cached) rows.push([isSecureContext ? 'Python and its libraries (first build only, then kept)' : 'Python and its libraries (every visit on this connection)',
+                            RUNTIME_MB + (device.fullScipy ? 7 : 0), false]);
+    const total = rows.reduce((a, r) => a + r[1], 0);
+    $('dataTitle').textContent = `Download about ${fmtMb(total)}?`;
+    $('dataParts').innerHTML = rows.map(([l, mb, exact]) => `<li><span>${escapeHtml(l)}</span><b>${exact ? '' : '≈ '}${fmtMb(mb)}</b></li>`).join('')
+      + `<li class="total"><span>Total</span><b>≈ ${fmtMb(total)}</b></li>`;
+    $('dataNote').textContent = [...(est.notes || []),
+      isSecureContext ? 'Data this device downloaded before is reused.'
+        : "This page isn't on a secure connection (https), so this device can't keep the downloads: they repeat on every build."].join(' ');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function fmtBytes(n) { return n > 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${(n / 1e3).toFixed(0)} kB`; }
 
+function jobUrls(j) {
+  if (j.urls) return j.urls;     // built on this device: blob URLs
+  const id = j.id;
+  return { model: `/api/jobs/${id}/model.3mf`, stl: `/api/jobs/${id}/stl.zip`, base: `/api/jobs/${id}/base.3mf`,
+           thumb: `/api/jobs/${id}/thumbnail.png?${Date.now()}`, preview: `/api/jobs/${id}/preview.bin?lod=${PREVIEW_LOD}` };
+}
+
 function showResult(j) {
-  const r = j.result, s = r.stats, id = j.id;
+  const r = j.result, s = r.stats, u = jobUrls(j);
   state.lastResult = j;
   const fil = r.filaments.map((f) => `<li><span class="swatch" style="background:${f.color}"></span><b>Filament ${f.slot}</b> ${f.color} — ${f.used_by.join(', ')}</li>`).join('');
   const cc = r.color_changes.length
@@ -806,12 +1173,17 @@ function showResult(j) {
   const projects = (r.data.projects || []).map((p) => p.name + (p.year ? ` (${p.year})` : '')).join(', ');
   $('result').innerHTML = `
     <h2>Result</h2>
-    <img src="/api/jobs/${id}/thumbnail.png?${Date.now()}" alt="Top view">
+    <img src="${u.thumb}" alt="Top view">
     <div class="downloads">
-      <a href="/api/jobs/${id}/model.3mf" download>⬇ 3MF (${fmtBytes(r.file_size)})</a>
-      <a class="alt" href="/api/jobs/${id}/stl.zip" download>STL per colour (.zip)</a>
+      <a href="${u.model}" download="${escapeHtml(r.file)}">⬇ 3MF (${fmtBytes(r.file_size)})</a>
+      <a class="alt" href="${u.stl}" download="${escapeHtml(r.stl_file || 'model_stl.zip')}">STL per colour (.zip)</a>
     </div>
-    ${r.base_file ? `<div class="downloads"><a class="alt" href="/api/jobs/${id}/base.3mf" download>⬇ Base plate 3MF (${fmtBytes(r.base_file_size)}, ${s.base_plate_mm.join(' × ')} mm)</a></div>` : ''}
+    ${r.base_file ? `<div class="downloads"><a class="alt" href="${u.base}" download="${escapeHtml(r.base_file)}">⬇ Base plate 3MF (${fmtBytes(r.base_file_size)}, ${s.base_plate_mm.join(' × ')} mm)</a></div>` : ''}
+    <div class="share-row">
+      <button type="button" class="secondary" id="shareBtn">Share link</button>
+      <input type="text" id="shareUrl" readonly hidden aria-label="Share link">
+    </div>
+    <p class="hint" id="shareMsg">The link holds this model's settings: opening it builds the same model.</p>
     <dl class="stats">
       <dt>Model size</dt><dd>${s.size_mm[0]} × ${s.size_mm[1]} × ${s.size_mm[2]} mm</dd>
       ${s.tile_size_mm ? `<dt>Tiles</dt><dd>${s.tiles} × ${s.tile_size_mm[0]} × ${s.tile_size_mm[1]} mm</dd>` : ''}
@@ -819,6 +1191,7 @@ function showResult(j) {
       <dt>Elevation</dt><dd>${s.elevation_range_m[0]} – ${s.elevation_range_m[1]} m → relief ${s.relief_mm} mm</dd>
       <dt>Resolution</dt><dd>${s.ground_m_per_cell} m / ${s.cell_mm} mm per cell</dd>
       <dt>Mesh</dt><dd>${s.triangles.toLocaleString()} triangles, ${s.parts} parts</dd>
+      ${j.device ? `<dt>Built on</dt><dd>this device in ${j.device.seconds.toFixed(0)} s (${j.device.downloaded_mb.toFixed(1)} MB of data downloaded${j.device.cache_mb >= 0.05 ? `, ${j.device.cache_mb.toFixed(1)} MB reused from earlier downloads` : ''})</dd>` : ''}
       ${s.colour_changes_est != null ? `<dt>Colour changes</dt><dd>≈ ${s.colour_changes_est.toLocaleString()} at 0.2 mm layers (max ${s.max_colours_per_layer} colours in a layer)</dd>` : ''}
       ${r.data.points ? `<dt>LiDAR</dt><dd>${(r.data.points / 1e6).toFixed(1)} M points from ${[r.data.tiles ? `${r.data.tiles} tiles` : '', r.data.ept_nodes ? `${r.data.ept_nodes} USGS octree nodes (AWS)` : ''].filter(Boolean).join(' + ')}</dd>` : ''}
       ${(r.data.sources || []).length ? `<dt>Data sources</dt><dd>${r.data.sources.filter((s) => s.share >= 0.0005).map((s) => `${escapeHtml(s.label)} ${(100 * s.share).toFixed(0)}%`).join('<br>')}</dd>` : ''}
@@ -833,11 +1206,67 @@ function showResult(j) {
     ${notes.length ? `<div class="info warn">${notes.join('<br>')}</div>` : ''}`;
   $('result').hidden = false;
   setProgress(1, `Done · ${s.size_mm[0]} × ${s.size_mm[1]} mm, ${r.filaments.length} colour${r.filaments.length > 1 ? 's' : ''}`);
-  $('miniDownload').href = `/api/jobs/${id}/model.3mf`; $('miniDownload').hidden = false;
+  $('miniDownload').href = u.model; $('miniDownload').hidden = false;
+  if (j.urls) $('miniDownload').download = r.file; else $('miniDownload').removeAttribute('download');
   $('miniDetails').hidden = false;
-  $('topImg').src = `/api/jobs/${id}/thumbnail.png?${Date.now()}`;
-  viewer.load(`/api/jobs/${id}/preview.bin?lod=${PREVIEW_LOD}`);
+  $('topImg').src = u.thumb;
+  $('shareBtn').onclick = () => shareModel(j);
+  viewer.load(u.preview);
   selectTab('view');
+}
+
+// ------------------------------------------------------------------ share links
+// Only the settings go to the server (maptomesh/shares.py), never model files: the link rebuilds
+// the model when it's opened.
+async function shareModel(j) {
+  const msg = $('shareMsg'), btn = $('shareBtn');
+  btn.disabled = true;
+  msg.textContent = 'Creating the link…';
+  try {
+    const r = await fetch('/api/shares', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                           body: JSON.stringify(j.options) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(describeError(d));
+    const url = `${location.origin}/?s=${d.id}`;
+    const box = $('shareUrl');
+    box.value = url; box.hidden = false;
+    if (navigator.share && (COARSE || MOBILE.matches)) {
+      try {
+        await navigator.share({ title: `${j.options.name} - MapToMesh`, url });
+        msg.textContent = 'Opening the link builds this model.';
+        return;
+      } catch (e) { /* dismissed: copy it instead */ }
+    }
+    try {
+      await navigator.clipboard.writeText(url);
+      msg.textContent = 'Link copied. Opening it builds this model.';
+    } catch (e) {
+      box.select();
+      msg.textContent = 'Copy the link above. Opening it builds this model.';
+    }
+  } catch (e) {
+    msg.textContent = `Couldn't create the link: ${e.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// a share link (?s=<id>): load its settings and build the model straight away
+async function openShare(id) {
+  $('progress').hidden = false;
+  setProgress(0, 'Opening the shared model…');
+  let d;
+  try {
+    const r = await fetch(`/api/shares/${encodeURIComponent(id)}`);
+    if (!r.ok) throw new Error(r.status === 404 ? 'this link is unknown' : `the server answered ${r.status}`);
+    d = await r.json();
+  } catch (e) {
+    setProgress(null, `Couldn't open the shared model: ${e.message}.`, true);
+    return;
+  }
+  applyOptions(d.options);
+  for (let i = 0; i < 50 && !LIMITS; i++) await new Promise((res) => setTimeout(res, 100));   // the Detail cap
+  generate({ keepUrl: true });
 }
 
 // ------------------------------------------------------------------ review / problem report
@@ -944,7 +1373,7 @@ async function submitReview(e) {
 
 // ------------------------------------------------------------------ 3D viewer
 const viewer = {
-  renderer: null, scene: null, camera: null, controls: null, group: null, pending: null,
+  renderer: null, scene: null, camera: null, controls: null, group: null, pending: null, frame: 0,
   init() {
     if (this.renderer) return;
     const el = $('viewer');
@@ -961,11 +1390,23 @@ const viewer = {
     sun.position.set(-1, 2, 1.2);
     this.scene.add(sun);
     new ResizeObserver(() => this.resize()).observe(el);
-    const loop = () => { requestAnimationFrame(loop); this.controls.update(); this.renderer.render(this.scene, this.camera); };
-    loop();
+    this.controls.addEventListener('change', () => this.redraw());
+    this.redraw();
+  },
+  // draw only when something changed (the camera moved, a model loaded, a resize), not every
+  // frame: an idle view costs no GPU time or battery
+  redraw() {
+    if (this.frame || !this.renderer) return;
+    this.frame = requestAnimationFrame(() => {
+      this.frame = 0;
+      const easing = this.controls.update();   // damping: keeps moving a little after release
+      this.renderer.render(this.scene, this.camera);
+      if (easing) this.redraw();
+    });
   },
   setBackground() {   // follows the colour theme
     if (this.scene) this.scene.background = new THREE.Color(getComputedStyle($('viewer')).backgroundColor);
+    this.redraw();
   },
   resize() {
     const el = $('viewer');
@@ -973,6 +1414,7 @@ const viewer = {
     this.renderer.setSize(el.clientWidth, el.clientHeight);
     this.camera.aspect = el.clientWidth / el.clientHeight;
     this.camera.updateProjectionMatrix();
+    this.redraw();
   },
   async load(url) {
     if ($('viewer').hidden) { this.pending = url; return; }
@@ -1019,6 +1461,8 @@ const viewer = {
       this.camera.position.set(c.x - d * 0.1, c.y + d * 0.75, c.z + d * 0.85);
     }
     this.camera.near = d / 100; this.camera.far = d * 20; this.camera.updateProjectionMatrix();
+    this.controls.update();
+    this.redraw();
     $('viewerMsg').hidden = true;
     if (header.simplified) {
       const m = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} M` : `${Math.round(n / 1e3)} k`);
@@ -1091,7 +1535,7 @@ $('miniDetails').onclick = (e) => {
   setTimeout(() => target.scrollIntoView({ block: 'start', behavior: 'smooth' }), 280);
 };
 $('mobileGenerate').onclick = () => {
-  if (state.running) { if (state.jobId) fetch(`/api/jobs/${state.jobId}/cancel`, { method: 'POST' }); } else generate();
+  if (state.running) cancelJob(); else generate();
 };
 // swipe / tap on the header (not on its buttons and links)
 let sheetDrag = null;
@@ -1149,6 +1593,55 @@ applyTheme();
 
 // ------------------------------------------------------------------ about / donate
 const ABOUT_KEY = 'maptomesh.about.seen.v1';
+// ------------------------------------------------------------------ failure dialog
+const FAIL_TITLES = {
+  timeout: 'The model took too long',
+  memory: 'The model needed too much memory',
+  too_large: 'This model is too large for the server',
+  busy: 'The server is busy',
+};
+let failSuggest = null;
+let failServerBody = null;
+function showFailure(j) {
+  const dlg = $('failDialog');
+  $('failTitle').textContent = j.title || FAIL_TITLES[j.error_kind] || "The model couldn't be built";
+  $('failCause').textContent = j.error || '';
+  const advice = j.advice || [];
+  $('failAdvice').innerHTML = advice.map((a) => `<li>${escapeHtml(a)}</li>`).join('');
+  $('failAdviceHead').hidden = !advice.length;
+  const stats = [];
+  if (j.seconds) stats.push(`stopped after ${Math.round(j.seconds)} s`);
+  if (j.peak_mb) stats.push(`peak memory ${(j.peak_mb / 1000).toFixed(1)} GB`);
+  if (LIMITS && !j.device && (j.error_kind === 'timeout' || j.error_kind === 'memory'))
+    stats.push(`limits: ${Math.round(LIMITS.timeout_s / 60)} min, ${(LIMITS.memory_mb / 1000).toFixed(1)} GB`);
+  $('failStats').textContent = stats.length ? stats.join(' · ') : '';
+  failSuggest = j.suggest && j.suggest.grid_cells ? j.suggest : null;
+  const retry = $('failRetry');
+  retry.hidden = !failSuggest && j.error_kind !== 'busy';
+  retry.textContent = failSuggest ? `Retry at ${failSuggest.grid_cells} cells` : 'Retry';
+  // a build that failed on this device can go to the server (if the server accepts that detail)
+  const scap = j.server ? gridCap('server') : null;
+  failServerBody = j.server && (scap == null || j.server.grid_cells <= scap) ? j.server : null;
+  $('failServer').hidden = !failServerBody;
+  if (!dlg.open) dlg.showModal();
+}
+$('failOk').onclick = () => $('failDialog').close();
+$('failClose').onclick = () => $('failDialog').close();
+$('failDialog').addEventListener('click', (e) => { if (e.target === $('failDialog')) $('failDialog').close(); });
+$('failRetry').onclick = () => {
+  $('failDialog').close();
+  if (failSuggest) {
+    $('gridCells').value = failSuggest.grid_cells;
+    $('gridCells').dispatchEvent(new Event('input', { bubbles: true }));
+    saveSettings();
+  }
+  generate({ keepUrl: true });
+};
+$('failServer').onclick = () => {   // this model only: the next one is built on the device again
+  $('failDialog').close();
+  if (failServerBody) generate({ keepUrl: true, target: 'server' });
+};
+
 const aboutDialog = $('aboutDialog');
 function openAbout() { if (!aboutDialog.open) aboutDialog.showModal(); }
 aboutDialog.addEventListener('close', () => localStorage.setItem(ABOUT_KEY, '1'));
@@ -1173,6 +1666,7 @@ aboutDialog.querySelectorAll('.copy').forEach((btn) => {
 
 // ------------------------------------------------------------------ wiring
 buildColorInputs();
+initBuildTarget();
 loadSettings();
 fillPresets();
 enforceAspect('w');
@@ -1185,9 +1679,11 @@ scheduleUsCoverage();
 // reopen a finished job from the URL (?job=<id>); &embed=1 shows only the 3D view (link previews,
 // screenshots: the preview image in the page's <head> metadata is rendered this way)
 const jobParam = new URLSearchParams(location.search).get('job');
+const shareParam = new URLSearchParams(location.search).get('s');
 if (jobParam && new URLSearchParams(location.search).get('embed') === '1') document.body.classList.add('embed');
-// first visit: introduce the tool (not over a shared result link - the About link is always there)
-if (!jobParam && !localStorage.getItem(ABOUT_KEY)) openAbout();
+// first visit: introduce the tool (not over a shared link - the About link is always there)
+if (!jobParam && !shareParam && !localStorage.getItem(ABOUT_KEY)) openAbout();
+if (shareParam && !jobParam) openShare(shareParam);
 if (jobParam) {
   fetch(`/api/jobs/${jobParam}`).then((r) => (r.ok ? r.json() : null)).then((j) => {
     if (j && j.state === 'done') { state.jobId = j.id; applyOptions(j.options); showResult(j); showReview(j); }
@@ -1199,18 +1695,23 @@ $('centerBtn').onclick = () => { const c = map.getCenter(); state.center = { lat
 $('shape').onchange = () => { enforceAspect('w'); redrawSelection(); saveSettings(); };
 $('widthKm').oninput = () => { enforceAspect('w'); redrawSelection(); };
 $('heightKm').oninput = () => { enforceAspect('h'); redrawSelection(); };
-$('colorMode').onchange = () => { fillPresets(); updateDerived(); saveSettings(); };
+$('colorMode').onchange = () => { fillPresets(); updateDerived(); saveSettings(); scheduleCoverage(); };
 $('preset').onchange = applyPreset;
 $('bandCount').oninput = () => { renderBandInputs(); saveSettings(); };
 $('usSource').addEventListener('change', () => { scheduleUsCoverage(); scheduleCoverage(); });
 $('source').addEventListener('change', scheduleCoverage);
+$('demPref').addEventListener('change', scheduleCoverage);
+for (const id of ['gridCells', 'colorMode', 'surface', 'source', 'widthKm', 'heightKm'])
+  $(id).addEventListener('input', updateGridCap);
+$('surface').addEventListener('change', scheduleCoverage);
 $('showCoverage').onchange = () => {
   scheduleUsCoverage();
   if (!coverageLayer) return;
   if ($('showCoverage').checked) { coverageLayer.addTo(map); selection.bringToFront(); } else map.removeLayer(coverageLayer);
 };
-$('generateBtn').onclick = generate;
-$('cancelBtn').onclick = () => state.jobId && fetch(`/api/jobs/${state.jobId}/cancel`, { method: 'POST' });
+$('generateBtn').onclick = () => generate();
+if (!shareParam) (window.requestIdleCallback || ((f) => setTimeout(f, 2000)))(() => prewarmDevice(), { timeout: 5000 });
+$('cancelBtn').onclick = cancelJob;
 for (const id of ['baseSeparate', 'label', 'gridCells', 'smoothing', 'cliffSmoothing', 'sizeMm', 'zEx', 'tilesX', 'tilesY', 'frame', 'cornerMm', 'elevWater']) {
   $(id).addEventListener('input', () => { if (id === 'sizeMm' || id === 'cornerMm') redrawSelection(); else updateDerived(); });
 }

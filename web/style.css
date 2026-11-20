@@ -54,6 +54,7 @@ input[readonly] { background: var(--soft); color: var(--ink-2); }
 .row { display: flex; gap: 10px; }
 .row > * { flex: 1; min-width: 0; }
 .hint { color: var(--muted); font-size: 12px; margin: 2px 0; }
+.hint.warn { color: var(--warn-ink); background: var(--warn-bg); border-radius: 4px; padding: 2px 6px; display: block; }
 .info { font-size: 12px; background: var(--soft); border-radius: 6px; padding: 8px; margin-top: 6px; }
 .info.warn { background: var(--warn-bg); color: var(--warn-ink); }
 .info.err { background: var(--err-bg); color: var(--err); }
@@ -95,6 +96,9 @@ button.secondary.active { background: var(--ink); color: var(--panel); border-co
 .downloads { display: flex; gap: 8px; margin: 10px 0; }
 .downloads a { flex: 1; text-align: center; text-decoration: none; padding: 9px; border-radius: 6px; background: var(--ink); color: var(--panel); font-weight: 600; }
 .downloads a.alt { background: var(--soft-2); color: var(--ink); border: 1px solid var(--btn-line); font-weight: 500; }
+.share-row { display: flex; gap: 8px; align-items: center; margin: 4px 0 0; }
+.share-row button { flex: none; }
+.share-row input { flex: 1; min-width: 0; font-size: 12px; }
 
 /* ---- map */
 .leaflet-container.drawing { cursor: crosshair; touch-action: none; }  /* drawing with a finger must not pan the page */
@@ -142,6 +146,17 @@ button.secondary.active { background: var(--ink); color: var(--panel); border-co
   max-height: calc(100vh - 48px); max-height: calc(100dvh - 48px); overscroll-behavior: contain;
   box-shadow: 0 20px 60px rgba(0, 0, 0, .3); color: var(--ink); background: var(--panel); }
 #aboutDialog::backdrop { background: rgba(20, 22, 26, .55); }
+#failDialog, #dataDialog { border: none; border-radius: 12px; padding: 0; width: min(500px, calc(100vw - 32px));
+  max-height: calc(100dvh - 48px); box-shadow: 0 20px 60px rgba(0, 0, 0, .3); color: var(--ink); background: var(--panel); }
+#failDialog::backdrop, #dataDialog::backdrop { background: rgba(20, 22, 26, .55); }
+#dataParts li { display: flex; justify-content: space-between; gap: 12px; }
+#dataParts li b { white-space: nowrap; }
+#dataParts li.total { border-top: 1px solid var(--btn-line); padding-top: 4px; list-style: none; margin-left: -20px; padding-left: 20px; }
+.fail-cause { font-size: 15px; color: var(--ink); }
+.fail-sub { margin-bottom: 2px !important; font-weight: 600; }
+.fail-stats { font-size: 12px; color: var(--muted); }
+.fail-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; flex-wrap: wrap; }
+.fail-actions button { width: auto; flex: 0 0 auto; padding: 8px 16px; }
 .about { position: relative; padding: 22px 24px 20px; font-size: 14px; line-height: 1.5; }
 .about h2 { font-size: 20px; text-transform: none; letter-spacing: 0; color: var(--ink); margin: 0 0 4px; padding-right: 30px; }
 .about-lead { margin: 0 0 10px; color: var(--ink-2); font-size: 15px; }

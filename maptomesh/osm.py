@@ -218,6 +218,11 @@ def _get_tile(url_tmpl: str, z: int, x: int, y: int) -> bytes:
     return b""
 
 
+def _prefetch_tiles(url_tmpl: str, z: int, coords: list[tuple[int, int]]) -> None:
+    """Hook: download the tiles ``_get_tile`` is about to read, all at once. The server's thread
+    pool needs none; in the browser (no threads) ``maptomesh.browser`` replaces it."""
+
+
 def fetch_osm(aoi: AOI, grid: Grid, roads: str, water: bool, buildings: bool = False,
               progress=None) -> dict:
     layers = set()
@@ -240,6 +245,7 @@ def fetch_osm(aoi: AOI, grid: Grid, roads: str, water: bool, buildings: bool = F
     xs, ys = _tile_range(bbox, z)
     url = _tiles_url()
     coords = [(x, y) for x in xs for y in ys]
+    _prefetch_tiles(url, z, coords)
     feats: list[dict] = []
     done = 0
     with cf.ThreadPoolExecutor(max_workers=8) as ex:
@@ -261,8 +267,10 @@ def rasterize_osm(data: dict, aoi: AOI, grid: Grid, mm_per_m: float, min_width_m
                   road_scale: float = 1.0, road_level: str = "medium", stream_level: str = "all",
                   river_min_width_mm: float = 0.8) -> dict[str, np.ndarray]:
     """Return {'water' (areas), 'waterways' (lines), 'roads', 'bridges', 'buildings'} vertex-grid
-    masks. ``bridges`` are road / rail / foot bridges whatever ``road_level`` is (the structure
-    matters even when roads aren't shown); pass ``road_level="none"`` to get only those."""
+    masks and 'building_h' (tallest OpenMapTiles ``render_height`` per vertex, m; NaN off
+    buildings: the tagged height, else levels x ~3.7 m, else a default). ``bridges`` are road /
+    rail / foot bridges whatever ``road_level`` is (the structure matters even when roads aren't
+    shown); pass ``road_level="none"`` to get only those."""
     from pyproj import Transformer
 
     shape = grid.vshape
@@ -274,6 +282,8 @@ def rasterize_osm(data: dict, aoi: AOI, grid: Grid, mm_per_m: float, min_width_m
 
     water = np.zeros(shape, bool)
     bld = np.zeros(shape, bool)
+    bld_h = np.full(shape, np.nan, np.float32)
+    raised = []       # building parts that start above the ground (render_min_height)
     road_lines, water_lines, bridge_lines = [], [], []
     min_hw = (min_width_mm / mm_per_m) / grid.step / 2 if mm_per_m > 0 else 0.5
     wanted_roads = ROAD_LEVELS.get(road_level, set())
@@ -308,8 +318,40 @@ def rasterize_osm(data: dict, aoi: AOI, grid: Grid, mm_per_m: float, min_width_m
             for p in parts:
                 road_lines.append((p, max(wm / grid.step / 2, min_hw)))
         elif layer == "building" and f["type"] == "polygon":
-            bld |= fill_polygon(parts, shape)
+            box = _fill_box(parts, shape)
+            if box is None:
+                continue
+            sl, m = box
+            bld[sl] |= m
+            h = props.get("render_height")
+            if isinstance(h, (int, float)) and h > 0:
+                lo = props.get("render_min_height")
+                if isinstance(lo, (int, float)) and lo > 0:
+                    raised.append((sl, m, h))
+                else:
+                    view = bld_h[sl]
+                    view[m] = np.fmax(view[m], h)
+    for sl, m, h in raised:
+        # only over a building that stands on the ground (a tower over its podium); canopies and
+        # skybridges over streets would print as solid walls
+        view = bld_h[sl]
+        on = m & np.isfinite(view)
+        view[on] = np.fmax(view[on], h)
     waterways = rasterize_lines(water_lines, shape)
     roads = rasterize_lines(road_lines, shape)
     bridges = rasterize_lines(bridge_lines, shape)
-    return {"water": water, "waterways": waterways, "roads": roads, "bridges": bridges, "buildings": bld}
+    return {"water": water, "waterways": waterways, "roads": roads, "bridges": bridges, "buildings": bld,
+            "building_h": bld_h}
+
+
+def _fill_box(parts: list[np.ndarray], shape: tuple[int, int]):
+    """fill_polygon within the polygon's bounding box (a building covers a few cells; filling the
+    whole grid per building was most of the rasterising time): (slices, mask) or None."""
+    pts = np.concatenate(parts)
+    c0, c1 = max(int(np.floor(pts[:, 0].min())), 0), min(int(np.ceil(pts[:, 0].max())) + 1, shape[1])
+    r0, r1 = max(int(np.floor(pts[:, 1].min())), 0), min(int(np.ceil(pts[:, 1].max())) + 1, shape[0])
+    if c1 <= c0 or r1 <= r0:
+        return None
+    off = np.array([c0, r0], dtype=np.float64)
+    m = fill_polygon([p - off for p in parts], (r1 - r0, c1 - c0))
+    return (slice(r0, r1), slice(c0, c1)), m

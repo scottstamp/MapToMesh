@@ -9,6 +9,9 @@
 * Hong Kong: CEDD 2020 airborne LiDAR 0.5 m DTM + DSM, one zipped GeoTIFF per 750 x 600 m sheet
   (HK1980 Grid, EPSG:2326, heights in mPD) on bulkdata.csdi.gov.hk, found through an ArcGIS
   FeatureServer sheet index.
+* Philippines: Taal Open LiDAR (UP TCAGP, DREAM / Phil-LiDAR 1, 2014-17): 1 m DTM + DSM GeoTIFFs per
+  1 km UTM 51N tile within ~20 km of Taal Volcano, in a public S3 bucket; the tile list comes from
+  the project's map page. CC BY-SA 4.0 (ShareAlike): a licence warning goes with the model.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import threading
 import warnings
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -24,7 +28,7 @@ import numpy as np
 import requests
 
 from ..dem import DemArrays, DemProvider, register, want_dsm
-from ..dem_readers import merge_fill, reproject_array, service_get, zoom_for
+from ..dem_readers import merge_fill, read_cog, reproject_array, service_get, src_bbox, zoom_for
 from ..httpcache import RANGE_CACHE
 
 WORKERS = 4                      # parallel requests per host (be gentle)
@@ -61,16 +65,21 @@ WEB_MERC = 2 * math.pi * 6378137.0
 
 
 def _decode_gsi(data: bytes) -> np.ndarray | None:
-    from rasterio.errors import NotGeoreferencedWarning
-    from rasterio.io import MemoryFile
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", NotGeoreferencedWarning)
-        with MemoryFile(data) as mf, mf.open() as src:
-            px = src.read()
-            if src.count == 1:                    # paletted PNG
-                cmap = src.colormap(1)
-                lut = np.array([cmap.get(i, (0, 0, 0, 0)) for i in range(256)], np.uint8)
-                px = np.moveaxis(lut[px[0]], -1, 0)
+    try:
+        from rasterio.errors import NotGeoreferencedWarning
+        from rasterio.io import MemoryFile
+    except ImportError:   # in the browser (Pyodide): Pillow, palettes expanded
+        from ..dem_readers import decode_png
+        px = np.moveaxis(decode_png(data), -1, 0)
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", NotGeoreferencedWarning)
+            with MemoryFile(data) as mf, mf.open() as src:
+                px = src.read()
+                if src.count == 1:                    # paletted PNG
+                    cmap = src.colormap(1)
+                    lut = np.array([cmap.get(i, (0, 0, 0, 0)) for i in range(256)], np.uint8)
+                    px = np.moveaxis(lut[px[0]], -1, 0)
     rgb = px[:3].astype(np.int64)
     x = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]
     h = np.where(x < 2 ** 23, x, x - 2 ** 24).astype(np.float32) * 0.01
@@ -135,6 +144,9 @@ def _gsi_tiles(layer: str, z: int, tiles, cancel) -> dict[tuple[int, int], np.nd
         data = _get(GSI_URL.format(layer=layer, z=z, x=t[0], y=t[1]), 1 << 22)
         return t, (_decode_gsi(data) if data else None)
 
+    from ..httpcache import hint
+    for t in tiles:
+        hint(GSI_URL.format(layer=layer, z=z, x=t[0], y=t[1]), 0, 1 << 22)
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         got = {t: a for t, a in ex.map(one, tiles) if a is not None}
     _cancelled(cancel)
@@ -165,7 +177,7 @@ def _gsi_with_data(layer: str, z: int, tiles, cancel, up: int = 3) -> list[tuple
 def _gsi_level(layer: str, z: int, tiles, aoi, grid, cancel) -> tuple[np.ndarray | None, int, int]:
     """Fetch tiles of one layer and put the mosaic on the vertex grid.
     Returns (grid array or None, tiles requested, tiles with data)."""
-    from rasterio.transform import Affine
+    from affine import Affine
 
     got = _gsi_tiles(layer, z, tiles, cancel)
     if not got:
@@ -250,7 +262,7 @@ HK_NATIVE = 0.5
 
 def _hk_sheet(data: bytes | None, aoi, grid) -> np.ndarray | None:
     """Zipped sheet GeoTIFF -> vertex grid (block average when the grid is much coarser)."""
-    from rasterio.io import MemoryFile
+    from ..dem_readers import read_raster_bytes
     if not data:
         return None
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -258,17 +270,18 @@ def _hk_sheet(data: bytes | None, aoi, grid) -> np.ndarray | None:
         if name is None:
             return None
         tif = zf.read(name)
-    with MemoryFile(tif) as mf, mf.open() as src:
-        arr = src.read(1)
-        nd = src.nodata if src.nodata is not None else -9999.0
-        crs = src.crs or 2326
-        tf = src.transform
+    src = read_raster_bytes(tif)
+    arr = src.arr
+    nd = src.nodata if src.nodata is not None else -9999.0
+    crs = src.crs or 2326
+    tf = src.transform
     resampling = "average" if grid.step > 2 * HK_NATIVE else "bilinear"
     return reproject_array(arr, tf, crs, aoi, grid, nodata=nd, resampling=resampling)
 
 
 class HongKongLidar2020(DemProvider):
     key = "hk_cedd_lidar2020"
+    read_kind = "file"   # download estimates (maptomesh.estimate)
     label = "CEDD LiDAR 2020 0.5 m (Hong Kong)"
     res_m = 0.5
     has_dsm = True
@@ -319,5 +332,73 @@ class HongKongLidar2020(DemProvider):
         return DemArrays(dtm, dsm if np.isfinite(dsm).any() else None, detail)
 
 
+# ---------------------------------------------------------------- Philippines (Taal, CC BY-SA)
+
+TAAL_BUCKET = "https://phil-lidar-taal-s3.s3.us-east-2.amazonaws.com/"
+TAAL_GRID = "https://phillidar-dad.github.io/data/taal-20km-grid.js"   # 1 km tile index (GeoJSON in JS)
+TAAL_TERMS = "https://phillidar-dad.github.io/taal-open-lidar.html"
+_taal_index: dict = {}
+_taal_lock = threading.Lock()
+
+
+def _taal_tiles() -> dict[str, tuple[bool, bool]]:
+    """{gridref ``E283N1550`` (UTM 51N km of the west / north edge): (has DTM, has DSM)}."""
+    with _taal_lock:
+        if not _taal_index:
+            txt = service_get(TAAL_GRID, timeout=60, allow_xml=True).decode("utf-8")
+            fc = json.loads(txt[txt.index("{"):].rstrip().rstrip(";"))
+            for f in fc.get("features", []):
+                p = f.get("properties", {})
+                if p.get("GRIDREF"):
+                    _taal_index[p["GRIDREF"]] = (p.get("DTM") == 1, p.get("DSM") == 1)
+        return _taal_index
+
+
+class TaalLidar(DemProvider):
+    key = "phl_taal_lidar_1m"
+    label = "Taal Volcano LiDAR 1 m 2014-17 (Philippines, CC BY-SA)"
+    res_m = 1.0
+    has_dsm = True
+    attribution = ("LiDAR data © UP Training Center for Applied Geodesy and Photogrammetry (UP TCAGP), "
+                   "DREAM / Phil-LiDAR 1 Program (Taal Open LiDAR), CC BY-SA 4.0")
+    licence = f"CC BY-SA 4.0, provisional (https://creativecommons.org/licenses/by-sa/4.0/; {TAAL_TERMS})"
+    licence_note = ("Taal Volcano LiDAR 2014-17 (UP TCAGP, DREAM / Phil-LiDAR 1) is under CC BY-SA 4.0 "
+                    "(ShareAlike; the programme calls the licence provisional): credit UP TCAGP and the Phil-LiDAR "
+                    "Program, share models or files made from it under the same licence, and note that the "
+                    "programme's FAQ asks for derived products to stay open and free: check before selling prints "
+                    "of this area; terms: " + TAAL_TERMS)
+    regions = ((120.78, 13.80, 121.21, 14.22),)
+    max_area_km2 = 25.0          # 1 km GeoTIFFs of 4.8 MB (uncompressed), DTM + DSM: ~0.25 GB at 25 km2
+    sample = (14.0750, 121.1500, 2000)   # Tanauan, east of Taal Lake (the lake itself has no data)
+    prefer = 2
+
+    def fetch(self, aoi, grid, progress, cancel):
+        index = _taal_tiles()
+        x0, y0, x1, y1 = src_bbox(aoi, grid, 32651)          # WGS 84 / UTM 51N
+        refs = [f"E{i}N{j + 1}" for i in range(int(x0 // 1000), int(x1 // 1000) + 1)
+                for j in range(int(y0 // 1000), int(y1 // 1000) + 1)]
+        jobs = [(ref, kind) for ref in refs if ref in index
+                for kind, ok in zip(("DTM", "DSM"), index[ref]) if ok and (kind == "DTM" or want_dsm())]
+        dtm = np.full(grid.vshape, np.nan)
+        dsm = np.full(grid.vshape, np.nan)
+
+        def one(job):
+            ref, kind = job
+            if cancel.is_set():
+                return job, None
+            return job, read_cog(f"{TAAL_BUCKET}Taal_{kind}/{ref}_{kind}.tif", aoi, grid)
+
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            for k, ((ref, kind), part) in enumerate(ex.map(one, jobs)):
+                _cancelled(cancel)
+                progress(k / max(len(jobs), 1), f"Taal LiDAR {ref} {kind}")
+                merge_fill(dtm if kind == "DTM" else dsm, part)
+        dsm = np.where(np.isfinite(dtm), dsm, np.nan)
+        used = sorted({ref for ref, _ in jobs})
+        return DemArrays(dtm, dsm if np.isfinite(dsm).any() else None,
+                         f"{len(used)} tiles: " + ", ".join(used[:12]) + (" ..." if len(used) > 12 else ""))
+
+
 register(GsiDem())
 register(HongKongLidar2020())
+register(TaalLidar())

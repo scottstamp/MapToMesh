@@ -2,9 +2,22 @@
 
 Status: **implemented** (2026-11-19) in `maptomesh/providers/` (one module per region) on top of
 `maptomesh/dem.py` (best-available composite) and `maptomesh/dem_readers.py`; the README's
-"Elevation sources" table lists what is live. Not implemented: Sweden / Denmark (accounts),
-Norway (unreachable from here), AHN6 COPC (undocumented), Czech ImageServer (slow), the heavy
-plain-LAZ downloads, ELVIS. Research notes below are kept for reference.
+"Elevation sources" table lists what is live. Not implemented directly: Sweden / Denmark
+(accounts), Norway (unreachable from here), AHN6 COPC (undocumented), Czech ImageServer (slow),
+the heavy plain-LAZ downloads, ELVIS.
+
+**Update (2026-11-19): Mapterhorn** (`maptomesh/providers/mapterhorn.py`, https://mapterhorn.com)
+serves ~150 open DTMs as one set of PMTiles: Denmark, Norway, Sweden, Portugal, Romania, Czechia,
+Slovakia, Spain 0.5-2 m, Italian regions, Tasmania, the remaining German states and more are now
+covered through it, and at equal detail it is preferred over the agencies' own services (see the
+README's *Mapterhorn* section for the comparison). Japan's data there is GSI's raw 基盤地図情報
+(licence warning; GSI's tiles stay first). Research notes below are kept for reference.
+
+**Update (2026-11-19): restricted licences.** The collections under *Licence traps* are now used
+where they can be reached anonymously, with a licence warning on every model that uses them and
+ranked after unrestricted data of equal detail: FABDEM, ALOS AW3D30, Tuscany 1 m, Lithuania
+DTM-LT-1m, Flanders DHMV II point clouds, the MDBA river-corridor DEMs and Taal. Skipped: TanDEM-X
+90 m and Sweden's laser data (accounts required). See the table at the end.
 
 Every source was probed on 2026-11-19 from St. John's, NL.
 **Verified** means a request returned the stated result: an HTTP status, a successful range read, or a parsed
@@ -176,15 +189,24 @@ headers.
 
 ## Licence traps (collections that look open but can't be used for sold prints)
 
-| Collection | Problem |
-|---|---|
-| Scotland Phase II LAZ and several Historic Environment Scotland sets | Non-Commercial Government Licence |
-| Tuscany 2019–21 1 m DTM | CC BY-NC-SA |
-| Flanders DHMV II point cloud | Restricted to "taken van algemeen belang" (public-interest tasks) |
-| FABDEM, TanDEM-X 90 m | Non-commercial |
-| Lithuania DTM-LT-1m on ArcGIS Online | Non-commercial, Esri-only |
-| ALOS AW3D30 | Commercial use allowed, but JAXA must be **notified in advance** |
-| Philippines Taal LiDAR | Provisional CC BY-SA (ShareAlike) |
-| Japan raw 基盤地図情報 DEM downloads, smartmaps/japan-geotiff-dem | Survey Act approval needed. GSI *tiles* are fine. |
-| MDBA river-corridor DEMs (Australia) | No licence stated |
-| Sweden laser data | Commercial use allowed, but the licensee takes on GDPR obligations |
+**Update (2026-11-19): restricted sources are now included.** MapToMesh is run as a free service,
+so the licence conditions fall to whoever uses a model: restricted data is used, ranked after
+unrestricted data of equal effective resolution (`prefer = 2`), and every model that uses it
+carries a licence warning (`licence_note` / `DemArrays.licence_notes`) naming the dataset, the
+restriction, what to check before selling prints, and the terms URL, plus the required credit
+line. Only sources reachable anonymously are used: no accounts, credentials, login walls,
+browser-only checks or requester-pays buckets. Probed 2026-11-19 with `tests/probe_sources.py`.
+
+| Collection | Problem | Status |
+|---|---|---|
+| Scotland Phase II/III, several Historic Environment Scotland sets | Non-Commercial Government Licence (HES); Fugro keeps the commercial copyright (II/III) | **Included** (already): DTM/DSM COGs, used after every unrestricted collection, per-collection warnings. Phase II LAZ point clouds not used (plain 58 MB/km² LAZ, no COPC). |
+| Tuscany 2019–21 1 m DTM (Italian Remote Sensing) | CC BY-NC-SA, distributed for public bodies | **Included**: `rt_tos_dtm1m_irs`, Geoscopio WMS `wmsmorfologia` GetMap `image/tiff` (real float32, EPSG:25832, 0 = outside the surveys, 4096 px limit). Monte Amiata 1663–1731 m. Mapterhorn's open TINITALY 10 m ranks first on grids ≥ 20 m. The 2021 photogrammetric DSM (`iddsm2021.1m.rt`, Regione Toscana, no licence stated) is not used. |
+| Flanders DHMV II point cloud | Official metadata: raw LiDAR for public-interest tasks ("taken van algemeen belang") only; the Flai mirror lists the free open data licence v1.2 | **Included**: `flai_be_vl`, Flai COPC mirror `BE/EODaS/LiDAR_DHMV_II-2013-2015` (EPSG:31370, 78 809 strip tiles, classes 1/2/9). Point clouds outrank all elevation models and have no preference order, so it is only offered for areas up to ~1.2 km (cells < 2 m at 600 cells), where it is finer than the open DHMV II 1 m DTM/DSM; ground matches that DTM to +2 cm (median) at Kemmelberg. |
+| FABDEM V1-2 | CC BY-NC-SA 4.0 (non-commercial; commercial licences from Fathom) | **Included**: `fabdem`, Fondazione LINKS COG copy on Hugging Face (`huggingface.co/buckets/links-ads/fabdem/resolve/tiles/<10° folder>/<tile>_FABDEM_V1-2.tif`, anonymous, redirect to a CDN, range requests; STAC `collection.json` lists the 19 011 tiles). Sea is stored as 0 m and treated as no data. Bare earth, so it ranks **before** Copernicus (surface model) at 30 m: land with nothing finer gets the non-commercial warning. |
+| TanDEM-X 90 m | Scientific use only, licence accepted at registration | **Skipped**: downloads need an EOC Geoservice account (registration + login); the public WMS would bypass the licence acceptance. 90 m is coarser than Copernicus anyway. |
+| Lithuania DTM-LT-1m on ArcGIS Online | HNIT-Baltic service terms: non-commercial, inside Esri ArcGIS only; no distribution or reproduction without written consent | **Included**: `hnit_dtm_lt_1m`, the public item's ImageServer `utility.arcgis.com/usrsvcs/servers/fef66dec83c14b0295180ecafa662aa0/rest/services/DTM_LT2020/ImageServer` (`exportImage`, F32, EPSG:3346, 15000 × 4100 px limit). Note the "ArcGIS only" condition binds the service's user, i.e. MapToMesh itself, not just the buyer of a print. Only source for Lithuania (Mapterhorn excludes it). The Flai mirror also holds NŽT point clouds (`LT/NZT/2017`, `2019-2022`, `2025-2026` COPC) and Flai-derived 0.5 m DEMs with no licence stated; not used. |
+| ALOS AW3D30 | Commercial use allowed, but JAXA asks to be **notified in advance**; credit ©JAXA | **Included**: `jaxa_aw3d30`, Microsoft Planetary Computer `alos-dem` COGs (`ALPSMLC30_N035E138_DSM.tif`, anonymous SAS token per container). Surface model, ranks after Copernicus: a fallback when Copernicus can't be read. JAXA's EORC site was down for maintenance during this check; the notification clause is from the earlier research. |
+| Philippines Taal LiDAR | Provisional CC BY-SA 4.0 (ShareAlike; the FAQ asks for derived products to stay open and free) | **Included**: `phl_taal_lidar_1m`, public S3 `phil-lidar-taal-s3` (`Taal_DTM/E{x}N{y}_DTM.tif`, `Taal_DSM/...`, 1 km UTM 51N tiles, 4.8 MB uncompressed) with the tile list from the project's map page (`taal-20km-grid.js`, 1 275 tiles with DTM/DSM). Taal Lake has no data. The Entwine point cloud of the volcano island is not used. |
+| Japan raw 基盤地図情報 DEM downloads, smartmaps/japan-geotiff-dem | Survey Act approval needed. GSI *tiles* are fine. | Used through Mapterhorn with a warning (GSI's tiles first). |
+| MDBA river-corridor DEMs (Australia) | No licence stated on most services; Chowilla 2003 has contractor conditions (use only for the commissioned purpose); some state CC BY 3.0 AU | **Included**: `mdba_lidar`, 24 ImageServers under `gis.mdba.gov.au/arcgis/rest/services/ELEVATION` (0.5–5 m, 2003–2021, `exportImage` F32 with `noData=-9999`; the SRTM DEM-H service is not used). Finest first, CC BY surveys before unlicensed ones at equal resolution; the warning names the unlicensed surveys actually used. GA 5 m / Queensland 1 m rank first at equal detail. |
+| Sweden laser data | Commercial use allowed, but the licensee takes on GDPR obligations | **Skipped**: Lantmäteriet's STAC (`api.lantmateriet.se/stac-hojd/v1`) is public, but its COPC / COG assets answer 401 (HTTP Basic, Geotorget account). The Flai mirror's `SE/LANTMATERIET/Laserdata_Skog` is empty. Sweden's open 1 m DEM (Markhöjdmodell, CC0) is already used through Mapterhorn. |

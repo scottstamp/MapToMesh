@@ -245,6 +245,7 @@ def _ign_wms(layer: str, native: float, aoi, grid, cancel, max_px: int = 4000) -
 
 class IgnLidarHdMnt(DemProvider):
     key = "ign_lidarhd_mnt"
+    read_kind = "service"   # download estimates (maptomesh.estimate)
     label = "IGN LiDAR HD 0.5 m (France)"
     res_m = 0.5
     has_dsm = True
@@ -267,6 +268,7 @@ class IgnLidarHdMnt(DemProvider):
 
 class IgnRgeAlti(DemProvider):
     key = "ign_rgealti"
+    read_kind = "service"   # download estimates (maptomesh.estimate)
     label = "IGN RGE ALTI 1 m (France)"
     res_m = 1.0
     attribution = IGN_ATTRIB + " - RGE ALTI"
@@ -373,20 +375,35 @@ class SwissAlti3d(DemProvider):
     sample = (46.5935, 7.9077, 3000)   # Lauterbrunnen valley
     dsm_budget_mb = 100.0     # skip the DSM (0.5 m tiles, overviews only to 2 m) beyond this estimate
 
-    def fetch(self, aoi, grid, progress, cancel):
+    def _dtm_urls(self, aoi, grid):
         bbox = aoi.lonlat_bbox(margin=grid.step * 2)
         gsd = 2.0 if grid.step >= 4 else 0.5
         items = _latest_per_tile(_swiss_items("ch.swisstopo.swissalti3d", bbox))
-        urls = [u for u in (_swiss_tif(it, gsd) or _swiss_tif(it, 0.5) for it in items) if u]
+        return gsd, items, [u for u in (_swiss_tif(it, gsd) or _swiss_tif(it, 0.5) for it in items) if u]
+
+    def _dsm_urls(self, aoi, grid) -> tuple[list[str], float]:
+        bbox = aoi.lonlat_bbox(margin=grid.step * 2)
+        ditems = _latest_per_tile(_swiss_items("ch.swisstopo.swisssurface3d-raster", bbox))
+        durls = [u for u in (_swiss_tif(it, 0.5) for it in ditems) if u]
+        f = max(f for f in (1, 2, 4) if 0.5 * f <= max(grid.step / 2, 0.5))   # overview read_cog will use
+        return durls, len(durls) * (2000 / f) ** 2 * 4 / 1e6   # LZW float32: ~4 bytes/px (measured)
+
+    def cog_urls(self, aoi, grid, dsm):
+        urls = self._dtm_urls(aoi, grid)[2]
+        if dsm and urls:
+            durls, est_mb = self._dsm_urls(aoi, grid)
+            if est_mb <= self.dsm_budget_mb:
+                urls += durls
+        return urls
+
+    def fetch(self, aoi, grid, progress, cancel):
+        gsd, items, urls = self._dtm_urls(aoi, grid)
         g = _datum_grid(aoi, grid, 2056)
         dtm, n_dtm = _mosaic(urls, aoi, g, cancel, progress, "swissALTI3D", f0=0.0, f1=0.6)
         detail = f"swissALTI3D {gsd:g} m {n_dtm} ({', '.join(sorted({it['id'].split('_')[1] for it in items}))})"
         dsm = None
         _cancelled(cancel)
-        ditems = _latest_per_tile(_swiss_items("ch.swisstopo.swisssurface3d-raster", bbox)) if want_dsm() else []
-        durls = [u for u in (_swiss_tif(it, 0.5) for it in ditems) if u]
-        f = max(f for f in (1, 2, 4) if 0.5 * f <= max(grid.step / 2, 0.5))   # overview read_cog will use
-        est_mb = len(durls) * (2000 / f) ** 2 * 4 / 1e6   # LZW float32: ~4 bytes/px (measured)
+        durls, est_mb = self._dsm_urls(aoi, grid) if want_dsm() else ([], 0.0)
         if durls and est_mb <= self.dsm_budget_mb:
             dsm, n_dsm = _mosaic(durls, aoi, g, cancel, progress, "swissSURFACE3D Raster", f0=0.6, f1=1.0)
             dsm = _dsm_where_missing(dtm, dsm)
@@ -528,6 +545,7 @@ def _fl_wcs(coverage: str, aoi, grid, cancel, max_px: int = 2500) -> np.ndarray:
 
 class FlandersDhmv2(DemProvider):
     key = "vl_dhmv2"
+    read_kind = "service"   # download estimates (maptomesh.estimate)
     label = "Digitaal Hoogtemodel Vlaanderen II 1 m (Flanders)"
     res_m = 1.0
     has_dsm = True

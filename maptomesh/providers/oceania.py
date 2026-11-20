@@ -10,23 +10,31 @@
   2001-2015): WCS 1.0.0, EPSG:4283 only. Outside its coverage the service returns 0.0 with no
   nodata tag, so exact zeros are treated as no data.
 
+* Murray-Darling Basin Authority (MDBA) elevation services: 24 river-corridor LiDAR DEMs (0.5-5 m,
+  2003-2021) as ArcGIS ImageServers, read with ``exportImage`` finest / newest first. Most state no
+  licence (one has contractor conditions): a licence warning names the surveys used, and the
+  provider ranks after unrestricted models of equal detail (GA 5 m, Queensland).
+
 Not used: ELVIS (browser-only API, requester-pays buckets), Vicmap / Landgate (licensed),
-NSW 5 m (photogrammetric, slow), MDBA services (no licence stated).
+NSW 5 m (photogrammetric, slow).
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
 from .. import config
 from ..dem import DemArrays, DemProvider, register, want_dsm
-from ..dem_readers import merge_fill, read_cog, read_service, request_res, service_get, src_bbox
+from ..dem_readers import (merge_fill, read_cog, read_service, reproject_array, request_res, service_get,
+                           service_tiles, src_bbox)
 
 # ---------------------------------------------------------------- New Zealand (LINZ)
 
@@ -262,7 +270,168 @@ class Ga5m(DemProvider):
         return DemArrays(dtm, None, f"WCS DEM_LiDAR_5m_2025, {res * 111_320:.1f} m, {n[0]} request(s)")
 
 
+# ---------------------------------------------------------------- Murray-Darling Basin (MDBA)
+
+MDBA_BASE = "https://gis.mdba.gov.au/arcgis/rest/services/ELEVATION/"
+MDBA_MAX_PX = 2048   # service limit 15000 x 15000 (4100 rows for some); keep responses small
+MDBA_PAD = 0.03      # degrees around each box: they come from two corners of the projected extents
+
+
+class _Survey(NamedTuple):
+    service: str
+    name: str
+    res: float
+    epsg: int
+    year: int
+    # from the service metadata: "cc-by" = CC BY 3.0 AU (Geoscience Australia / ELVIS) or Commonwealth
+    # IP "without limits"; "none" = no licence stated; "contractor" = the contractor's conditions
+    # limit use to the purpose it was commissioned for
+    licence: str
+    box: tuple   # lon / lat (w, s, e, n)
+
+
+MDBA_SURVEYS = tuple(_Survey(sv, nm, r, ep, yr, lic, (w - MDBA_PAD, s - MDBA_PAD, e + MDBA_PAD, n + MDBA_PAD))
+                     for sv, nm, r, ep, yr, lic, (w, s, e, n) in (
+    ("DEW_SA_MurrayLiDAR_2021_DTM_50cm_MGA54", "SA River Murray 2021", 0.5, 7854, 2021, "none",
+     (139.18, -35.36, 141.33, -33.86)),
+    ("ELEVATION_GREAT_DARLING_ANABRANCH_1M_DEM_2020_SFA915", "Great Darling Anabranch 2020", 1.0, 7854, 2020,
+     "cc-by", (141.62, -34.15, 142.31, -32.63)),
+    ("ELEVATION_MENINDEE_LOWER_DARLING_1M_DEM_2019_SFA915", "Menindee - Lower Darling 2019", 1.0, 7854, 2019,
+     "cc-by", (141.86, -34.15, 142.83, -32.07)),
+    ("ELEVATION_WAKOOL_EDWARD_MURRAY_1M_LIDAR_DEM_19_10_2015_SFA500", "Wakool - Edward - Murray 2015", 1.0, 7855,
+     2015, "none", (143.10, -36.17, 146.04, -34.75)),
+    ("ELEVATION_MACQUARIE_BARWON_1M_DEM_2014_SFA701", "Macquarie - Barwon 2014", 1.0, 7855, 2014, "none",
+     (146.78, -32.26, 148.49, -29.64)),
+    ("ELEVATION_MIDDLE_DARLING_1M_DEM_2014_SFA003", "Middle Darling 2014", 1.0, 7855, 2014, "none",
+     (143.01, -32.02, 145.47, -29.73)),
+    ("ELEVATION_UPPER_DARLING_1M_DEM_2014_SFA207", "Upper Darling 2014", 1.0, 7855, 2014, "none",
+     (146.19, -30.13, 148.64, -28.00)),
+    ("ELEVATION_SOUTHERN_MURRAY_DARLING_1M_2001_2014_LIDAR_UPDATE_SFA912", "Southern MDB 2001-2014", 1.0, 28355,
+     2014, "cc-by", (142.61, -36.29, 147.07, -34.59)),
+    ("ELEVATION_EDWARDS_1M_LIDAR_DEM_2013_SFA200", "Edward River 2013", 1.0, 7855, 2013, "cc-by",
+     (143.32, -35.32, 144.75, -34.80)),
+    ("ELEVATION_GWYDIR_VALLEY_1M_LIDAR_DEM_2013_SFA907", "Gwydir Valley 2013", 1.0, 7855, 2013, "none",
+     (149.08, -29.78, 149.28, -29.62)),
+    ("ELEVATION_LOWER_DARLING_1M_DEM_2013_SFA201", "Lower Darling 2013", 1.0, 7854, 2013, "none",
+     (141.61, -34.08, 142.67, -33.03)),
+    ("ELEVATION_NAMOI_1_M_DEM_2013_SFA208", "Namoi 2013", 1.0, 7855, 2013, "none",
+     (148.07, -30.58, 149.52, -29.66)),
+    ("ELEVATION_BROKEN_HILL_LOWER_DARLING_1M_LIDAR_DEM_2009_SFA202", "Broken Hill - Lower Darling 2009", 1.0,
+     7854, 2009, "cc-by", (141.94, -33.19, 143.29, -31.77)),
+    ("ELEVATION_DARLING_BOURKE_1M_DEM_2009_SFA203", "Darling - Bourke 2009", 1.0, 7855, 2009, "none",
+     (144.92, -30.67, 146.56, -29.78)),
+    ("ELEVATION_MURRUMBIDGEE_WAGGA_WAGGA_1M_LIDAR_DEM_2009_SFA907", "Murrumbidgee - Wagga Wagga 2009", 1.0, 7855,
+     2009, "none", (143.17, -35.25, 148.42, -34.17)),
+    ("ELEVATION_MACQUARIE_MARSHES_GWYDIR_1M_LIDAR_DEM_2008_SFA907", "Macquarie Marshes - Gwydir 2008", 1.0, 7855,
+     2008, "cc-by", (147.45, -31.41, 149.84, -29.12)),
+    ("ELEVATION_GOULBURN_BROKEN_1M_LiDAR_DEM_2007_SFA205", "Goulburn - Broken 2007", 1.0, 7855, 2007, "none",
+     (145.04, -37.27, 146.00, -36.24)),
+    ("ELEVATION_LINDSAY_WALPOLLA_HATTAH_ISLANDS_1_6M_LIDAR_DEM_SFA204", "Lindsay - Walpolla - Hattah 2004", 1.6,
+     7854, 2004, "none", (140.99, -34.81, 142.52, -34.00)),
+    ("ELEVATION_COORONG_2M_DEM_2008_SFA905", "Coorong 2008", 2.0, 7854, 2008, "cc-by",
+     (138.72, -36.51, 139.86, -35.30)),
+    ("ELEVATION_KATARAPKO_2M_DEM_2007_SFA905", "Katarapko 2007", 2.0, 7854, 2007, "none",
+     (140.43, -34.46, 140.83, -33.97)),
+    ("ELEVATION_PYAP_KATARAPKO_2M_DEM_2007_SFA905", "Pyap - Katarapko 2007", 2.0, 7854, 2007, "none",
+     (139.60, -34.45, 140.53, -33.99)),
+    ("ELEVATION_LOCK1_TO_WELLINGTON_2M_DEM_2007_SFA101", "Lock 1 - Wellington 2007", 2.0, 7854, 2007, "none",
+     (139.21, -35.35, 139.68, -34.30)),
+    ("ELEVATION_CHOWILLA_2M_DEM_2003_SFA905", "Chowilla 2003", 2.0, 7854, 2003, "contractor",
+     (140.78, -34.07, 141.08, -33.88)),
+    ("ELEVATION_BARMAH_MILLEWA_FOREST_5M_DEM_2007_SFA205", "Barmah - Millewa Forest 2007", 5.0, 7855, 2007, "none",
+     (144.87, -36.03, 145.46, -35.58)),
+))
+
+
+def _mdba_surveys(bbox) -> list[_Survey]:
+    """Surveys whose box meets ``bbox`` (lon / lat): finest first; at equal resolution the licensed
+    (CC BY) ones before the others, then newest first."""
+    w, s, e, n = bbox
+    hit = [sv for sv in MDBA_SURVEYS if w <= sv.box[2] and e >= sv.box[0] and s <= sv.box[3] and n >= sv.box[1]]
+    return sorted(hit, key=lambda sv: (sv.res, sv.licence != "cc-by", -sv.year))
+
+
+def _mdba_notes(none: list[str], contractor: list[str]) -> list[str]:
+    notes = []
+    if none:
+        notes.append(f"Murray-Darling Basin LiDAR DEMs ({', '.join(none)}) come from the Murray-Darling Basin "
+                     "Authority's elevation services, which state no licence: reuse rights are unclear, so ask the "
+                     "MDBA (and the survey custodian in each service's metadata) before selling prints of this "
+                     f"area; services: {MDBA_BASE}")
+    if contractor:
+        notes.append(f"Murray-Darling Basin LiDAR DEM ({', '.join(contractor)}): the survey contractor's conditions "
+                     "(AAM GeoScan, for the SA Government) allow use only for the purpose it was commissioned for: "
+                     "don't sell prints of this area without the SA Department for Environment and Water's "
+                     f"permission; services: {MDBA_BASE}")
+    return notes
+
+
+class MdbaLidar(DemProvider):
+    key = "mdba_lidar"
+    read_kind = "file"   # download estimates (maptomesh.estimate)
+    label = "MDBA river-corridor LiDAR 0.5-5 m (Murray-Darling Basin)"
+    res_m = 1.0                    # per area: the finest survey there (``variants``)
+    attribution = ("Elevation: Murray-Darling Basin Authority elevation services (LiDAR DEMs of the MDBA, "
+                   "Geoscience Australia, NSW, Victorian and SA government agencies and their survey contractors); "
+                   "includes © Commonwealth of Australia (Geoscience Australia) data under CC BY 3.0 AU.")
+    licence = f"Per survey: CC BY 3.0 AU (Geoscience Australia) or no licence stated ({MDBA_BASE})"
+    regions = tuple(sv.box for sv in MDBA_SURVEYS)
+    max_area_km2 = 2500.0
+    sample = (-34.1800, 140.7500, 3000)   # River Murray floodplain near Renmark (SA 2021, 0.5 m)
+    prefer = 2
+
+    def variants(self, aoi, grid):
+        found = _mdba_surveys(aoi.lonlat_bbox(margin=grid.step * 2))
+        if not found:
+            return []
+        v = copy.copy(self)
+        v.res_m = found[0].res
+        return [v]
+
+    def fetch(self, aoi, grid, progress, cancel):
+        from ..dem_readers import read_raster_bytes
+
+        found = _mdba_surveys(aoi.lonlat_bbox(margin=grid.step * 2))
+        H, W = grid.vshape
+        gx, gy = np.meshgrid(grid.x0 + np.arange(W) * grid.step, grid.y0 + np.arange(H) * grid.step)
+        lon, lat = aoi.to_lonlat.transform(gx, gy)
+        out = np.full(grid.vshape, np.nan)
+        used, none, contractor = [], [], []
+        for k, sv in enumerate(found):
+            w, s, e, n = sv.box
+            if not (np.isnan(out) & (lon >= w) & (lon <= e) & (lat >= s) & (lat <= n)).any():
+                continue   # what this survey could cover is filled already
+            progress(k / len(found), f"MDBA LiDAR {sv.name}")
+            part = np.full(grid.vshape, np.nan)
+            for b, tw, th in service_tiles(src_bbox(aoi, grid, sv.epsg), request_res(sv.res, grid), MDBA_MAX_PX):
+                if cancel.is_set():
+                    raise RuntimeError("Cancelled")
+                data = service_get(f"{MDBA_BASE}{sv.service}/ImageServer/exportImage", params={
+                    "bbox": ",".join(f"{v:.2f}" for v in b), "bboxSR": sv.epsg, "imageSR": sv.epsg,
+                    "size": f"{tw},{th}", "format": "tiff", "compression": "LZ77", "pixelType": "F32",
+                    "noData": -9999, "noDataInterpretation": "esriNoDataMatchAny",
+                    "interpolation": "RSP_BilinearInterpolation", "f": "image"}, timeout=180)
+                src = read_raster_bytes(data)
+                a = src.arr.astype(np.float32)
+                with np.errstate(invalid="ignore"):
+                    a[~(np.abs(a) < 9000)] = np.nan   # -9999 and the +-1e38 fill values of some surveys
+                merge_fill(part, reproject_array(a, src.transform, src.crs or sv.epsg, aoi, grid))
+            before = int(np.isfinite(out).sum())
+            merge_fill(out, part)
+            if int(np.isfinite(out).sum()) > before:
+                used.append(sv.name)
+                if sv.licence == "none":
+                    none.append(sv.name)
+                elif sv.licence == "contractor":
+                    contractor.append(sv.name)
+            if np.isfinite(out).all():
+                break
+        return DemArrays(out, None, "MDBA ELEVATION services: " + ", ".join(used),
+                         licence_notes=_mdba_notes(none, contractor))
+
+
 register(Linz1m())
 register(Linz8m())
 register(QldDem())
 register(Ga5m())
+register(MdbaLidar())

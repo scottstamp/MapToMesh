@@ -22,7 +22,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
 use rayon::prelude::*;
 
+mod mesh3d;
 mod partition;
+mod tiff;
 
 /// Rows of vertices / triangles per parallel work item (about 1.5-2 MB of XML).
 const ROWS_PER_CHUNK: usize = 32_768;
@@ -539,5 +541,8 @@ fn maptomesh_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(write_zip, m)?)?;
     m.add_function(wrap_pyfunction!(simplify, m)?)?;
+    m.add_function(wrap_pyfunction!(tiff::decode_tile, m)?)?;
+    m.add_function(wrap_pyfunction!(mesh3d::decode_draco, m)?)?;
+    m.add_function(wrap_pyfunction!(mesh3d::raster_max, m)?)?;
     Ok(())
 }

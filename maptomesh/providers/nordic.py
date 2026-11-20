@@ -9,10 +9,13 @@
   Greenland, Faroes, Svalbard, northern Canada...). Heights are WGS84-ellipsoidal; they are converted
   to EGM2008 heights with NGA's geoid grid (PROJ CDN COG) so seams to national models stay small.
 * Iceland: ÍslandsDEM v1.0 10 m (national model built from ArcticDEM, gap-filled, ISN2016 heights).
+* Lithuania: DTM-LT-1m (NŽT data, HNIT-Baltic's public ArcGIS Online image service, ``exportImage``
+  in LKS94). Its terms allow only non-commercial use inside Esri ArcGIS: a licence warning goes with
+  the model.
 
 Not here (see the research notes): Norway (Kartverket services unreachable from outside Europe at the
 time of writing), Sweden / Denmark (account or token required), Latvia (uncompressed 160 MB LAS
-tiles only), Lithuania (order-based).
+tiles only).
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ import numpy as np
 
 from .. import config
 from ..dem import DemArrays, DemProvider, register
-from ..dem_readers import merge_fill, read_cog, service_get, src_bbox
+from ..dem_readers import merge_fill, read_cog, read_service, request_res, service_get, src_bbox
 
 INDEX_DIR = config.CACHE_DIR / "dem_index"
 INDEX_DAYS = 30
@@ -201,8 +204,10 @@ EGM2008 = "https://cdn.proj.org/us_nga_egm08_25.tif"   # NGA EGM2008 geoid undul
 
 
 def geoid_egm2008(aoi, grid) -> np.ndarray:
-    """EGM2008 geoid height (ellipsoidal minus orthometric) on the vertex grid."""
-    n = read_cog(EGM2008, aoi, grid)
+    """EGM2008 geoid height (ellipsoidal minus orthometric) on the vertex grid (all of it: a gap
+    fill's ``read_blocks`` would leave NaN outside the blocks; the geoid grid is tiny anyway)."""
+    import dataclasses
+    n = read_cog(EGM2008, aoi, dataclasses.replace(grid, read_blocks=()))
     if not np.isfinite(n).all():
         raise RuntimeError("EGM2008 geoid grid not available for this area")
     return n
@@ -262,12 +267,58 @@ class IslandsDem10m(DemProvider):
     def fetch(self, aoi, grid, progress, cancel):
         _check(cancel)
         progress(0.0, "ÍslandsDEM 10 m")
-        out = read_cog(IS_DEM10, aoi, grid)
+        # ISN2016 / Lambert 2016 (EPSG:8088): the file gives it as parameters only, which GDAL
+        # resolves but the GDAL-free reader (browser) does not
+        out = read_cog(IS_DEM10, aoi, grid, src_crs=8088)
         out[out < -1000] = np.nan   # nodata is -3.4e38 (float min); guard against resampling edges
         return DemArrays(out, None, "IslandsDEMv1.0_10x10m_isn2016")
+
+
+# ---------------------------------------------------------------- Lithuania (non-commercial, ArcGIS only)
+
+LT_SERVICE = ("https://utility.arcgis.com/usrsvcs/servers/fef66dec83c14b0295180ecafa662aa0/rest/services/"
+              "DTM_LT2020/ImageServer")
+LT_TERMS = "https://www.arcgis.com/home/item.html?id=fef66dec83c14b0295180ecafa662aa0"
+LT_MAX_PX = 4000   # service limit 15000 x 4100
+
+
+class DtmLt1m(DemProvider):
+    key = "hnit_dtm_lt_1m"
+    label = "DTM-LT-1m (Lithuania, non-commercial)"
+    res_m = 1.0
+    attribution = ("Lietuvos reljefo modelis DTM-LT-1m. Duomenys: © Nacionalinė žemės tarnyba prie Aplinkos "
+                   "ministerijos; © UAB Hnit-Baltic; Sukūrė: © UAB Hnit-Baltic.")
+    licence = f"UAB HNIT-Baltic service terms: non-commercial use within Esri ArcGIS only ({LT_TERMS})"
+    licence_note = ("Lithuania DTM-LT-1m (© Nacionalinė žemės tarnyba, service by UAB HNIT-Baltic): its terms allow "
+                    "only non-commercial use, within Esri ArcGIS software, and forbid distributing or reproducing "
+                    "it; prints of this area must not be sold without HNIT-Baltic's prior written consent "
+                    "(maps@hnit-baltic.lt); terms: " + LT_TERMS)
+    regions = ((20.84, 53.86, 26.93, 56.48),)
+    max_area_km2 = 2500.0
+    sample = (54.6795, 25.2870, 3000)   # Vilnius old town and Gediminas hill
+    prefer = 2
+
+    def fetch(self, aoi, grid, progress, cancel):
+        bbox = src_bbox(aoi, grid, 3346)                   # LKS94 / Lithuania TM (ETRS89 datum)
+        res = request_res(self.res_m, grid)
+        n = [0]
+
+        def tile(b, w, h):
+            _check(cancel)
+            n[0] += 1
+            progress(0.1, f"DTM-LT-1m request {n[0]}")
+            return service_get(LT_SERVICE + "/exportImage", params={
+                "bbox": ",".join(f"{v:.2f}" for v in b), "bboxSR": 3346, "imageSR": 3346, "size": f"{w},{h}",
+                "format": "tiff", "pixelType": "F32", "noData": -9999,
+                "noDataInterpretation": "esriNoDataMatchAny", "interpolation": "RSP_BilinearInterpolation",
+                "f": "image"}, timeout=180)
+
+        dtm = read_service(tile, bbox, res, LT_MAX_PX, aoi, grid, src_crs=3346, nodata=-9999.0, cancel=cancel)
+        return DemArrays(dtm, None, f"DTM_LT2020 exportImage, {res:.1f} m, {n[0]} request(s)")
 
 
 register(NlsFinland2m())
 register(MaruEstonia1m())
 register(ArcticDem2m())
 register(IslandsDem10m())
+register(DtmLt1m())

@@ -10,6 +10,11 @@ Providers live in ``maptomesh.providers`` (one module per region) and register t
 ``register``. A provider returns a DTM (bare earth) and, where it has one, a DSM (first surface).
 DSM-only models (Copernicus, ArcticDEM) set ``dsm_only``: their heights include trees and
 buildings and are used as ground.
+
+Providers are ranked by *effective* resolution, ``max(res_m, grid step / 2)``: detail finer than
+half a cell doesn't reach the model, so a 0.5 m and a 2 m model are equal on a 5 m grid. Ties go
+to a provider with a surface model when the job wants one, then to ``prefer`` (0 = Mapterhorn's
+shared tiles, which spare the agencies' own servers), then to the finer native resolution.
 """
 
 from __future__ import annotations
@@ -52,12 +57,42 @@ class DemProvider:
     max_area_km2: float = 2500.0  # beyond this the provider is skipped (next fallback is used)
     sample: tuple = ()           # (lat, lon, size_m) for tests/probe_sources.py
     licence_note: str = ""       # restriction that applies whenever this provider's data is used
+    prefer: int = 1              # tie-break at equal effective resolution: lower first
+    # how ``fetch`` reads, for download estimates (``maptomesh.estimate``): "cog" (GeoTIFF tiles at
+    # the overview matching the grid), "service" (WMS / WCS resampled by the server to about the
+    # grid), "file" (whole files at native resolution)
+    read_kind: str = "cog"
+
+    def cog_urls(self, aoi: AOI, grid: Grid, dsm: bool) -> list[str] | None:
+        """The cloud-optimised GeoTIFFs ``fetch`` would read through ``read_cog`` (for an exact
+        download estimate from their headers); None if not listed cheaply. May use the network
+        (searches; cached)."""
+        return None
+
+    def download_estimate(self, aoi: AOI, grid: Grid, dsm: bool) -> float:
+        """Bytes ``fetch`` downloads, roughly (``read_kind``; measured bytes per pixel)."""
+        layers = 2 if dsm and self.has_dsm else 1
+        if self.read_kind == "service":
+            return grid.nx * grid.ny * 15.0 * layers
+        area = aoi.width_m * aoi.height_m
+        if self.read_kind == "file":
+            return area * 2.0 / self.res_m ** 2 * 2.5 * layers
+        r = self.res_m
+        while r * 2 <= grid.step / 2:
+            r *= 2
+        return area * 1.3 / r ** 2 * 2.5 * layers
 
     def covers(self, bbox: tuple[float, float, float, float]) -> bool:
         if not self.regions:
             return True
         w, s, e, n = bbox
         return any(w <= rx1 and e >= rx0 and s <= ry1 and n >= ry0 for rx0, ry0, rx1, ry1 in self.regions)
+
+    def variants(self, aoi: AOI, grid: Grid) -> list["DemProvider"]:
+        """The candidates this provider offers for an area: itself. A provider whose resolution
+        varies by place (Mapterhorn) returns one candidate per resolution tier found there, or
+        none. May use the network; an exception skips the provider for this area."""
+        return [self]
 
     def fetch(self, aoi: AOI, grid: Grid, progress: ProgressFn, cancel: threading.Event) -> DemArrays:
         raise NotImplementedError
@@ -71,10 +106,17 @@ def register(p: DemProvider) -> DemProvider:
     return p
 
 
-def ordered(providers=None) -> list[DemProvider]:
-    """Highest resolution first; DTM+DSM before DTM-only before surface-only at equal resolution."""
+def rank(p: DemProvider, step: float | None = None, dsm: bool = True) -> tuple:
+    """Sort key: effective resolution on a grid of ``step`` (native resolution without one), then
+    bare earth before surface-only, a surface model when wanted, ``prefer``, native resolution."""
+    eff = p.res_m if step is None else max(p.res_m, step / 2)
+    return (eff, p.dsm_only, dsm and not p.has_dsm, p.prefer, p.res_m)
+
+
+def ordered(providers=None, step: float | None = None, dsm: bool = True) -> list[DemProvider]:
+    """Best first (see ``rank``)."""
     ps = providers if providers is not None else PROVIDERS
-    return sorted(ps, key=lambda p: (p.res_m, p.dsm_only, not p.has_dsm))
+    return sorted(ps, key=lambda p: rank(p, step, dsm))
 
 
 @dataclass
@@ -124,6 +166,7 @@ def _offset(ref: np.ndarray, vals: np.ndarray, step: float, surface_only: bool =
 
 
 _WANT_DSM: ContextVar[bool] = ContextVar("maptomesh_want_dsm", default=True)
+_SHARED_FIRST: ContextVar[bool] = ContextVar("maptomesh_shared_first", default=True)
 
 
 def want_dsm() -> bool:
@@ -133,17 +176,27 @@ def want_dsm() -> bool:
     return _WANT_DSM.get()
 
 
+def shared_first() -> bool:
+    """False when the job asks for the agencies' own services before Mapterhorn's shared tiles
+    (``Options.dem_preference == "official"``); read it in ``variants``."""
+    return _SHARED_FIRST.get()
+
+
 def best_dems(aoi: AOI, grid: Grid, need: np.ndarray | None = None, ref: np.ndarray | None = None,
               progress: ProgressFn = lambda f, m: None, cancel: threading.Event | None = None,
-              providers=None, min_share: float = 0.0005, dsm: bool = True) -> Composite:
+              providers=None, min_share: float = 0.0005, dsm: bool = True,
+              shared_first: bool = True) -> Composite:
     """Fill the vertices in ``need`` (all if None) from the best providers covering the AOI.
 
     ``ref`` is higher-priority elevation already known elsewhere (e.g. LiDAR ground): fallbacks
-    are offset to it where both exist. ``dsm=False``: providers skip surface models."""
+    are offset to it where both exist. ``dsm=False``: providers skip surface models.
+    ``shared_first=False``: the agencies' own services before Mapterhorn at equal detail."""
     token = _WANT_DSM.set(dsm)
+    token2 = _SHARED_FIRST.set(shared_first)
     try:
         return _best_dems(aoi, grid, need, ref, progress, cancel, providers, min_share)
     finally:
+        _SHARED_FIRST.reset(token2)
         _WANT_DSM.reset(token)
 
 
@@ -194,7 +247,15 @@ def _best_dems(aoi: AOI, grid: Grid, need, ref, progress: ProgressFn, cancel, pr
     out = Composite(dtm, dsm, source)
     bbox = aoi.lonlat_bbox(margin=grid.step * 2)
     area_km2 = aoi.width_m * aoi.height_m / 1e6
-    cands = [p for p in ordered(providers) if p.covers(bbox)]
+    cands = []
+    for p in (providers if providers is not None else PROVIDERS):
+        if not p.covers(bbox):
+            continue
+        try:
+            cands.extend(p.variants(aoi, grid))
+        except Exception as e:  # noqa: BLE001 - e.g. a coverage index that can't be read
+            out.errors.append(f"{p.label}: {type(e).__name__}: {str(e)[:200]}")
+    cands = ordered(cands, grid.step, want_dsm())
     for k, p in enumerate(cands):
         remaining = need & np.isnan(dtm)
         if remaining.mean() < min_share or not remaining.any():
@@ -250,14 +311,31 @@ def _best_dems(aoi: AOI, grid: Grid, need, ref, progress: ProgressFn, cancel, pr
     return out
 
 
-def describe(cands_bbox: tuple[float, float, float, float], area_km2: float, providers=None) -> list[dict]:
-    """Providers that would be tried for an area (cheap: region test only)."""
-    out = []
-    for p in ordered(providers):
-        if p.covers(cands_bbox):
-            out.append({"key": p.key, "label": p.label, "res_m": p.res_m,
-                        "usable": area_km2 <= p.max_area_km2})
-    return out
+def candidates(aoi: AOI, grid: Grid, providers=None, dsm: bool = True, shared_first: bool = True) -> list[DemProvider]:
+    """Providers that would be tried for an area, in order (region test, plus the coverage index
+    of providers with ``variants``)."""
+    bbox = aoi.lonlat_bbox(margin=grid.step * 2)
+    cands = []
+    t1, t2 = _WANT_DSM.set(dsm), _SHARED_FIRST.set(shared_first)
+    try:
+        for p in (providers if providers is not None else PROVIDERS):
+            if p.covers(bbox):
+                try:
+                    cands.extend(p.variants(aoi, grid))
+                except Exception:  # noqa: BLE001 - the job would skip it too
+                    pass
+    finally:
+        _SHARED_FIRST.reset(t2)
+        _WANT_DSM.reset(t1)
+    return ordered(cands, grid.step, dsm)
+
+
+def describe(aoi: AOI, grid: Grid, providers=None, dsm: bool = True, shared_first: bool = True) -> list[dict]:
+    """``candidates`` for display."""
+    area_km2 = aoi.width_m * aoi.height_m / 1e6
+    return [{"key": p.key, "label": p.label, "res_m": p.res_m, "usable": area_km2 <= p.max_area_km2,
+             "has_dsm": p.has_dsm}
+            for p in candidates(aoi, grid, providers, dsm, shared_first)]
 
 
 def utm_epsg(lon: float, lat: float) -> int:

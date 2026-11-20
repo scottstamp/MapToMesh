@@ -1,4 +1,5 @@
-"""Central Europe: Austria, German states, and COPC point clouds for Slovenia, Poland, Saxony and Wallonia.
+"""Central Europe: Austria, German states, and COPC point clouds for Slovenia, Poland, Saxony, Wallonia
+and Flanders.
 
 Elevation models (highest resolution first; ``best_dems`` fills gaps from the next one):
 
@@ -23,7 +24,9 @@ bounding boxes (``shp/files_bbox_<name>.shp``); its .shp/.shx are downloaded onc
 compact ``.npz``, and only the .dbf records of intersecting files are range-read (persistent range
 cache). The files carry no CRS, so ``Tile.crs`` is set per dataset. Saxony's GeoSN point clouds use
 class 20 for non-ground points, which ``pointcloud`` reads as ground, so that provider is only
-registered once ``Tile`` has a ``class_map`` field.
+registered once ``Tile`` has a ``class_map`` field. Flanders' DHMV II point clouds are restricted to
+public-interest use (licence warning) and only offered for small areas, where they are finer than
+the open 1 m DHMV II elevation models.
 """
 
 from __future__ import annotations
@@ -174,19 +177,19 @@ def _unzip(data: bytes, ext: str = ".tif") -> bytes:
 def _tif_to_grid(data: bytes, aoi, grid, src_crs=None) -> np.ndarray:
     """GeoTIFF bytes -> vertex grid; block-averaged ('average') when the grid is much coarser than
     the data (point sampling 1 m heights at 10 m steps would alias), bilinear otherwise."""
-    from rasterio.io import MemoryFile
-    with MemoryFile(data) as mf, mf.open() as src:
-        arr = src.read(1).astype(np.float32)
-        nd = src.nodata
-        crs = src.crs or src_crs
-        if crs is None:
-            raise ValueError("GeoTIFF without CRS")
-        res = abs(src.res[0])
-        if nd is not None and np.isfinite(nd):
-            arr[arr == nd] = np.nan
+    from ..dem_readers import read_raster_bytes
+    src = read_raster_bytes(data)
+    arr = src.arr.astype(np.float32)
+    nd = src.nodata
+    crs = src.crs or src_crs
+    if crs is None:
+        raise ValueError("GeoTIFF without CRS")
+    if nd is not None and np.isfinite(nd):
+        arr[arr == nd] = np.nan
+    with np.errstate(invalid="ignore"):
         arr[(arr < -1000) | (arr > 9000)] = np.nan    # stray fill values (-9999, -32767, 3.4e38)
-        rs = "average" if grid.step > 4 * res else "bilinear"
-        return reproject_array(arr, src.transform, crs, aoi, grid, nodata=None, resampling=rs)
+    rs = "average" if grid.step > 4 * src.res else "bilinear"
+    return reproject_array(arr, src.transform, crs, aoi, grid, nodata=None, resampling=rs)
 
 
 def _km_tiles(aoi, grid, epsg: int, size_m: int) -> list[tuple[int, int]]:
@@ -392,6 +395,7 @@ NRW_BASE = "https://www.opengeodata.nrw.de/produkte/geobasis/hm"
 
 class NrwDgm1(_TileDem):
     key = "nrw_dgm1"
+    read_kind = "file"   # download estimates (maptomesh.estimate)
     label = "Geobasis NRW DGM1/DOM1 1 m (North Rhine-Westphalia)"
     has_dsm = True
     attribution = "Geobasis NRW, DGM1 and DOM1 (dl-de/zero-2-0)"
@@ -410,6 +414,7 @@ class NrwDgm1(_TileDem):
 
 class BavariaDgm1(_TileDem):
     key = "bvv_dgm1_by"
+    read_kind = "file"   # download estimates (maptomesh.estimate)
     label = "Bayerische Vermessungsverwaltung DGM1 1 m (Bavaria)"
     has_dsm = False
     attribution = "Datenquelle: Bayerische Vermessungsverwaltung – www.geodaten.bayern.de (CC BY 4.0)"
@@ -427,6 +432,7 @@ RLP_BASE = "https://geobasis-rlp.de/data"
 
 class RlpDgm1(_TileDem):
     key = "lvermgeo_dgm1_rp"
+    read_kind = "file"   # download estimates (maptomesh.estimate)
     label = "LVermGeo DGM1/DOM1 1 m (Rhineland-Palatinate)"
     has_dsm = True
     attribution = f"©GeoBasis-DE / LVermGeoRP {YEAR}, dl-de/by-2-0, www.lvermgeo.rlp.de (data modified)"
@@ -445,6 +451,7 @@ class RlpDgm1(_TileDem):
 
 class BrandenburgDgm1(_TileDem):
     key = "lgb_dgm1_bb"
+    read_kind = "file"   # download estimates (maptomesh.estimate)
     label = "LGB DGM1 1 m (Brandenburg, Berlin)"
     has_dsm = False
     epsg = 25833
@@ -461,6 +468,7 @@ class BrandenburgDgm1(_TileDem):
 
 class SaxonyDgm1(_TileDem):
     key = "geosn_dgm1_sn"
+    read_kind = "file"   # download estimates (maptomesh.estimate)
     label = "GeoSN DGM1 1 m (Saxony)"
     has_dsm = False
     epsg = 25833
@@ -481,6 +489,7 @@ class SaxonyDgm1(_TileDem):
 
 class MvWcs(DemProvider):
     key = "laiv_dgm1_mv"
+    read_kind = "service"   # download estimates (maptomesh.estimate)
     label = "LAiV DGM1/DOM1 1 m (Mecklenburg-Western Pomerania)"
     res_m = 1.0
     has_dsm = True
@@ -688,6 +697,38 @@ class FlaiSaxony(_FlaiCopc):
                  "EPSG:25833"),)
 
 
+class FlaiFlanders(_FlaiCopc):
+    """DHMV II raw point clouds (2013-2015, 500 m tiles per flight strip, overlapping strips all
+    kept; classes 1 / 2 / 9 only, buildings and trees come from class 1 + OpenStreetMap).
+
+    Licence: the official metadata limits the raw LiDAR to public-interest tasks, so a warning goes
+    with the model. Point clouds outrank every elevation model (``pointcloud.find_sources`` has no
+    preference order), while the open DHMV II 1 m DTM + DSM (``vl_dhmv2``) is as detailed as the grid
+    once its cells are 2 m or more: the restricted point cloud is only offered for areas whose long
+    side (``max_side_m``, the bbox includes a margin of a few cells) gives cells under 2 m at the
+    default 600 cells."""
+    key = "flai_be_vl"
+    label = "Flanders LiDAR DHMV II 2013-2015 (Digitaal Vlaanderen, COPC mirror)"
+    attribution = "LiDAR, ruwe remote sensing data DHMV II, Digitaal Vlaanderen; " + MIRROR
+    licence = ("DHMV II licence: public-interest tasks only (Digitaal Vlaanderen metadata 242ddabc-3cbc-44f0-9623-"
+               "bee874b29549); the mirror lists the Gratis open data licentie Vlaanderen v1.2")
+    licence_note = ("Flanders DHMV II LiDAR point cloud (Digitaal Vlaanderen): the official metadata allows the raw "
+                    "LiDAR data only for tasks of public interest ('taken van algemeen belang') under the DHMV II "
+                    "licence (the mirror lists the Flemish free open data licence v1.2): check the terms before "
+                    "selling prints of this area: https://remotesensing.vlaanderen.be/apps/openlidar/")
+    regions = ((2.54, 50.68, 5.92, 51.51),)
+    sample = (50.7830, 2.8150, 600)     # Kemmelberg
+    max_side_m = 1250.0                 # 600 cells x 2 m, plus the bbox margin
+    datasets = (("BE/EODaS/LiDAR_DHMV_II-2013-2015", "DHMV II 2013-2015 (Flai mirror)", 2014, "EPSG:31370"),)
+
+    def tiles(self, bbox, max_items):
+        w, s, e, n = bbox
+        width = (e - w) * 111_320.0 * math.cos(math.radians((s + n) / 2))
+        if max(width, (n - s) * 111_320.0) > self.max_side_m:
+            return []   # the open 1 m DTM / DSM is as detailed as the grid: let it fill the area
+        return super().tiles(bbox, max_items)
+
+
 class FlaiWallonia(_FlaiCopc):
     key = "flai_be_wal"
     label = "Wallonia LiDAR 2021-2022 (SPW, COPC mirror)"
@@ -703,7 +744,7 @@ class FlaiWallonia(_FlaiCopc):
 for _p in (BevAustria(), LglnNiedersachsen(), NrwDgm1(), BavariaDgm1(), RlpDgm1(), BrandenburgDgm1(),
            SaxonyDgm1(), MvWcs()):
     register(_p)
-for _p in (FlaiSlovenia(), FlaiPoland(), FlaiWallonia()):
+for _p in (FlaiSlovenia(), FlaiPoland(), FlaiWallonia(), FlaiFlanders()):
     register_pointcloud(_p)
 if _TILE_CLASS_MAP:
     register_pointcloud(FlaiSaxony())

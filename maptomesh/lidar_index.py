@@ -280,6 +280,14 @@ class IndexManager:
             self.state = "error"
             self.error = f"{type(e).__name__}: {e}"
 
+    def load_now(self) -> bool:
+        """Load an already-built index synchronously (job worker processes); False if not built."""
+        with self._lock:
+            if self._index is None and TILES_NPZ.exists():
+                self._index = TileIndex.load()
+                self.state = "ready"
+        return self.ready
+
     def start(self) -> None:
         with self._lock:
             if self._thread and self._thread.is_alive():

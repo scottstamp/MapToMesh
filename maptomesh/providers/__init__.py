@@ -11,7 +11,7 @@ import importlib
 import logging
 
 MODULES = ("global_", "north_america", "france_benelux_ch", "uk_ie_south_eu", "central_eu", "nordic",
-           "oceania", "asia")
+           "oceania", "asia", "mapterhorn")
 IMPORT_ERRORS: dict[str, str] = {}
 
 for _m in MODULES:

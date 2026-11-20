@@ -1,0 +1,2 @@
+# bash scripts run inside WSL / Linux: keep LF even with core.autocrlf
+*.sh text eol=lf

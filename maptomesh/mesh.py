@@ -38,7 +38,7 @@ class Mesh:
 def _segments(start: np.ndarray, count: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """For strips with ``count`` segments starting at global index ``start``,
     return (strip id, first-vertex global index) for every segment."""
-    count = np.maximum(count, 0)
+    count = np.maximum(count, 0).astype(np.intp)   # repeat counts: intp is 32-bit in WebAssembly
     total = int(count.sum())
     strip = np.repeat(np.arange(len(start)), count)
     g = np.repeat(start, count) + (np.arange(total) - np.repeat(np.cumsum(count) - count, count))

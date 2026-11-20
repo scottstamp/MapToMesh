@@ -32,6 +32,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import io
 import json
+import math
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -226,24 +227,51 @@ RESOLUTION_FACTOR = 0.7
 GROUND_RESOLUTION_FACTOR = 1.4
 
 
+def _query_box(r, tile: Tile, aoi: AOI, grid: Grid):
+    """The AOI (plus margin) in the file's coordinates, clipped to the file: (crs, zf, qmin,
+    qmax), or a status string ("no CRS" / "outside")."""
+    crs, zf = _file_crs(r, tile.crs)
+    if crs is None:
+        return "no CRS"
+    to_file = Transformer.from_crs(aoi.crs, crs, always_xy=True)
+    ring = aoi.outline_local(margin=grid.step * 1.5)
+    fx, fy = to_file.transform(ring[:, 0], ring[:, 1])
+    hmin, hmax = r.header.mins, r.header.maxs
+    qmin = np.array([max(fx.min(), hmin[0]), max(fy.min(), hmin[1])])
+    qmax = np.array([min(fx.max(), hmax[0]), min(fy.max(), hmax[1])])
+    if (qmax <= qmin).any():
+        return "outside"
+    return crs, zf, qmin, qmax
+
+
+def copc_download_bytes(tile: Tile, aoi: AOI, grid: Grid, resolution: float) -> int:
+    """Compressed bytes a job reads from ``tile``: the octree nodes ``CopcReader.query`` would
+    fetch for this area and ``resolution`` (from the file's hierarchy; nothing else downloaded)."""
+    from laspy.copc import load_octree_for_query
+    with CopcReader.open(tile.url, http_num_threads=8) as r:
+        q = _query_box(r, tile, aoi, grid)
+        if isinstance(q, str):
+            return 0
+        _, _, qmin, qmax = q
+        level_max = max(1, math.ceil(math.log2(r.copc_info.spacing / resolution)) + 1)
+        bounds = Bounds(mins=qmin, maxs=qmax).ensure_3d(r.header.mins, r.header.maxs)
+        nodes = load_octree_for_query(r.source, r.copc_info, r.root_page, query_bounds=bounds,
+                                      level_range=range(0, level_max))
+        return int(sum(n.byte_size for n in nodes))
+
+
 def _process_tile(tile: Tile, aoi: AOI, grid: Grid, resolution: float, cancel: threading.Event):
     if cancel.is_set():
         raise Cancelled()
     sel = (DecompressionSelection.base() | DecompressionSelection.Z
            | DecompressionSelection.CLASSIFICATION | DecompressionSelection.FLAGS)
     with CopcReader.open(tile.url, http_num_threads=8, decompression_selection=sel) as r:
-        crs, zf = _file_crs(r, tile.crs)
-        if crs is None:
-            return None, "no CRS"
-        to_file = Transformer.from_crs(aoi.crs, crs, always_xy=True)
+        q = _query_box(r, tile, aoi, grid)
+        if isinstance(q, str):
+            return None, q
+        crs, zf, qmin, qmax = q
         to_local = Transformer.from_crs(crs, aoi.crs, always_xy=True)
-        ring = aoi.outline_local(margin=grid.step * 1.5)
-        fx, fy = to_file.transform(ring[:, 0], ring[:, 1])
         hmin, hmax = r.header.mins, r.header.maxs
-        qmin = np.array([max(fx.min(), hmin[0]), max(fy.min(), hmin[1])])
-        qmax = np.array([min(fx.max(), hmax[0]), min(fy.max(), hmax[1])])
-        if (qmax <= qmin).any():
-            return None, "outside"
         # tile footprint -> local grid coverage polygon
         cx = np.array([hmin[0], hmax[0], hmax[0], hmin[0]])
         cy = np.array([hmin[1], hmin[1], hmax[1], hmax[1]])
@@ -445,10 +473,15 @@ def empty_result(grid: Grid, info: dict | None = None) -> LidarResult:
                         "providers": [], **(info or {})})
 
 
+def _hint_sources(copc_urls: list[str], ept_urls: list[str]) -> None:
+    """Hook: the files a job is about to read. The server's thread pools need no hint; in the
+    browser (no threads) ``maptomesh.browser`` replaces it to start the downloads in the background."""
+
+
 def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: ProgressFn,
                 cancel: threading.Event | None = None, max_tiles: int = 2500,
                 workers: int = 6, us_source: str = "usgs", allow_empty: bool = False,
-                ground_only: bool = False) -> LidarResult:
+                ground_only: bool = False, max_ept_km2: float | None = None) -> LidarResult:
     """Classified point clouds on the grid. With ``allow_empty`` an area without point clouds,
     or one over the tile limit, returns an empty result (and a note) instead of raising, so that
     elevation models can take over."""
@@ -469,9 +502,11 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: Progres
         return give_up(f"{len(tiles)} LiDAR tiles intersect this area (limit {max_tiles}). "
                        "Pick a smaller area or use elevation models only.",
                        f"{len(tiles)} LiDAR tiles is over the {max_tiles} limit: used elevation models instead.")
-    if projects and aoi.width_m * aoi.height_m > max_tiles * 1e6:
-        return give_up(f"Area over {max_tiles} km2: pick a smaller area for USGS 3DEP point clouds.",
-                       f"Area over {max_tiles} km2 for USGS point clouds: used elevation models instead.")
+    ept_km2 = max_tiles if max_ept_km2 is None else max_ept_km2
+    if projects and aoi.width_m * aoi.height_m > ept_km2 * 1e6:
+        return give_up(f"Area over {ept_km2:g} km2: pick a smaller area for USGS 3DEP point clouds.",
+                       f"Area over {ept_km2:g} km2 for USGS point clouds at this detail: used elevation "
+                       "models instead.")
     provider_of = {t.project: t.provider for t in tiles}
     provider_of.update({p.label: "usgs" for p in projects})
     # octree LOD giving ~1 point per (step/2)^2 at most
@@ -484,6 +519,7 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: Progres
     ept_labels: set[str] = set()
     # jobs: (project, year, callable -> ((footprint | None, data | None) | None, status))
     jobs = [(t.project, t.year, partial(_process_tile, t, aoi, grid, resolution, cancel)) for t in tiles]
+    ept_urls: list[str] = []
     if projects:
         progress(0.0, f"Reading the octree of {len(projects)} USGS 3DEP project(s)")
         with cf.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -502,6 +538,7 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: Progres
                 ept_labels.add(p.label)
                 acc.covered |= fill_polygon(pl.footprint, shape)
                 jobs += [(p.label, p.year, partial(_process_ept_node, p, k, aoi, grid, cancel)) for k in pl.keys]
+                ept_urls += [f"{p.url}ept-data/{k}.laz" for k in pl.keys]
         if cancel.is_set():
             raise Cancelled()
     if not jobs:
@@ -513,6 +550,7 @@ def fetch_lidar(aoi: AOI, grid: Grid, index: TileIndex | None, progress: Progres
     n_proj = len({j[0] for j in jobs})
     unit = "tiles" if len(jobs) == len(tiles) else "octree nodes" if not tiles else "tiles / octree nodes"
     progress(0.0, f"Fetching {len(jobs)} LiDAR {unit} from {n_proj} project(s)")
+    _hint_sources([t.url for t in tiles], ept_urls)
     failed = 0
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(fn): (proj, year) for proj, year, fn in jobs}
