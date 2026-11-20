@@ -2,10 +2,24 @@
 // this worker. Messages: in {type: "run", opts, memory_mb, cache_mb}; out {type: "setup" |
 // "progress" | "done" | "error", ...}. The network and cache functions below are called from
 // maptomesh/browser.py.
-import { loadPyodide } from "https://cdn.jsdelivr.net/pyodide/v314.0.8/full/pyodide.mjs";
 import { PackCache, mountCache } from "./opfs-cache.js";
 
 const PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v314.0.8/full/";
+// Everything loaded from the CDN is checked against a hash before it is used. Pyodide's own files:
+// sha384 of the files the CDN serves (pinned here); its packages: the sha256 hashes in
+// pyodide-lock.json (pinned by its hash), which Pyodide passes to fetch as `integrity`. Its
+// JavaScript is imported from blob: URLs of the checked bytes (an import of the CDN URL itself
+// could not be checked). A file from the CDN without a hash is refused. Checked again when it
+// comes from the runtime cache (copies kept by earlier versions of this page were not checked).
+// A new Pyodide version needs new hashes, for each file:
+//   curl -s <PYODIDE_URL><file> | openssl dgst -sha384 -binary | openssl base64 -A
+const PYODIDE_SRI = {
+  "pyodide.mjs": "sha384-VR+eYp8LZKGhhQ7Nql3TONJIMizM0VRxz87k6V7IyuQHElicjy7ULmkOuB2LFR3b",
+  "pyodide.asm.mjs": "sha384-zZV4ZBUhsbFzcmaHqwfipWI/BS8YH7Duesu1Rrtyx1HRqFAyz+Mt/HRiMtNyWdwU",
+  "pyodide.asm.wasm": "sha384-L3e25SSwmf8Q0I8qcgGD/PNkK1wyivO8lWFSko3xXQZ8uLNcYkZXJlX8LU3oVH/o",
+  "python_stdlib.zip": "sha384-ShW1Tjb4ytDLumQGuwRa/PTLxHcN6agBzp2wIRZSJNK8tEt2QMRDnG69N58KhHqM",
+  "pyodide-lock.json": "sha384-o8SQQvpVlZnOl04+3dFTJipKxul9GbViVusA379wlOrfHSgxbzt0yPiqCTxOiYES",
+};
 // Python and its packages are kept in the browser's Cache Storage (not left to the HTTP cache,
 // which browsers may skip or evict): ~23 MB downloaded once per Pyodide version. Same name in
 // web/app.js, which checks it to tell phone users what a build will download.
@@ -203,15 +217,46 @@ function immutableUrl(url) {
     && (u.pathname.startsWith("/api/browser/files/") || (u.pathname === "/api/browser/package.zip" && u.searchParams.has("v")));
 }
 
+// the hash a file must match (SRI form, "sha384-..."): the caller's (Pyodide passes its packages'),
+// else Pyodide's own pinned files
+function pinnedHash(url, init) {
+  if (init && init.integrity) return init.integrity;
+  return url.startsWith(PYODIDE_URL) ? PYODIDE_SRI[url.slice(PYODIDE_URL.length)] || null : null;
+}
+
+const SRI_ALGOS = { sha512: "SHA-512", sha384: "SHA-384", sha256: "SHA-256" };   // strongest first
+
+async function matchesHash(buf, integrity) {   // SRI rules: any of the strongest algorithm's hashes
+  const hashes = String(integrity).trim().split(/\s+/)
+    .map((h) => /^(sha256|sha384|sha512)-([A-Za-z0-9+/=_-]+)/.exec(h)).filter(Boolean);
+  const algo = Object.keys(SRI_ALGOS).find((a) => hashes.some((h) => h[1] === a));
+  if (!algo || !crypto.subtle) return false;
+  const digest = btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.digest(SRI_ALGOS[algo], buf))));
+  return hashes.some((h) => h[1] === algo && h[2].replace(/-/g, "+").replace(/_/g, "/") === digest);
+}
+
+async function checkedCopy(res, integrity) {   // a cached response, if it matches the hash
+  const buf = await res.arrayBuffer();
+  if (!(await matchesHash(buf, integrity))) return null;
+  return new Response(buf, { status: res.status, statusText: res.statusText, headers: res.headers });
+}
+
 async function cachedFetch(input, init) {
   const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url, self.location.href).href;
+  const hash = pinnedHash(url, init);
+  if (url.startsWith(PYODIDE_URL) && !hash) throw new TypeError(`Not loaded: ${url} has no pinned hash`);
+  if (hash) init = { ...init, integrity: hash };   // the browser checks what the network returns
   if (!runtimeCache || (init && init.method && init.method !== "GET") || !immutableUrl(url)) return netFetch(input, init);
   RUNTIME.keep.add(url);
   try {
     const hit = await runtimeCache.match(url);
-    if (hit) { RUNTIME.hits++; return hit; }
+    if (hit) {
+      const ok = hash ? await checkedCopy(hit, hash) : hit;
+      if (ok) { RUNTIME.hits++; return ok; }
+      await runtimeCache.delete(url);           // not the pinned file: fetched again
+    }
   } catch (e) { /* storage unavailable: the network */ }
-  const res = await netFetch(input, init);   // (Pyodide passes its packages' integrity hashes)
+  const res = await netFetch(input, init);
   RUNTIME.misses++;
   if (res.ok) {
     RUNTIME.puts.push(runtimeCache.put(url, res.clone()).catch((e) => {
@@ -254,14 +299,11 @@ async function runtimeKept() {    // the runtime was completely stored by an ear
   } catch (e) { return false; }
 }
 
-async function runtimeModule() {   // pyodide.asm.mjs through the cache (Pyodide would import() it)
-  try {
-    const src = await (await cachedFetch(PYODIDE_URL + "pyodide.asm.mjs")).text();
-    const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
-    try { return (await import(url)).default; } finally { URL.revokeObjectURL(url); }
-  } catch (e) {
-    return undefined;       // let Pyodide load it itself
-  }
+async function importPyodide(name) {   // a Pyodide module from its checked bytes
+  const res = await cachedFetch(PYODIDE_URL + name);
+  if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
+  const url = URL.createObjectURL(new Blob([await res.text()], { type: "text/javascript" }));
+  try { return await import(url); } finally { URL.revokeObjectURL(url); }
 }
 
 // Persistent data cache (web/opfs-cache.js): held while a job runs, released after it so another
@@ -309,7 +351,8 @@ async function init(say) {
   const cfg = await (await netFetch("/api/browser/config", { cache: "no-cache" })).json();
   PROXY = cfg.proxy || null;
   PROXY_FIRST = new Set(cfg.proxy_first || []);
-  py = await loadPyodide({ createPyodideModule: await runtimeModule() });
+  const { loadPyodide } = await importPyodide("pyodide.mjs");
+  py = await loadPyodide({ indexURL: PYODIDE_URL, createPyodideModule: (await importPyodide("pyodide.asm.mjs")).default });
   const t1 = performance.now();
   const wheels = { ...(cfg.wheels || {}) };
   if (fullScipy || !wheels.scipy) delete wheels.scipy;

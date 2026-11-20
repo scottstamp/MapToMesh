@@ -4,25 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MapToMesh - generate in your browser (prototype)</title>
-<style>
-  body { font: 15px/1.45 system-ui, sans-serif; max-width: 760px; margin: 24px auto; padding: 0 16px; color: #1d2329; }
-  h1 { font-size: 1.35rem; margin-bottom: 4px; }
-  .note { color: #5b6670; margin-top: 0; }
-  form { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px 14px; margin: 18px 0; }
-  label { display: flex; flex-direction: column; font-size: .85rem; color: #46515b; gap: 3px; }
-  label.check { flex-direction: row; align-items: center; gap: 6px; }
-  input, select { font: inherit; padding: 5px 7px; border: 1px solid #b9c2ca; border-radius: 6px; }
-  button { font: inherit; padding: 8px 18px; border: 0; border-radius: 6px; background: #1f6feb; color: #fff; cursor: pointer; }
-  button:disabled { background: #8aa9d6; cursor: default; }
-  progress { width: 100%; height: 10px; }
-  #status { margin: 8px 0; min-height: 1.4em; }
-  #log { font: 12px/1.4 ui-monospace, monospace; background: #f4f6f8; padding: 10px; border-radius: 6px; white-space: pre-wrap; max-height: 260px; overflow: auto; }
-  #result img { max-width: 100%; border-radius: 6px; margin-top: 10px; }
-  #result table { border-collapse: collapse; margin-top: 8px; }
-  #result td { padding: 2px 12px 2px 0; }
-  .links a { margin-right: 14px; }
-  .err { color: #b42318; }
-</style>
+<link rel="stylesheet" href="/static/browser-page.css">
 </head>
 <body>
 <h1>Generate in your browser</h1>
@@ -70,94 +52,6 @@
 <h3>Log</h3>
 <div id="log"></div>
 
-<script type="module">
-const $ = (id) => document.getElementById(id);
-const log = (s) => { $("log").textContent += s + "\n"; $("log").scrollTop = 1e9; };
-let worker = null, t0 = 0, urls = [];
-
-function opts() {
-  const f = new FormData($("f"));
-  const num = (k) => Number(f.get(k));
-  return {
-    lat: num("lat"), lon: num("lon"), width_m: num("width_m"), height_m: num("height_m"),
-    grid_cells: num("grid_cells"), size_mm: num("size_mm"), color_mode: f.get("color_mode"),
-    osm_roads: f.get("osm_roads"), osm_water: f.get("osm_water") === "on", name: f.get("name") || "MapToMesh",
-    surface: "terrain", dem_preference: f.get("dem_preference"), source: f.get("source"),
-  };
-}
-
-function fmtMB(n) { return (n / 1e6).toFixed(1) + " MB"; }
-
-function showResult(m) {
-  const r = m.res, files = m.files;
-  urls.forEach(URL.revokeObjectURL);
-  urls = [];
-  const link = (name, label, type) => {
-    if (!files[name]) return "";
-    const u = URL.createObjectURL(new Blob([files[name]], { type }));
-    urls.push(u);
-    return `<a href="${u}" download="${name}">${label} (${fmtMB(files[name].length)})</a>`;
-  };
-  const thumb = files["thumbnail.png"] ? URL.createObjectURL(new Blob([files["thumbnail.png"]], { type: "image/png" })) : "";
-  if (thumb) urls.push(thumb);
-  const b = r.browser, net = b.net;
-  const rows = [
-    ["Triangles", r.stats.triangles.toLocaleString()],
-    ["Job time (this device)", m.job_s.toFixed(1) + " s"],
-    ["Data downloaded by the job", `${fmtMB(net.bytes)} in ${net.requests} requests (${net.seconds} s waiting)`],
-    ["Peak WebAssembly memory", Math.round(m.heap_mb) + " MB"],
-    ["Elevation", (r.data.sources || []).map(s => `${s.label} ${(100 * s.share).toFixed(0)}%`).join("; ")],
-  ];
-  $("result").innerHTML =
-    `<div class="links">${link(r.file, "3MF", "model/3mf")} ${link(r.stl_file, "STL zip", "application/zip")}` +
-    ` ${link(r.base_file, "Base 3MF", "model/3mf")}</div>` +
-    `<table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("")}</table>` +
-    (thumb ? `<img src="${thumb}" alt="Top view of the model">` : "");
-  log(`stages: ${b.marks.map(([t, , msg]) => `${t}s ${msg}`).join("\n        ")}`);
-  window.__last = { job_s: m.job_s, total_s: m.total_s, heap_mb: m.heap_mb, net, triangles: r.stats.triangles,
-                    marks: b.marks, sources: (r.data.sources || []).map(s => `${s.label} ${(100 * s.share).toFixed(0)}%`), errors: r.data.errors, sizes: Object.fromEntries(Object.entries(files).map(([k, v]) => [k, v.length])) };
-}
-
-$("go").onclick = () => {
-  if (!worker) {
-    worker = new Worker("/static/browser-worker.js" + location.search, { type: "module" });
-    worker.onmessage = (e) => {
-      const m = e.data;
-      const s = ((performance.now() - t0) / 1000).toFixed(1);
-      if (m.type === "progress") {
-        $("bar").value = m.f;
-        if ($("status").textContent !== m.msg) log(`${s}s  ${m.msg}`);
-        $("status").textContent = m.msg;
-      } else if (m.type === "setup") {
-        const x = m.setup;
-        log(`${s}s  Python ready: runtime ${x.runtime_s.toFixed(1)} s, packages ${x.packages_s.toFixed(1)} s, ` +
-            `code ${x.code_s.toFixed(1)} s, ~${x.downloaded_mb.toFixed(1)} MB fetched, Pyodide ${x.pyodide}, ` +
-            `Promise Integration ${x.jspi ? "yes" : "no (downloads one at a time)"}, ` +
-            `Rust extension ${x.native ? "yes" : "no"}`);
-        window.__setup = x;
-      } else if (m.type === "done") {
-        $("status").textContent = `Done in ${s} s`;
-        $("bar").hidden = true;
-        $("go").disabled = false;
-        showResult(m);
-        window.__done = true;
-      } else if (m.type === "error") {
-        $("status").innerHTML = `<span class="err">Failed: ${m.message.replace(/</g, "&lt;")}</span>`;
-        log(m.message);
-        $("bar").hidden = true;
-        $("go").disabled = false;
-        window.__error = m.message;
-      }
-    };
-  }
-  t0 = performance.now();
-  window.__done = false; window.__error = null;
-  $("go").disabled = true;
-  $("bar").hidden = false;
-  $("bar").value = 0;
-  $("result").innerHTML = "";
-  worker.postMessage({ type: "run", opts: opts() });
-};
-</script>
+<script type="module" src="/static/browser-page.js"></script>
 </body>
 </html>
