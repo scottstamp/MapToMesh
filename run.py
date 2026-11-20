@@ -1,15 +1,14 @@
 """Start the MapToMesh web app:  python run.py [--port 8000] [--no-browser]
 
-Behind a reverse proxy (nginx, Caddy, a tunnel), set ``MAPTOMESH_FORWARDED_ALLOW_IPS`` to the
-proxy's address(es) - comma-separated IPs or CIDR ranges - so per-client limits use the client
-address from ``X-Forwarded-For``; only requests from those addresses may set it. The default,
-``127.0.0.1``, suits a proxy on the same machine. Never use ``*`` on a server that is reachable
-directly: anyone could then pick the address their requests are counted against.
+Served through Cloudflare: per-client limits count against the visitor address Cloudflare sends
+in ``CF-Connecting-IP``, believed only from Cloudflare's address ranges or this machine (a
+cloudflared tunnel); see ``maptomesh.limits.client_key``. Requests from this machine without that
+header (tests) have no request limits. uvicorn's own proxy-header handling stays off: it would
+replace the peer address that check relies on with an X-Forwarded-For value.
 """
 
 import argparse
 import logging
-import os
 import threading
 import webbrowser
 
@@ -29,9 +28,7 @@ def main() -> None:
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     print(f"MapToMesh running at {url}")
     uvicorn.run("maptomesh.server:app", host=args.host, port=args.port, log_level="warning",
-                proxy_headers=True,
-                forwarded_allow_ips=os.environ.get("MAPTOMESH_FORWARDED_ALLOW_IPS", "127.0.0.1"),
-                server_header=False)
+                proxy_headers=False, server_header=False)
 
 
 if __name__ == "__main__":

@@ -864,19 +864,22 @@ def create_job(o: Options, request: Request):
     with _JOBS_LOCK:
         active = [j for j in JOBS.values() if j.state in ("queued", "running")]
         mine = sum(1 for j in active if j.client == key)
-        if mine >= limits.JOBS_PER_CLIENT:
-            return _refuse("busy", f"You already have {mine} model{'s' if mine > 1 else ''} queued or being built "
-                           "on the server; wait for one to finish (or cancel it).",
-                           ["Wait for your other model to finish, or cancel it, then try again."], status=429,
-                           headers={"Retry-After": "30"})
-        if len(active) >= limits.MAX_QUEUE:
-            advice, _ = limits.advice_for("busy", o)
-            return _refuse("busy", f"The server is busy: {len(active)} models are queued or being built.", advice,
-                           status=429, headers={"Retry-After": "60"})
+        if key != limits.LOCAL:            # this machine (tests run in parallel): no queue limits
+            if mine >= limits.JOBS_PER_CLIENT:
+                return _refuse("busy", f"You already have {mine} model{'s' if mine > 1 else ''} queued or being "
+                               "built on the server; wait for one to finish (or cancel it).",
+                               ["Wait for your other model to finish, or cancel it, then try again."], status=429,
+                               headers={"Retry-After": "30"})
+            if len(active) >= limits.MAX_QUEUE:
+                advice, _ = limits.advice_for("busy", o)
+                return _refuse("busy", f"The server is busy: {len(active)} models are queued or being built.",
+                               advice, status=429, headers={"Retry-After": "60"})
         job = Job(uuid.uuid4().hex[:12], o, client=key, cancel_token=secrets.token_urlsafe(18))
         JOBS[job.id] = job
-        while len(JOBS) > 50:
-            JOBS.popitem(last=False)
+        # keep the newest 50 in memory; never drop one still queued or running
+        done = [jid for jid, j in JOBS.items() if j.state not in ("queued", "running")]
+        for jid in done[:max(0, len(JOBS) - 50)]:
+            del JOBS[jid]
     threading.Thread(target=_run_job, args=(job,), daemon=True).start()
     return {"id": job.id, "cancel_token": job.cancel_token}
 

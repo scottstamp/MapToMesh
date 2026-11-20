@@ -409,6 +409,24 @@ def test_client_keys():
     assert k("unknown") == "unknown" and k("") == "unknown"
 
 
+def test_local_unlimited():
+    """Requests from this machine (limits.LOCAL: tests) aren't limited or counted."""
+    _reset()
+    c, g = proxy.CLIENT_CONCURRENT, proxy.GLOBAL_CONCURRENT
+    proxy.CLIENT_CONCURRENT, proxy.GLOBAL_CONCURRENT = 1, 1
+    try:
+        with _Fake(_ok(b"z" * 1000)):
+            streams = [proxy.open_upstream(GH + f"l{i}", "GET", {}, None, proxy.LOCAL)[2] for i in range(5)]
+            assert proxy.CLIENTS.total == 0 and not proxy.CLIENTS.active
+            a = proxy.open_upstream(GH + "x", "GET", {}, None, "203.0.113.9")[2]    # a visitor still gets one
+            assert len(b"".join(a)) == 1000
+            for st in streams:
+                assert len(b"".join(st)) == 1000
+            assert proxy.CLIENTS.total == 0 and "local" not in proxy.CLIENTS.used
+    finally:
+        proxy.CLIENT_CONCURRENT, proxy.GLOBAL_CONCURRENT = c, g
+
+
 def test_slots_per_client_and_global():
     _reset()
     c, g = proxy.CLIENT_CONCURRENT, proxy.GLOBAL_CONCURRENT
@@ -584,7 +602,8 @@ def test_response_size_cap():
 if __name__ == "__main__":
     for fn in (test_bypasses_refused, test_allowed_and_sent_unchanged, test_extra_rules,
                test_sent_target_is_checked_url, test_redirects_rechecked, test_response_headers,
-               test_request_headers_and_session, test_client_keys, test_slots_per_client_and_global,
+               test_request_headers_and_session, test_client_keys, test_local_unlimited,
+               test_slots_per_client_and_global,
                test_budget_counted_while_streaming, test_budget_window, test_slow_readers_reaped,
                test_reaped_mid_read_is_not_a_complete_file, test_response_size_cap):
         fn()

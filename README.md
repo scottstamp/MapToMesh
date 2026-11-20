@@ -471,15 +471,20 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 | `MAPTOMESH_JOBS_PER_CLIENT` | `2` (server jobs one client may have queued or running) |
 | `MAPTOMESH_KEEP_REVIEWS` | `20000` (reviews kept; the oldest go first) |
 | `MAPTOMESH_REVIEWS_MAX_MB` | `200` (size budget of the stored reviews; the oldest go first) |
-| `MAPTOMESH_FORWARDED_ALLOW_IPS` | `127.0.0.1` (reverse proxies trusted to set `X-Forwarded-For`; see below) |
+| `MAPTOMESH_TRUSTED_PROXIES` | empty (address ranges besides Cloudflare's and this machine allowed to set `CF-Connecting-IP`; see below) |
+| `MAPTOMESH_LOCAL_UNLIMITED` | `1` (requests from this machine without `CF-Connecting-IP` have no request limits; `0` turns that off) |
 
-**Deployment behind a reverse proxy.** Per-client limits (jobs, estimates, coverage, shares,
-reviews, the data proxy) count against the client's address (IPv6: its /64). Behind nginx, Caddy
-or a tunnel, that address comes from `X-Forwarded-For`, which uvicorn only believes from the
-addresses in `MAPTOMESH_FORWARDED_ALLOW_IPS` (comma-separated IPs / CIDR ranges; `run.py` passes it
-on). Set it to the proxy's address, make the proxy overwrite (not pass through) the header, and
-never use `*` on a server that is reachable directly. Started some other way than `run.py`, give
-uvicorn the same `--proxy-headers --forwarded-allow-ips`. The API has no public docs or schema
+**Deployment behind Cloudflare.** Per-client limits (jobs, estimates, coverage, shares, reviews,
+the data proxy) count against the visitor's address (IPv6: its /64), taken from the
+`CF-Connecting-IP` header Cloudflare sets on every request. The header is believed only when the
+connection comes from Cloudflare's published address ranges (a proxied origin) or from this
+machine (a cloudflared tunnel); from anywhere else the connecting address counts, so a visitor
+reaching the server directly can't pick their own. `X-Forwarded-For` is ignored (visitors can
+prepend to it), and `run.py` keeps uvicorn's proxy-header rewriting off: started some other way,
+don't pass uvicorn `--proxy-headers`. Requests from this machine without `CF-Connecting-IP` never
+went through Cloudflare: they are local (tests, maintenance) and have no request limits, so test
+suites can run in parallel. Cloudflare's ranges are built in (`maptomesh/limits.py`, from
+cloudflare.com/ips); add others with `MAPTOMESH_TRUSTED_PROXIES`. The API has no public docs or schema
 (`/docs`, `/openapi.json`), request bodies are capped (413), and error responses carry an error id
 instead of internals: the details go to the server log.
 

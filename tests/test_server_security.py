@@ -65,8 +65,8 @@ def call(method: str, path: str, query: str = "", headers: dict | None = None, b
     return out["status"], out["headers"], out["body"]
 
 
-def post_json(path: str, data, **kw):
-    return call("POST", path, headers={"content-type": "application/json"},
+def post_json(path: str, data, headers: dict | None = None, **kw):
+    return call("POST", path, headers={"content-type": "application/json", **(headers or {})},
                 body=json.dumps(data).encode(), **kw)
 
 
@@ -294,6 +294,62 @@ def _queue_jobs_without_running():
     return real
 
 
+class _HReq:
+    """A request with a peer address and headers (lower-case names, as Starlette's)."""
+    def __init__(self, host, headers=None):
+        self.client = type("C", (), {"host": host})() if host else None
+        self.headers = {k.lower(): v for k, v in (headers or {}).items()}
+
+
+def test_cloudflare_client_ip():
+    cf = {"CF-Connecting-IP": "198.51.100.77"}
+    # through a cloudflared tunnel (peer: this machine) or Cloudflare's edge (its ranges): the header
+    assert limits.client_key(_HReq("127.0.0.1", cf)) == "198.51.100.77"
+    assert limits.client_key(_HReq("::1", cf)) == "198.51.100.77"
+    assert limits.client_key(_HReq("172.70.1.2", cf)) == "198.51.100.77"              # 172.64.0.0/13
+    assert limits.client_key(_HReq("2606:4700:10::1", cf)) == "198.51.100.77"
+    assert limits.client_key(_HReq("127.0.0.1", {"CF-Connecting-IP": "2001:db8:5:6::9"})) == "2001:db8:5:6::/64"
+    # straight to the server from elsewhere: a forged header doesn't move the visitor's bucket
+    assert limits.client_key(_HReq("203.0.113.50", cf)) == "203.0.113.50"
+    assert limits.client_key(_HReq("203.0.113.50", {"X-Forwarded-For": "198.51.100.77"})) == "203.0.113.50"
+    # this machine without the header: local (tests), exempt from limits
+    assert limits.client_key(_HReq("127.0.0.1")) == limits.LOCAL
+    assert limits.client_key(_HReq("::ffff:127.0.0.1")) == limits.LOCAL
+    assert limits.client_key(_HReq("127.0.0.1", {"X-Forwarded-For": "198.51.100.77"})) == limits.LOCAL
+    # a header that isn't an address never makes a request local
+    assert limits.client_key(_HReq("127.0.0.1", {"CF-Connecting-IP": "nonsense"})) == "127.0.0.1"
+    # MAPTOMESH_TRUSTED_PROXIES-style extra range
+    saved = limits.TRUSTED_PROXIES
+    try:
+        import ipaddress
+        limits.TRUSTED_PROXIES = saved + (ipaddress.ip_network("192.0.2.0/24"),)
+        assert limits.client_key(_HReq("192.0.2.9", cf)) == "198.51.100.77"
+    finally:
+        limits.TRUSTED_PROXIES = saved
+    # the switch
+    saved = limits.LOCAL_UNLIMITED
+    try:
+        limits.LOCAL_UNLIMITED = False
+        assert limits.client_key(_HReq("127.0.0.1")) == "127.0.0.1"
+    finally:
+        limits.LOCAL_UNLIMITED = saved
+
+
+def test_local_requests_unlimited():
+    r = limits.RateLimit(1)
+    assert all(r.hit(limits.LOCAL) == 0 for _ in range(100))
+    s = limits.Slots(1, per_client=1)
+    assert all(s.enter(limits.LOCAL) is None for _ in range(10))
+    assert s.enter("a") is None and s.enter("b") == "busy"      # local slots weren't counted
+    for _ in range(10):
+        s.leave(limits.LOCAL)
+    assert s.enter("b") == "busy"
+    # through the app: estimates / coverage from this machine never hit their limits
+    for _ in range(5):
+        st, _, _ = call("GET", "/api/coverage/usgs", query="w=-80&s=43&e=-79.9&n=43.1", client="127.0.0.1")
+        assert st != 429, st
+
+
 def test_jobs_per_client_and_cancel_token():
     real = _queue_jobs_without_running()
     server.JOBS.clear()
@@ -323,12 +379,17 @@ def test_jobs_per_client_and_cancel_token():
         assert not server.JOBS[d1["id"]].cancel.is_set()
         assert call("POST", path, headers={"x-cancel-token": d1["cancel_token"]})[0] == 200
         assert server.JOBS[d1["id"]].cancel.is_set()
-        # the whole queue: refused for everyone
+        # the whole queue: refused for everyone but this machine (tests run in parallel)
         limits_q = limits.MAX_QUEUE
         limits.MAX_QUEUE = len([j for j in server.JOBS.values() if j.state == "queued"])
         try:
             st, _, b = post_json("/api/jobs", body, client="198.51.100.99")
             assert st == 429 and "busy" in json.loads(b)["detail"]
+            for _ in range(limits.JOBS_PER_CLIENT + 2):
+                assert post_json("/api/jobs", body, client="127.0.0.1")[0] == 200
+            # through Cloudflare (tunnel: peer is this machine, header set): limited again
+            st, _, _ = post_json("/api/jobs", body, client="127.0.0.1", headers={"CF-Connecting-IP": "198.51.100.98"})
+            assert st == 429
         finally:
             limits.MAX_QUEUE = limits_q
     finally:
@@ -441,7 +502,8 @@ def test_shares_and_failures_still_work():
 
 TESTS = [test_docs_hidden, test_security_headers, test_body_limit, test_proxy_checks_url_before_body,
          test_coverage_bounds, test_coverage_usgs_bounds, test_tile_query_capped, test_coverage_rate_limit,
-         test_job_ids, test_thumbnail_traversal, test_client_key, test_rate_and_slots, test_estimate_fails_fast,
+         test_job_ids, test_thumbnail_traversal, test_client_key, test_cloudflare_client_ip,
+         test_local_requests_unlimited, test_rate_and_slots, test_estimate_fails_fast,
          test_jobs_per_client_and_cancel_token, test_worker_error_classification, test_job_failure_hides_internals,
          test_value_error_handler, test_reviews_budget, test_review_endpoint, test_shares_and_failures_still_work]
 

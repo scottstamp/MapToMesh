@@ -149,25 +149,90 @@ def public() -> dict:
 
 
 # ---------------------------------------------------------------- per-client request limits
-# A public server keys its limits on the client: the address uvicorn reports, which is the
-# X-Forwarded-For address only when the request came through a trusted reverse proxy
-# (``MAPTOMESH_FORWARDED_ALLOW_IPS``, run.py). IPv6 clients are keyed by their /64: one
-# subscriber usually has a whole /64 and could otherwise rotate through addresses.
+# The public service sits behind Cloudflare, which puts the visitor's address in CF-Connecting-IP
+# on every request (overwriting any the visitor sent). That header is believed only when the TCP
+# peer can be Cloudflare: its published ranges (a proxied origin) or this machine (cloudflared /
+# a local reverse proxy). Anyone reaching the server directly could otherwise choose the address
+# their requests count against. X-Forwarded-For is not used: visitors can prepend to it.
+#
+# A request from this machine WITHOUT CF-Connecting-IP never went through Cloudflare: it is local
+# (tests, maintenance) and no request limits apply to it (``LOCAL``), so test suites can run in
+# parallel. MAPTOMESH_LOCAL_UNLIMITED=0 turns that off.
+#
+# IPv6 clients are keyed by their /64: one subscriber usually has a whole /64 and could otherwise
+# rotate through addresses.
 
 JOBS_PER_CLIENT = int(os.environ.get("MAPTOMESH_JOBS_PER_CLIENT", "2"))   # server jobs queued / running
+LOCAL = "local"                 # the client key of local requests: exempt from every request limit
+LOCAL_UNLIMITED = os.environ.get("MAPTOMESH_LOCAL_UNLIMITED", "1") != "0"
+
+# https://www.cloudflare.com/ips-v4 and /ips-v6 (they change rarely; MAPTOMESH_TRUSTED_PROXIES
+# adds ranges, comma-separated)
+CLOUDFLARE_RANGES = (
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18",
+    "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17",
+    "162.158.0.0/15", "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32",
+    "2a06:98c0::/29", "2c0f:f248::/32",
+)
+
+
+def _networks() -> tuple:
+    import ipaddress
+    extra = [s.strip() for s in os.environ.get("MAPTOMESH_TRUSTED_PROXIES", "").split(",") if s.strip()]
+    return tuple(ipaddress.ip_network(s, strict=False) for s in (*CLOUDFLARE_RANGES, *extra))
+
+
+TRUSTED_PROXIES = _networks()
+
+
+def _ip(text: str | None):
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address((text or "").strip().split("%", 1)[0])
+    except ValueError:
+        return None
+    return ip.ipv4_mapped if ip.version == 6 and ip.ipv4_mapped is not None else ip
+
+
+def _peer(request):
+    """The TCP peer's address (uvicorn runs without proxy-header rewriting: see run.py)."""
+    client = getattr(request, "client", None)
+    return _ip(client.host) if client else None
+
+
+def _cf_header(request) -> str | None:
+    headers = getattr(request, "headers", None)
+    return headers.get("cf-connecting-ip") if headers is not None else None
+
+
+def client_ip(request) -> str:
+    """The visitor's address: CF-Connecting-IP when the request came through a peer that can be
+    Cloudflare (its ranges or this machine), else the peer itself."""
+    peer = _peer(request)
+    cf = _cf_header(request)
+    if cf is not None and peer is not None and (peer.is_loopback or any(peer in n for n in TRUSTED_PROXIES)):
+        ip = _ip(cf)
+        if ip is not None:
+            return str(ip)
+    return str(peer) if peer is not None else ""
+
+
+def is_local(request) -> bool:
+    """From this machine and not through Cloudflare (tests, maintenance)."""
+    peer = _peer(request)
+    return LOCAL_UNLIMITED and peer is not None and peer.is_loopback and _cf_header(request) is None
 
 
 def client_key(request) -> str:
-    """The key per-client limits count against (an IPv4 address or an IPv6 /64)."""
+    """The key per-client limits count against: an IPv4 address, an IPv6 /64, or ``LOCAL``."""
     import ipaddress
-    host = request.client.host if getattr(request, "client", None) else ""
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return host[:100] or "unknown"
+    if is_local(request):
+        return LOCAL
+    ip = _ip(client_ip(request))
+    if ip is None:
+        return "unknown"
     if ip.version == 6:
-        if ip.ipv4_mapped is not None:
-            return str(ip.ipv4_mapped)
         return str(ipaddress.ip_network(f"{ip}/64", strict=False))
     return str(ip)
 
@@ -185,6 +250,8 @@ class RateLimit:
         """Count an event; 0 if allowed, else the seconds until the client may try again."""
         import time
         from collections import deque
+        if key == LOCAL:
+            return 0.0
         now = time.time()
         with self._lock:
             q = self._times.setdefault(key, deque())
@@ -217,7 +284,9 @@ class Slots:
 
     def enter(self, key: str) -> str | None:
         """Take a slot: None if taken, else why not ("client": this client's share is in use,
-        "busy": all slots are)."""
+        "busy": all slots are). Local requests (``LOCAL``) always get one and don't count."""
+        if key == LOCAL:
+            return None
         with self._lock:
             if self._active.get(key, 0) >= self.per_client:
                 return "client"
@@ -228,6 +297,8 @@ class Slots:
             return None
 
     def leave(self, key: str) -> None:
+        if key == LOCAL:
+            return
         with self._lock:
             n = self._active.get(key, 0) - 1
             if n > 0:

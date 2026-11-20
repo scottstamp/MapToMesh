@@ -28,6 +28,8 @@ import weakref
 from collections import deque
 from urllib.parse import urljoin, urlsplit
 
+from .limits import LOCAL
+
 from . import config
 
 # (host, path prefix): the elevation / map data hosts the providers read
@@ -268,6 +270,8 @@ class _Clients:
         return self.used_total[key]
 
     def enter(self, key: str, now: float | None = None) -> None:
+        if key == LOCAL:                # this machine (tests): no limits, not counted
+            return
         now = time.monotonic() if now is None else now
         with self.lock:
             if self.total >= GLOBAL_CONCURRENT:
@@ -281,6 +285,8 @@ class _Clients:
 
     def add(self, key: str, nbytes: int, now: float | None = None) -> bool:
         """Count bytes as they stream; False once the key's hourly budget is exceeded."""
+        if key == LOCAL:
+            return True
         now = time.monotonic() if now is None else now
         with self.lock:
             used = self._used(key, now) + nbytes
@@ -296,6 +302,8 @@ class _Clients:
             return used <= CLIENT_BYTES_PER_HOUR
 
     def leave(self, key: str) -> None:
+        if key == LOCAL:
+            return
         with self.lock:
             self.active[key] = max(0, self.active.get(key, 1) - 1)
             if not self.active[key]:
