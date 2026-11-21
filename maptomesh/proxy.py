@@ -9,9 +9,11 @@ backslashes or encoded slashes are refused, and the URL checked is the exact URL
 canonicalises it the way ``requests`` would and refuses anything the library would still change).
 Redirects are followed by hand and every hop is checked the same way.
 
-Per client (IPv4 address / IPv6 /64): a few concurrent requests and an hourly byte budget counted
-while the bytes stream; overall: a cap on concurrent requests. A stream whose reader stalls or
-trickles is cut off so it can't hold its slot (``reap``). Responses can't run script under our
+Per client (IPv4 address / IPv6 /64, and a few clients' worth per IPv6 /48): hourly request
+allowances (``rate_wait``), a few concurrent requests and an hourly byte budget counted while the
+bytes stream; overall: a cap on concurrent requests, a quarter of it kept for new clients. A
+stream whose reader stalls or trickles, or that stays open too long, is cut off so it can't hold
+its slot (``reap``); upstream reads time out after ``READ_TIMEOUT``. Responses can't run script under our
 origin (sandbox CSP, no HTML), and the upstream session keeps no cookies and ignores the
 environment (no ``.netrc`` credentials, no proxy variables).
 """
@@ -28,7 +30,7 @@ import weakref
 from collections import deque
 from urllib.parse import urljoin, urlsplit
 
-from .limits import LOCAL
+from .limits import GROUP_FACTOR, LOCAL, RateLimit, group_of
 
 from . import config
 
@@ -81,7 +83,9 @@ RULES: tuple[tuple[str, str], ...] = (
     ("datacube.services.geo.ca", "/stac/"),
     ("planetarycomputer.microsoft.com", "/api/"),
     ("usgs.entwine.io", "/boundaries/"),
-    ("raw.githubusercontent.com", "/hobuinc/usgs-lidar/"),
+    # only the boundaries file maptomesh/usgs_ept.py reads: the rest of the repository (forks'
+    # commits are readable through it by hash) is anyone's content
+    ("raw.githubusercontent.com", "/hobuinc/usgs-lidar/master/boundaries/"),
     ("stac.pgc.umn.edu", "/api/"),
     ("dgm.stac.lgln.niedersachsen.de", "/"),
     ("bdom.stac.lgln.niedersachsen.de", "/"),
@@ -119,14 +123,25 @@ NO_CORS: tuple[str, ...] = (
 MAX_RESPONSE_BYTES = int(float(os.environ.get("MAPTOMESH_PROXY_MAX_MB", "1024")) * 1e6)
 CLIENT_BYTES_PER_HOUR = int(float(os.environ.get("MAPTOMESH_PROXY_GB_PER_HOUR", "4")) * 1e9)
 CLIENT_CONCURRENT = int(os.environ.get("MAPTOMESH_PROXY_CLIENT_CONCURRENT", "16"))
-GLOBAL_CONCURRENT = int(os.environ.get("MAPTOMESH_PROXY_CONCURRENT", "64"))
+# Open streams cost a socket each, not a thread (the route reads them on a few threads of its own:
+# server.PROXY_THREADS), so the overall cap is many clients wide. A client already streaming gets
+# more only while a quarter of it is free: that quarter stays for new clients.
+GLOBAL_CONCURRENT = int(os.environ.get("MAPTOMESH_PROXY_CONCURRENT", "256"))
+# requests per client per hour (each one reaches a third-party server from ours): any method, and
+# HEAD / POST (probes, catalogue searches) on their own, tighter
+REQUESTS_PER_HOUR = int(os.environ.get("MAPTOMESH_PROXY_REQUESTS_PER_HOUR", "3000"))
+HEAD_POST_PER_HOUR = int(os.environ.get("MAPTOMESH_PROXY_HEAD_POST_PER_HOUR", "600"))
 MAX_BODY = 64_000                   # POST bodies (STAC searches)
 MAX_URL = 4000
+CONNECT_TIMEOUT = 10.0
+READ_TIMEOUT = float(os.environ.get("MAPTOMESH_PROXY_READ_TIMEOUT_S", "30"))   # per read from the upstream
 # a stream whose reader takes nothing for IDLE_SECONDS, or less than MIN_BYTES_PER_SECOND over a
-# RATE_WINDOW, is cut off and frees its slot (time spent waiting on the upstream doesn't count)
+# RATE_WINDOW, is cut off and frees its slot (time spent waiting on the upstream doesn't count);
+# so is any stream open longer than MAX_STREAM_SECONDS
 IDLE_SECONDS = float(os.environ.get("MAPTOMESH_PROXY_IDLE_S", "30"))
 RATE_WINDOW = 60.0
 MIN_BYTES_PER_SECOND = float(os.environ.get("MAPTOMESH_PROXY_MIN_KB_PER_S", "4")) * 1e3
+MAX_STREAM_SECONDS = float(os.environ.get("MAPTOMESH_PROXY_MAX_STREAM_S", "900"))
 REAP_EVERY = 5.0
 CHUNK = 64 * 1024
 METHODS = ("GET", "HEAD", "POST")
@@ -149,9 +164,10 @@ def _extra_rules() -> tuple[tuple[str, str], ...]:
 
 
 class Refused(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, retry_after: float | None = None):
         super().__init__(message)
         self.status = status
+        self.retry_after = retry_after
 
 
 class StreamAborted(Exception):
@@ -160,9 +176,10 @@ class StreamAborted(Exception):
 
 
 _NETLOC = re.compile(r"[a-z0-9.-]+(?::443)?")
-# encoded '.', '/', '\', '%' (double encoding) and NUL: no data URL needs them in its path, and
-# each can become a segment that climbs out of a prefix at some server or library
-_BAD_ESCAPES = ("%2e", "%2f", "%5c", "%25", "%00")
+# encoded '.', '/', '\', '%' (double encoding), ';' (path parameters: '..%3b') and NUL: no data URL
+# needs them in its path, and each can become a segment that climbs out of a prefix at some server
+# or library
+_BAD_ESCAPES = ("%2e", "%2f", "%5c", "%25", "%3b", "%00")
 
 
 def _path_ok(path: str) -> bool:
@@ -170,6 +187,11 @@ def _path_ok(path: str) -> bool:
         return False
     low = path.lower()
     if any(e in low for e in _BAD_ESCAPES):
+        return False
+    try:        # escapes must decode to UTF-8: overlong forms ('%c0%ae' = '.') are refused
+        from urllib.parse import unquote_to_bytes
+        unquote_to_bytes(path).decode("utf-8")
+    except UnicodeDecodeError:
         return False
     segs = path.split("/")[1:]
     for i, seg in enumerate(segs):
@@ -247,16 +269,33 @@ def client_key(host: str) -> str:
     return str(ip)
 
 
+REQUESTS = RateLimit(REQUESTS_PER_HOUR)
+HEAD_POST = RateLimit(HEAD_POST_PER_HOUR)
+
+
+def rate_wait(key: str, method: str) -> float:
+    """Count a proxied request against the client's hourly request allowances; 0 if allowed,
+    else the seconds until it may try again."""
+    wait = REQUESTS.hit(key)
+    if not wait and (method or "").upper() in ("HEAD", "POST"):
+        wait = HEAD_POST.hit(key)
+    return wait
+
+
 class _Clients:
-    """Slots and hourly byte budgets per client key (``client_key``)."""
+    """Slots and hourly byte budgets per client key (``client_key``) and per IPv6 /48 (``group_of``,
+    ``GROUP_FACTOR`` times a client's)."""
     BUCKET = 60.0                   # bytes are counted per minute
+    SWEEP_S = 60.0                  # forget keys with nothing in the last hour this often
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.active: dict[str, int] = {}
+        self.active: dict[str, int] = {}        # client keys (the /48s are in active_groups)
+        self.active_groups: dict[str, int] = {}
         self.used: dict[str, deque] = {}       # key -> [[minute start, bytes], ...] over the last hour
         self.used_total: dict[str, int] = {}
         self.total = 0
+        self._swept: float | None = None
 
     def _used(self, key: str, now: float) -> int:
         q = self.used.get(key)
@@ -269,45 +308,73 @@ class _Clients:
             return 0
         return self.used_total[key]
 
+    def _sweep(self, now: float) -> None:
+        if self._swept is None:
+            self._swept = now
+        if now - self._swept < self.SWEEP_S:
+            return
+        self._swept = now
+        for k in list(self.used):
+            self._used(k, now)
+
     def enter(self, key: str, now: float | None = None) -> None:
         if key == LOCAL:                # this machine (tests): no limits, not counted
             return
         now = time.monotonic() if now is None else now
+        group = group_of(key)
         with self.lock:
-            if self.total >= GLOBAL_CONCURRENT:
-                raise Refused(503, "The data proxy is busy; try again shortly")
-            if self.active.get(key, 0) >= CLIENT_CONCURRENT:
-                raise Refused(429, "Too many simultaneous downloads")
-            if self._used(key, now) >= CLIENT_BYTES_PER_HOUR:
-                raise Refused(429, "Hourly download allowance through the server used up; try later")
-            self.active[key] = self.active.get(key, 0) + 1
+            have = self.active.get(key, 0)
+            if self.total >= GLOBAL_CONCURRENT or (have and self.total >= GLOBAL_CONCURRENT - GLOBAL_CONCURRENT // 4):
+                if not have:
+                    raise Refused(503, "The data proxy is busy; try again shortly", retry_after=5)
+                raise Refused(429, "Too many simultaneous downloads", retry_after=2)
+            if have >= CLIENT_CONCURRENT or \
+                    (group and self.active_groups.get(group, 0) >= CLIENT_CONCURRENT * GROUP_FACTOR):
+                raise Refused(429, "Too many simultaneous downloads", retry_after=2)
+            if self._used(key, now) >= CLIENT_BYTES_PER_HOUR or \
+                    (group and self._used(group, now) >= CLIENT_BYTES_PER_HOUR * GROUP_FACTOR):
+                raise Refused(429, "Hourly download allowance through the server used up; try later",
+                              retry_after=600)
+            self.active[key] = have + 1
+            if group:
+                self.active_groups[group] = self.active_groups.get(group, 0) + 1
             self.total += 1
 
+    def _count(self, key: str, nbytes: int, now: float) -> int:
+        used = self._used(key, now) + nbytes
+        q = self.used.setdefault(key, deque())
+        if q and q[-1][0] > now - self.BUCKET:
+            q[-1][1] += nbytes
+        else:
+            q.append([now, nbytes])
+        self.used_total[key] = used
+        return used
+
     def add(self, key: str, nbytes: int, now: float | None = None) -> bool:
-        """Count bytes as they stream; False once the key's hourly budget is exceeded."""
+        """Count bytes as they stream; False once the key's (or its /48's) hourly budget is exceeded."""
         if key == LOCAL:
             return True
         now = time.monotonic() if now is None else now
+        group = group_of(key)
         with self.lock:
-            used = self._used(key, now) + nbytes
-            q = self.used.setdefault(key, deque())
-            if q and q[-1][0] > now - self.BUCKET:
-                q[-1][1] += nbytes
-            else:
-                q.append([now, nbytes])
-            self.used_total[key] = used
-            if len(self.used) > 10_000:          # forget clients with nothing in the last hour
-                for k in list(self.used):
-                    self._used(k, now)
-            return used <= CLIENT_BYTES_PER_HOUR
+            self._sweep(now)
+            ok = self._count(key, nbytes, now) <= CLIENT_BYTES_PER_HOUR
+            if group:
+                ok = self._count(group, nbytes, now) <= CLIENT_BYTES_PER_HOUR * GROUP_FACTOR and ok
+            return ok
 
     def leave(self, key: str) -> None:
         if key == LOCAL:
             return
+        group = group_of(key)
         with self.lock:
             self.active[key] = max(0, self.active.get(key, 1) - 1)
             if not self.active[key]:
                 del self.active[key]
+            if group:
+                self.active_groups[group] = max(0, self.active_groups.get(group, 1) - 1)
+                if not self.active_groups[group]:
+                    del self.active_groups[group]
             self.total = max(0, self.total - 1)
 
 
@@ -327,7 +394,7 @@ class _Stream:
         self.r, self.key = r, key
         self._chunks = r.raw.stream(CHUNK, decode_content=False)
         self.sent = 0
-        self.last = self.mark_t = time.monotonic() if now is None else now
+        self.last = self.mark_t = self.born = time.monotonic() if now is None else now
         self.mark_sent = 0
         self.reading = False        # waiting on the upstream, not on the reader
         self.closed: str | None = None
@@ -388,6 +455,8 @@ class _Stream:
 
     def stale(self, now: float) -> str | None:
         """Why this stream should be cut off now, if it should."""
+        if now - self.born > MAX_STREAM_SECONDS:     # however it's read: no slot is held for good
+            return "open too long"
         if self.reading:            # the upstream is slow, not the reader (it has its own timeout)
             self.mark_t, self.mark_sent = now, self.sent
             return None
@@ -484,7 +553,7 @@ def open_upstream(url: str, method: str, headers: dict, body: bytes | None, clie
             if prep.url != url:             # the library changed what was checked: don't send it
                 raise Refused(403, "Not a data source this server forwards")
             try:
-                r = s.send(prep, stream=True, allow_redirects=False, timeout=(15, 120))
+                r = s.send(prep, stream=True, allow_redirects=False, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             finally:
                 s.cookies.clear()
             if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):

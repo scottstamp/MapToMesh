@@ -49,8 +49,46 @@ def test_cli_safe_strips_control_bytes():
     assert "\x1b" not in t and "\n  at f()" in t
 
 
+def test_cli_env_values_escaped():
+    """Stored env values are printed through _safe, and malformed ones (older rows, a report that
+    bypassed the endpoint's checks) don't crash the listing."""
+    import contextlib
+    import io
+    real = df._STORE
+    with tempfile.TemporaryDirectory() as d:
+        df._STORE = df.FailureStore(os.path.join(d, "f.sqlite"))
+        try:
+            for env in ({"memory_mb": "\x1b]0;pwned\x07\x1b[2J", "python": {"ready": "\x1b[31m"}},
+                        {"python": "x"}, {"cores": ["\x1b"]}):
+                df._STORE.add(kind="error", message="m", trace="", stage="", options={"lat": "x"}, env=env,
+                              user_agent="", app_version="t")
+            con = df._STORE._connect()                         # a row whose env isn't an object
+            try:
+                con.execute("UPDATE failures SET env_json = '[1]' WHERE id = 3")
+            finally:
+                con.close()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                df._main(["10"])
+            out = buf.getvalue()
+            assert "\x1b" not in out and "\x07" not in out and out.count("#") == 3, out
+        finally:
+            df._STORE = real
+
+
+def test_global_rate_limit():
+    real = df._GLOBAL
+    df._GLOBAL = df.limits.RateLimit(2, group_factor=0)
+    try:
+        assert [df.rate_limited(f"198.51.100.{i}") for i in range(4)] == [False, False, True, True]
+        assert not df.rate_limited(df.limits.LOCAL)
+    finally:
+        df._GLOBAL = real
+
+
 if __name__ == "__main__":
-    for fn in (test_store, test_rate_limit, test_cli_safe_strips_control_bytes):
+    for fn in (test_store, test_rate_limit, test_cli_safe_strips_control_bytes, test_cli_env_values_escaped,
+               test_global_rate_limit):
         fn()
         print(f"{fn.__name__}: ok")
     print("all passed")

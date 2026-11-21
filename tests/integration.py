@@ -1,6 +1,6 @@
 """End-to-end integration tests against a running MapToMesh server.
 
-    python run.py --no-browser --port 8765        # in another terminal
+    python run.py --no-browser --port 8765 --local-unlimited   # in another terminal (no request limits for it)
     python tests/integration.py [--base http://127.0.0.1:8765] [case ...]
 
 Each case submits a job, waits for it, re-validates the downloaded 3MF with

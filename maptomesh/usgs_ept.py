@@ -83,11 +83,16 @@ def _download_resources() -> None:
     raise RuntimeError(f"USGS 3DEP project list unavailable: {last}")
 
 
+class Busy(RuntimeError):
+    """The project list is being downloaded by another thread."""
+
+
 class ProjectIndex:
     def __init__(self):
         self._lock = threading.Lock()
         self._projects: list[EptProject] | None = None
         self._bbox: np.ndarray | None = None
+        self._loading = False
 
     def _load(self) -> None:
         stale = not RESOURCES_PATH.exists() or time.time() - RESOURCES_PATH.stat().st_mtime > REFRESH_S
@@ -116,10 +121,19 @@ class ProjectIndex:
         self._projects = projects
         self._bbox = np.asarray(boxes)
 
-    def get(self) -> list[EptProject]:
+    def get(self, wait: bool = True) -> list[EptProject]:
+        """The projects, loaded (and downloaded if need be) on first use. ``wait=False``: raise
+        ``Busy`` rather than wait while another thread downloads them (web requests must not pile
+        up threads behind a slow download)."""
+        if not wait and self._projects is None and self._loading:
+            raise Busy("The USGS 3DEP project list is being downloaded; try again in a minute")
         with self._lock:
             if self._projects is None:
-                self._load()
+                self._loading = True
+                try:
+                    self._load()
+                finally:
+                    self._loading = False
             return self._projects
 
     def query(self, bbox: tuple[float, float, float, float]) -> list[EptProject]:
@@ -138,17 +152,20 @@ class ProjectIndex:
                 out.append(p)
         return out
 
-    def overlay(self) -> bytes:
+    def overlay(self, wait: bool = True) -> bytes:
         """Footprints as gzipped GeoJSON for the coverage map (built once, cached). The boundaries
-        are already coarse (~80 vertices per project): rounding to ~10 m + gzip makes ~1 MB."""
+        are already coarse (~80 vertices per project): rounding to ~10 m + gzip makes ~1 MB.
+        ``wait``: as ``get``."""
         import gzip
 
-        with self._lock:
+        try:        # no lock: the file is replaced whole (atomic_write); a download deletes it
             if OVERLAY_PATH.exists() and RESOURCES_PATH.exists() \
                     and OVERLAY_PATH.stat().st_mtime >= RESOURCES_PATH.stat().st_mtime:
                 return OVERLAY_PATH.read_bytes()
+        except OSError:
+            pass
         feats = []
-        for p in self.get():
+        for p in self.get(wait):
             rings = [np.round(r, 4).tolist() for r in p.rings]
             feats.append({"type": "Feature", "properties": {"project": p.label, "year": p.year},
                           "geometry": {"type": "MultiPolygon", "coordinates": [[r] for r in rings if len(r) >= 4]}})

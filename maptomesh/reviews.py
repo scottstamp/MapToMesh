@@ -5,9 +5,10 @@ reproduced later.
 
 The database lives in ``config.DATA_DIR`` (not the cache, which may be wiped) and contains personal
 data when users leave contact details: keep it out of version control and backups you share. No IP
-addresses are stored. Anyone can post reviews (rate-limited per client), so the table keeps a budget
-(``MAPTOMESH_KEEP_REVIEWS`` rows, ``MAPTOMESH_REVIEWS_MAX_MB``): the oldest go first. Anything rendered from it (the future admin page) must be HTML-escaped - every
-text field is user input.
+addresses are stored. Anyone can post reviews (rate-limited per client and overall), so the table
+keeps a budget (``MAPTOMESH_KEEP_REVIEWS`` rows, ``MAPTOMESH_REVIEWS_MAX_MB``) and refuses new
+reviews once it is full - it never deletes stored ones to make room. Anything rendered from it (the
+future admin page) must be HTML-escaped - every text field is user input.
 """
 
 from __future__ import annotations
@@ -55,11 +56,16 @@ CREATE INDEX IF NOT EXISTS reviews_status ON reviews (status);
 """
 
 
+class StoreFull(Exception):
+    """The review table is at its row or size budget."""
+
+
 class ReviewStore:
     def __init__(self, path=DB_PATH):
         self.path = str(path)
         self._lock = threading.Lock()
         self._bytes: int | None = None     # text stored, for the MAX_MB budget (summed on first add)
+        self._rows: int | None = None
         with self._connect() as con:
             con.executescript(_SCHEMA)
             if con.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
@@ -80,6 +86,10 @@ class ReviewStore:
     def add(self, *, job_id: str, job_state: str, rating: int | None, problems: list[str], comment: str,
             wants_followup: bool, contact_name: str | None, contact_email: str | None, options: dict,
             result: dict | None, snapshot_source: str, app_version: str, user_agent: str) -> int:
+        """Store a review; ``StoreFull`` when it would take the table past ``KEEP`` rows or
+        ``MAX_MB`` of text. Anyone may post reviews (rate-limited per client), so a full table
+        refuses new ones rather than delete stored ones: a flood can't erase real reviews (and
+        their contact details). The operator exports or clears old reviews to make room."""
         row = (datetime.now(timezone.utc).isoformat(timespec="seconds"), job_id, job_state, rating,
                json.dumps(problems), comment, int(wants_followup),
                contact_name if wants_followup else None, contact_email if wants_followup else None,
@@ -87,41 +97,30 @@ class ReviewStore:
                json.dumps(result, separators=(",", ":")) if result is not None else None,
                snapshot_source, app_version, user_agent)
         with self._lock, self._connect() as con:
+            if self._bytes is None or self._rows is None:
+                self._bytes = int(con.execute(f"SELECT COALESCE(SUM({self._SIZE}), 0) FROM reviews").fetchone()[0])
+                self._rows = int(con.execute("SELECT COUNT(*) FROM reviews").fetchone()[0])
+            size = sum(len(v) for i, v in enumerate(row) if i in self._SIZED and v is not None)
+            if self._rows >= KEEP or self._bytes + size > MAX_MB * 1e6:
+                raise StoreFull()
             cur = con.execute(
                 "INSERT INTO reviews (created_at, job_id, job_state, rating, problems, comment, wants_followup, "
                 "contact_name, contact_email, options_json, result_json, snapshot_source, app_version, user_agent) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", row)
-            rid = int(cur.lastrowid)
-            self._prune(con, rid)
-            return rid
+            self._bytes += size
+            self._rows += 1
+            return int(cur.lastrowid)
 
+    # the text counted against MAX_MB: these columns (as SQL, and their positions in ``add``'s row)
     _SIZE = ("length(created_at) + length(job_id) + length(problems) + length(comment) + length(options_json)"
              " + COALESCE(length(result_json), 0) + COALESCE(length(user_agent), 0)"
              " + COALESCE(length(contact_name), 0) + COALESCE(length(contact_email), 0)")
+    _SIZED = frozenset((0, 1, 4, 5, 7, 8, 9, 10, 13))
 
-    def _prune(self, con: sqlite3.Connection, newest: int) -> None:
-        """Keep the newest ``KEEP`` reviews and their text within ``MAX_MB``: anyone may post
-        reviews (rate-limited per client), so the oldest go first rather than the disk filling up
-        (SQLite reuses the freed pages). The total is summed once, then kept up to date."""
-        if self._bytes is None:
-            self._bytes = int(con.execute(f"SELECT COALESCE(SUM({self._SIZE}), 0) FROM reviews").fetchone()[0])
-        else:
-            self._bytes += int(con.execute(f"SELECT {self._SIZE} FROM reviews WHERE id = ?", (newest,)).fetchone()[0])
-        cut = newest - KEEP
-        if con.execute("SELECT 1 FROM reviews WHERE id <= ? LIMIT 1", (cut,)).fetchone():
-            self._bytes -= int(con.execute(f"SELECT COALESCE(SUM({self._SIZE}), 0) FROM reviews WHERE id <= ?",
-                                           (cut,)).fetchone()[0])
-            con.execute("DELETE FROM reviews WHERE id <= ?", (cut,))
-        while self._bytes > MAX_MB * 1e6:
-            old = con.execute(f"SELECT id, {self._SIZE} FROM reviews WHERE id < ? ORDER BY id LIMIT 20",
-                              (newest,)).fetchall()
-            if not old:                # only the review just added is left
-                break
-            for rid, size in old:
-                con.execute("DELETE FROM reviews WHERE id = ?", (rid,))
-                self._bytes -= int(size)
-                if self._bytes <= MAX_MB * 1e6:
-                    break
+    def forget(self) -> None:
+        """Drop the cached totals (after rows were deleted by hand)."""
+        with self._lock:
+            self._bytes = self._rows = None
 
     def count_for_job(self, job_id: str) -> int:
         with self._connect() as con:

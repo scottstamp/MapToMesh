@@ -299,7 +299,15 @@ function loadUsgsProjects() {
   if (usgsLayer || usgsLoading) return;
   usgsLoading = true;
   $('usCovHint').textContent = '· loading USGS 3DEP coverage…';
-  fetch('/api/projects/usgs').then((r) => (r.ok ? r.json() : null)).then((gj) => {
+  fetch('/api/projects/usgs').then((r) => {
+    if (r.status === 503) {     // the server is still downloading the list: ask again shortly
+      const wait = Math.min(120, parseFloat(r.headers.get('retry-after')) || 30);
+      setTimeout(() => { usgsLoading = false; loadUsgsProjects(); }, wait * 1000);
+      return undefined;
+    }
+    return r.ok ? r.json() : null;
+  }).then((gj) => {
+    if (gj === undefined) return;
     usgsLoading = false;
     $('usCovHint').textContent = gj ? '' : '· USGS coverage unavailable';
     if (!gj) return;
@@ -709,7 +717,12 @@ function describeError(d) {
   }).join('\n');
 }
 
+// While a share link's settings are on the form (openShare) they aren't saved over the visitor's
+// own: only once the visitor builds the model or changes something (every other saveSettings()
+// call follows something the visitor did).
+let shareHold = false;
 function saveSettings() {
+  shareHold = false;
   const s = { center: state.center, zoom: map.getZoom(), mapCenter: map.getCenter(), colors: {} };
   for (const f of FIELDS) { const el = $(f); s[f] = el.type === 'checkbox' ? el.checked : el.value; }
   document.querySelectorAll('[data-color]').forEach((el) => { s.colors[el.dataset.color] = el.value; });
@@ -778,8 +791,9 @@ function buildOptions() {
   };
 }
 
-// restore the form from a job's options (inverse of buildOptions)
-function applyOptions(o) {
+// restore the form from a job's options (inverse of buildOptions); ``save``: also as this
+// browser's saved settings
+function applyOptions(o, { save = true } = {}) {
   if (!o) return;
   const set = (id, v) => {
     const el = $(id);
@@ -802,7 +816,7 @@ function applyOptions(o) {
   fillPresets();
   redrawSelection();
   map.fitBounds(selection.getBounds().pad(0.3));
-  saveSettings();
+  if (save) saveSettings();
   refreshMode();
 }
 
@@ -1030,9 +1044,10 @@ async function onDeviceMessage(e) {
                    thumb: blob('thumbnail.png', 'image/png'),
                    preview: await gunzipToUrl(f[`preview_${PREVIEW_LOD}.bin.gz`], 'application/octet-stream') };
     device.urls.push(urls.preview);
-    const j = { id: localJobId(), state: 'done', result: r, options: device.opts, log: device.log, urls,
+    const j = { id: localJobId(), state: 'done', result: r, options: device.opts, log: device.log,
                 device: { seconds: m.total_s, downloaded_mb: (r.browser?.net?.bytes || 0) / 1e6,
                           cache_mb: m.cache?.persistent ? m.cache.hit_mb : null } };
+    DEVICE_URLS.set(j, urls);
     state.onDevice = false;
     rememberBuilt(device.opts);
     finish();
@@ -1180,8 +1195,13 @@ async function fillDownload(body) {
 
 function fmtBytes(n) { return n > 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${(n / 1e3).toFixed(0)} kB`; }
 
+// blob: URLs of models built on this device, by their job object (onDeviceMessage). Never taken from
+// a job's JSON: a server answer (or anything a link made the page fetch) can't choose the links.
+const DEVICE_URLS = new WeakMap();
+
 function jobUrls(j) {
-  if (j.urls) return j.urls;     // built on this device: blob URLs
+  const own = DEVICE_URLS.get(j);
+  if (own) return own;
   const id = encodeURIComponent(j.id);
   return { model: `/api/jobs/${id}/model.3mf`, stl: `/api/jobs/${id}/stl.zip`, base: `/api/jobs/${id}/base.3mf`,
            thumb: `/api/jobs/${id}/thumbnail.png?${Date.now()}`, preview: `/api/jobs/${id}/preview.bin?lod=${PREVIEW_LOD}` };
@@ -1212,7 +1232,7 @@ function showResult(j) {
       <button type="button" class="secondary" id="shareBtn">Share link</button>
       <input type="text" id="shareUrl" readonly hidden aria-label="Share link">
     </div>
-    <p class="hint" id="shareMsg">The link holds this model's settings: opening it builds the same model.</p>
+    <p class="hint" id="shareMsg">The link holds this model's settings: opening it sets them up, ready to build the same model.</p>
     <dl class="stats">
       <dt>Model size</dt><dd>${s.size_mm[0]} × ${s.size_mm[1]} × ${s.size_mm[2]} mm</dd>
       ${s.tile_size_mm ? html`<dt>Tiles</dt><dd>${s.tiles} × ${s.tile_size_mm[0]} × ${s.tile_size_mm[1]} mm</dd>` : ''}
@@ -1236,7 +1256,7 @@ function showResult(j) {
   $('result').hidden = false;
   setProgress(1, `Done · ${s.size_mm[0]} × ${s.size_mm[1]} mm, ${r.filaments.length} colour${r.filaments.length > 1 ? 's' : ''}`);
   $('miniDownload').href = u.model; $('miniDownload').hidden = false;
-  if (j.urls) $('miniDownload').download = r.file; else $('miniDownload').removeAttribute('download');
+  if (DEVICE_URLS.has(j)) $('miniDownload').download = r.file; else $('miniDownload').removeAttribute('download');
   $('miniDetails').hidden = false;
   $('topImg').src = u.thumb;
   $('shareBtn').onclick = () => shareModel(j);
@@ -1262,16 +1282,16 @@ async function shareModel(j) {
     if (navigator.share && (COARSE || MOBILE.matches)) {
       try {
         await navigator.share({ title: `${j.options.name} - MapToMesh`, url });
-        msg.textContent = 'Opening the link builds this model.';
+        msg.textContent = 'Opening the link sets up this model, ready to build.';
         return;
       } catch (e) { /* dismissed: copy it instead */ }
     }
     try {
       await navigator.clipboard.writeText(url);
-      msg.textContent = 'Link copied. Opening it builds this model.';
+      msg.textContent = 'Link copied. Opening it sets up this model, ready to build.';
     } catch (e) {
       box.select();
-      msg.textContent = 'Copy the link above. Opening it builds this model.';
+      msg.textContent = 'Copy the link above. Opening it sets up this model, ready to build.';
     }
   } catch (e) {
     msg.textContent = `Couldn't create the link: ${e.message}`;
@@ -1280,10 +1300,11 @@ async function shareModel(j) {
   }
 }
 
-// a share link (?s=<id>): load its settings and build the model straight away
+// a share link (?s=<id>): show its settings on the form and map; the model is built when the
+// visitor presses Generate - opening a link spends nobody's CPU, memory or data by itself, and
+// doesn't replace the visitor's saved settings (shareHold)
 async function openShare(id) {
-  $('progress').hidden = false;
-  setProgress(0, 'Opening the shared model…');
+  setProgress(null, 'Opening the shared model…');
   let d;
   try {
     const r = await fetch(`/api/shares/${encodeURIComponent(id)}`);
@@ -1293,9 +1314,12 @@ async function openShare(id) {
     setProgress(null, `Couldn't open the shared model: ${e.message}.`, true);
     return;
   }
-  applyOptions(d.options);
-  for (let i = 0; i < 50 && !LIMITS; i++) await new Promise((res) => setTimeout(res, 100));   // the Detail cap
-  generate({ keepUrl: true });
+  shareHold = true;
+  applyOptions(d.options, { save: false });
+  const o = d.options;
+  setProgress(null, `Shared model "${o.name}": ${+(o.width_m / 1000).toFixed(2)} × ${+(o.height_m / 1000).toFixed(2)} km `
+    + `around ${o.lat.toFixed(4)}, ${o.lon.toFixed(4)}. Press Generate 3MF to build it.`);
+  $('generateBtn').focus({ preventScroll: true });
 }
 
 // ------------------------------------------------------------------ review / problem report
@@ -1713,9 +1737,11 @@ if (jobParam && new URLSearchParams(location.search).get('embed') === '1') docum
 // first visit: introduce the tool (not over a shared link - the About link is always there)
 if (!jobParam && !shareParam && !localStorage.getItem(ABOUT_KEY)) openAbout();
 if (shareParam && !jobParam) openShare(shareParam);
-if (jobParam) {
-  fetch(`/api/jobs/${jobParam}`).then((r) => (r.ok ? r.json() : null)).then((j) => {
-    if (j && j.state === 'done') { state.jobId = j.id; applyOptions(j.options); showResult(j); showReview(j); }
+// only a well-formed server job id (maptomesh/server.py valid_job_id): anything else in the link
+// (e.g. '../proxy?url=...') must never become a path under /api/
+if (jobParam && /^[0-9a-f]{12}$/.test(jobParam)) {
+  fetch(`/api/jobs/${encodeURIComponent(jobParam)}`).then((r) => (r.ok ? r.json() : null)).then((j) => {
+    if (j && j.state === 'done' && j.id === jobParam) { state.jobId = j.id; applyOptions(j.options); showResult(j); showReview(j); }
   });
 }
 
@@ -1739,7 +1765,7 @@ $('showCoverage').onchange = () => {
   if ($('showCoverage').checked) { coverageLayer.addTo(map); selection.bringToFront(); } else map.removeLayer(coverageLayer);
 };
 $('generateBtn').onclick = () => generate();
-if (!shareParam) (window.requestIdleCallback || ((f) => setTimeout(f, 2000)))(() => prewarmDevice(), { timeout: 5000 });
+(window.requestIdleCallback || ((f) => setTimeout(f, 2000)))(() => prewarmDevice(), { timeout: 5000 });
 $('cancelBtn').onclick = cancelJob;
 for (const id of ['baseSeparate', 'label', 'gridCells', 'smoothing', 'cliffSmoothing', 'sizeMm', 'zEx', 'tilesX', 'tilesY', 'frame', 'cornerMm', 'elevWater']) {
   $(id).addEventListener('input', () => { if (id === 'sizeMm' || id === 'cornerMm') redrawSelection(); else updateDerived(); });
@@ -1747,6 +1773,6 @@ for (const id of ['baseSeparate', 'label', 'gridCells', 'smoothing', 'cliffSmoot
 $('gridCells').addEventListener('change', scheduleCoverage);
 document.getElementById('sidebar').addEventListener('change', saveSettings);
 for (const t of ['input', 'change']) document.getElementById('sidebar').addEventListener(t, refreshMode);
-map.on('moveend', saveSettings);
+map.on('moveend', () => { if (!shareHold) saveSettings(); });   // (fitting a shared model's area isn't the visitor's doing)
 map.on('moveend', scheduleUsCoverage);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.drawing) setDrawing(false); });

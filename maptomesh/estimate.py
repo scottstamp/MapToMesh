@@ -135,7 +135,7 @@ def estimate(o: Options) -> dict:
 # that finds no free slot is refused at once (``limits.Slots``), not queued on a server thread.
 PER_HOUR = int(os.environ.get("MAPTOMESH_ESTIMATES_PER_HOUR", "120"))
 RATE = RateLimit(PER_HOUR)
-SLOTS = Slots(int(os.environ.get("MAPTOMESH_ESTIMATES_CONCURRENT", "2")), per_client=1)
+SLOTS = Slots(int(os.environ.get("MAPTOMESH_ESTIMATES_CONCURRENT", "4")), per_client=1)
 
 
 def rate_limited(addr: str) -> bool:

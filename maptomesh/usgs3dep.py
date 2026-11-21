@@ -117,33 +117,12 @@ def _search(bbox: tuple[float, float, float, float], max_items: int) -> list[dic
     return feats
 
 
-def _trim_cache(directory, keep_files: int | None = None, keep_mb: float | None = None) -> None:
-    """Delete the oldest ``pc_*.json`` search files until at most ``keep_files`` files and
+def _trim_cache(directory, keep_files: int | None = None, keep_mb: float | None = None,
+                pattern: str = "pc_*.json") -> None:
+    """Delete the oldest ``pattern`` search files until at most ``keep_files`` files and
     ``keep_mb`` MB remain."""
     keep_files = STAC_CACHE_FILES if keep_files is None else keep_files
-    limit = (STAC_CACHE_MB if keep_mb is None else keep_mb) * 1e6
-    try:
-        files = []
-        for p in directory.glob("pc_*.json"):
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            files.append((st.st_mtime, st.st_size, p))
-    except OSError:
-        return
-    files.sort(key=lambda f: f[0])
-    total = sum(f[1] for f in files)
-    n = len(files)
-    for _, size, p in files:
-        if n <= max(0, keep_files) and total <= limit:
-            break
-        try:
-            p.unlink()
-        except OSError:
-            continue        # in use or already gone
-        n -= 1
-        total -= size
+    config.trim_dir(directory, pattern, (STAC_CACHE_MB if keep_mb is None else keep_mb) * 1e6, keep_files)
 
 
 def _cached_search(bbox: tuple[float, float, float, float], max_items: int) -> list[dict]:

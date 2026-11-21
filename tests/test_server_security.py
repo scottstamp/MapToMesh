@@ -10,12 +10,14 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 _TMP = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 os.environ["MAPTOMESH_CACHE"] = os.path.join(_TMP.name, "cache")
 os.environ["MAPTOMESH_DATA_DIR"] = os.path.join(_TMP.name, "data")
+os.environ["MAPTOMESH_LOCAL_UNLIMITED"] = "1"     # opt-in (off by default): requests from 127.0.0.1 are exempt
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import numpy as np  # noqa: E402
@@ -326,13 +328,30 @@ def test_cloudflare_client_ip():
         assert limits.client_key(_HReq("192.0.2.9", cf)) == "198.51.100.77"
     finally:
         limits.TRUSTED_PROXIES = saved
-    # the switch
+    # the switch (off unless MAPTOMESH_LOCAL_UNLIMITED=1: a local reverse proxy forwarding without
+    # the header must not make its requests unlimited)
     saved = limits.LOCAL_UNLIMITED
     try:
         limits.LOCAL_UNLIMITED = False
         assert limits.client_key(_HReq("127.0.0.1")) == "127.0.0.1"
     finally:
         limits.LOCAL_UNLIMITED = saved
+    import subprocess
+    out = subprocess.run([sys.executable, "-c", "from maptomesh import limits; print(limits.LOCAL_UNLIMITED)"],
+                         capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent),
+                         env={k: v for k, v in os.environ.items() if k != "MAPTOMESH_LOCAL_UNLIMITED"})
+    assert out.stdout.strip() == "False", out
+    # an origin secret: the header counts only on requests that carry it (Cloudflare's ranges are
+    # shared by every customer's zones and Workers)
+    saved = limits.ORIGIN_SECRET
+    try:
+        limits.ORIGIN_SECRET = "s3cret-value"
+        assert limits.client_key(_HReq("172.70.1.2", cf)) == "172.70.1.2"
+        assert limits.client_key(_HReq("172.70.1.2", {**cf, "X-Origin-Secret": "wrong"})) == "172.70.1.2"
+        assert limits.client_key(_HReq("172.70.1.2", {**cf, "X-Origin-Secret": "s3cret-value"})) == "198.51.100.77"
+        assert limits.client_key(_HReq("127.0.0.1", {**cf, "X-Origin-Secret": "s3cret-value"})) == "198.51.100.77"
+    finally:
+        limits.ORIGIN_SECRET = saved
 
 
 def test_local_requests_unlimited():
@@ -450,18 +469,35 @@ def test_reviews_budget():
         st = reviews.ReviewStore(os.path.join(d, "r.sqlite"))
         kw = dict(job_state="done", rating=5, problems=[], comment="", wants_followup=False, contact_name=None,
                   contact_email=None, options={}, snapshot_source="client", app_version="t", user_agent="")
+        def refused(**k) -> bool:
+            try:
+                st.add(**{**dict(job_id="ffffffffffff", result=None), **k}, **kw)
+                return False
+            except reviews.StoreFull:
+                return True
+
         try:
+            # full by rows: new reviews are refused, stored ones are never deleted to make room
             reviews.KEEP = 5
-            ids = [st.add(job_id=f"{i:012x}", result=None, **kw) for i in range(8)]
-            assert [r["id"] for r in st.recent(100)] == ids[::-1][:5]
+            ids = [st.add(job_id=f"{i:012x}", result=None, **kw) for i in range(5)]
+            assert refused()
+            assert [r["id"] for r in st.recent(100)] == ids[::-1]
+            # full by size
             reviews.KEEP, reviews.MAX_MB = 10_000, 0.5
+            n = 0
             for i in range(20):
-                st.add(job_id=f"{i:012x}", result={"blob": "x" * 100_000}, **kw)
+                if refused(job_id=f"{i:012x}", result={"blob": "x" * 100_000}):
+                    break
+                n += 1
+            assert 1 <= n <= 5, n
             rows = st.recent(1000)
-            assert 1 <= len(rows) < 10
-            assert rows[0]["job_id"] == f"{19:012x}"                 # the newest kept
+            assert rows[-1]["id"] == ids[0] and len(rows) == 5 + n     # the oldest still there
+            assert not refused(result={"small": 1})                     # a small one still fits
             size = os.path.getsize(os.path.join(d, "r.sqlite"))
             assert size < 3e6, size
+            # a new store (restart) sums what's stored before taking more
+            st = reviews.ReviewStore(os.path.join(d, "r.sqlite"))
+            assert refused(result={"blob": "x" * 100_000})
         finally:
             reviews.KEEP, reviews.MAX_MB = keep, mx
 
@@ -500,12 +536,368 @@ def test_shares_and_failures_still_work():
     assert st == 200 and json.loads(b)["ok"]
 
 
+# ---------------------------------------------------------------- data proxy: threads, navigations, rate
+
+async def acall(method: str, path: str, query: str = "", headers: dict | None = None,
+                client: str = "203.0.113.7"):
+    """``call`` as a coroutine, for many requests at once on one event loop (as uvicorn serves)."""
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
+             "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": query.encode(),
+             "root_path": "", "headers": [(k.lower().encode(), str(v).encode()) for k, v in (headers or {}).items()],
+             "client": (client, 50000), "server": ("testserver", 80)}
+    out = {"status": None, "body": b""}
+    sent = []
+
+    async def receive():
+        if not sent:
+            sent.append(1)
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await asyncio.sleep(3600)
+        return {"type": "http.disconnect"}
+
+    async def send(msg):
+        if msg["type"] == "http.response.start":
+            out["status"] = msg["status"]
+        elif msg["type"] == "http.response.body":
+            out["body"] += msg.get("body", b"")
+
+    await server.app(scope, receive, send)
+    return out["status"], out["body"]
+
+
+PROXY_URL = "url=https://usgs.entwine.io/boundaries/resources.geojson"
+
+
+def test_proxy_threads_isolated():
+    """Slow upstreams hold proxy threads only: with 60 proxied requests stuck on their upstreams,
+    the rest of the site still answers, at most PROXY_THREADS upstream calls block at once, and
+    one client never holds more than PROXY_CLIENT_THREADS of them."""
+    from maptomesh import proxy
+    real = proxy.open_upstream
+    release = threading.Event()
+    lock = threading.Lock()
+    state = {"now": 0, "peak": 0, "by": {}, "peak_by": 0}
+
+    def slow(url, method, headers, body, client):
+        with lock:
+            state["now"] += 1
+            state["by"][client] = state["by"].get(client, 0) + 1
+            state["peak"] = max(state["peak"], state["now"])
+            state["peak_by"] = max(state["peak_by"], state["by"][client])
+        release.wait(20)
+        with lock:
+            state["now"] -= 1
+            state["by"][client] -= 1
+        raise proxy.Refused(418, "stub upstream")
+
+    async def main():
+        stuck = [asyncio.create_task(acall("GET", "/api/proxy", query=PROXY_URL, client=f"198.51.100.{i % 12}"))
+                 for i in range(60)]
+        await asyncio.sleep(1.0)
+        t0 = time.time()
+        st, _ = await asyncio.wait_for(acall("GET", "/api/status"), 10)
+        took = time.time() - t0
+        release.set()
+        done = await asyncio.gather(*stuck)
+        return st, took, done
+
+    proxy.open_upstream = slow
+    server._PROXY_LIMITER.clear()
+    try:
+        st, took, done = asyncio.run(main())
+        assert st == 200 and took < 5, (st, took)
+        assert all(s == 418 for s, _ in done), {s for s, _ in done}
+        assert state["peak"] <= server.PROXY_THREADS, state
+        assert state["peak_by"] <= server.PROXY_CLIENT_THREADS, state
+        assert not server._PROXY_KEYS                                  # per-client limiters cleaned up
+    finally:
+        proxy.open_upstream = real
+        release.set()
+        server._PROXY_LIMITER.clear()
+
+
+def test_proxy_navigation_and_rate():
+    from maptomesh import proxy
+    real, saved = proxy.open_upstream, (proxy.REQUESTS, proxy.HEAD_POST)
+
+    def stub(*a):
+        raise proxy.Refused(418, "stub upstream")
+
+    proxy.open_upstream = stub
+    try:
+        # opened as a page, in a frame or an <embed>: never (only the build's own fetches use it)
+        for dest in ("document", "iframe", "embed", "object", "frame"):
+            st, _, _ = call("GET", "/api/proxy", query=PROXY_URL, headers={"Sec-Fetch-Dest": dest})
+            assert st == 403, dest
+        assert call("GET", "/api/proxy", query=PROXY_URL, headers={"Sec-Fetch-Dest": "empty"})[0] == 418
+        # hourly request allowances, before anything is sent upstream
+        proxy.REQUESTS, proxy.HEAD_POST = proxy.RateLimit(3), proxy.RateLimit(1)
+        me = "198.51.100.150"
+        assert call("HEAD", "/api/proxy", query=PROXY_URL, client=me)[0] == 418
+        st, h, _ = call("HEAD", "/api/proxy", query=PROXY_URL, client=me)
+        assert st == 429 and "retry-after" in h
+        assert call("GET", "/api/proxy", query=PROXY_URL, client=me)[0] == 418
+        st, h, _ = call("GET", "/api/proxy", query=PROXY_URL, client=me)
+        assert st == 429 and int(h["retry-after"]) > 0
+        assert call("GET", "/api/proxy", query=PROXY_URL, client="198.51.100.151")[0] == 418
+    finally:
+        proxy.open_upstream, (proxy.REQUESTS, proxy.HEAD_POST) = real, saved
+
+
+def test_proxy_route_streams_and_releases():
+    """Through the route: the body streams whole (read on the proxy's threads), HEAD frees its slot
+    at once, and a visitor who leaves mid-download frees theirs too."""
+    import requests
+
+    from maptomesh import proxy
+    from test_proxy import FakeUpstream
+    body = bytes(range(256)) * 4096                                  # 1 MB
+    huge = b"\0" * (48 << 20)
+    session = requests.Session()
+    session.trust_env = False
+    session.mount("https://", FakeUpstream(lambda req: (200, {"Content-Type": "image/tiff",
+                                                              "Content-Length": str(len(huge if "big" in req.url else body))},
+                                                        huge if "big" in req.url else body)))
+    real = proxy._session
+    proxy._session = lambda: session
+    proxy.CLIENTS = proxy._Clients()
+    me = "198.51.100.160"
+    try:
+        st, h, b = call("GET", "/api/proxy", query=PROXY_URL, client=me)
+        assert st == 200 and b == body and h["content-security-policy"] == "default-src 'none'; sandbox"
+        st, _, b = call("HEAD", "/api/proxy", query=PROXY_URL, client=me)
+        assert st == 200 and b == b""
+        assert not proxy.CLIENTS.active and proxy.CLIENTS.total == 0
+        assert proxy.CLIENTS.used_total[me] == len(body)
+
+        async def leave_early():
+            scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET",
+                     "scheme": "http", "path": "/api/proxy", "raw_path": b"/api/proxy",
+                     "query_string": b"url=https://usgs.entwine.io/boundaries/big.json", "root_path": "",
+                     "headers": [], "client": (me, 50000), "server": ("testserver", 80)}
+            got = {"n": 0}
+            gone = asyncio.Event()
+
+            async def receive():
+                if got["n"] == 0 and not gone.is_set():
+                    got["n"] = -1
+                    return {"type": "http.request", "body": b"", "more_body": False}
+                await gone.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(msg):
+                if msg["type"] == "http.response.body":
+                    got["n"] = max(got["n"], 0) + len(msg.get("body", b""))
+                    if got["n"] > 1 << 20:
+                        gone.set()                                     # the visitor closes the tab
+
+            await asyncio.wait_for(server.app(scope, receive, send), 20)
+            return got["n"]
+
+        n = asyncio.run(leave_early())
+        assert n < len(huge), n
+        time.sleep(0.2)
+        assert not proxy.CLIENTS.active and proxy.CLIENTS.total == 0, proxy.CLIENTS.active
+    finally:
+        proxy._session = real
+        proxy.CLIENTS = proxy._Clients()
+
+
+# ---------------------------------------------------------------- limits: groups, reserve, memory
+
+def test_group_limits_and_reserve():
+    # an IPv6 /48 gets GROUP_FACTOR clients' worth, however many /64s it rotates through
+    r = limits.RateLimit(2)
+    allowed = sum(r.hit(f"2001:db8:0:{n:x}::/64") == 0 for n in range(10) for _ in range(2))
+    assert allowed == int(2 * limits.GROUP_FACTOR), allowed
+    assert r.hit("2001:db8:1::/64") == 0                       # the next /48
+    s = limits.Slots(100, per_client=1)
+    got = [s.enter(f"2001:db8:0:{n:x}::/64") for n in range(6)]
+    assert got.count(None) == int(limits.GROUP_FACTOR) and got[-1] == "client"
+    # a quarter of the slots stays for clients with none yet
+    s = limits.Slots(4, per_client=2)
+    assert s.enter("a") is None and s.enter("a") is None and s.enter("b") is None
+    assert s.enter("b") == "client"                             # 3 of 4 in use: the last one is for newcomers
+    assert s.enter("c") is None and s.enter("d") == "busy"
+    s.leave("a")
+    s.leave("a")
+    assert s._active == {"b": 1, "c": 1} and s._n == 2
+
+
+def test_rate_limit_memory():
+    """Tables of many clients stay bounded and cheap: idle keys are swept on a timer (not scanned
+    on every event), and an event costs the same with 65,536 keys as with ten."""
+    r = limits.RateLimit(5)
+    t = 1_000.0
+    for i in range(65_536):
+        r.hit(f"10.{i >> 16}.{(i >> 8) & 255}.{i & 255}", now=t)
+    t0 = time.perf_counter()
+    for i in range(5_000):
+        r.hit(f"10.200.{(i >> 8) & 255}.{i & 255}", now=t + 1)
+    assert time.perf_counter() - t0 < 1.0, time.perf_counter() - t0
+    r.hit("10.255.255.255", now=t + 3700)                      # an hour on: swept
+    assert r.keys() == 1, r.keys()
+    small = limits.RateLimit(1)
+    small.MAX_KEYS = 100
+    for i in range(1_000):
+        small.hit(f"192.0.2.{i % 250}-{i}", now=t)
+    assert small.keys() <= 101
+
+
+# ---------------------------------------------------------------- jobs: hourly limit, groups, reserve, retention
+
+def test_job_rate_groups_and_reserve():
+    real = _queue_jobs_without_running()
+    server.JOBS.clear()
+    body = Options(**AREA, grid_cells=300).model_dump()
+    saved = limits.JOB_RATE, limits.MAX_QUEUE
+    try:
+        # hourly: finished jobs don't free the allowance
+        limits.JOB_RATE = limits.RateLimit(3)
+        me = "198.51.100.60"
+        for _ in range(3):
+            st, _, b = post_json("/api/jobs", body, client=me)
+            assert st == 200
+            server.JOBS[json.loads(b)["id"]].state = "done"
+        st, h, b = post_json("/api/jobs", body, client=me)
+        assert st == 429 and "last hour" in json.loads(b)["detail"] and int(h["retry-after"]) > 0
+        assert post_json("/api/jobs", body, client="127.0.0.1")[0] == 200          # local: exempt
+        server.JOBS.clear()
+        # a /48: JOBS_PER_CLIENT x GROUP_FACTOR queued, however many /64s
+        limits.JOB_RATE, limits.MAX_QUEUE = limits.RateLimit(1000), 100
+        ok = sum(post_json("/api/jobs", body, client=f"2001:db8:7:{n:x}::1")[0] == 200
+                 for n in range(10) for _ in range(limits.JOBS_PER_CLIENT))
+        assert ok == int(limits.JOBS_PER_CLIENT * limits.GROUP_FACTOR), ok
+        server.JOBS.clear()
+        # reserve: a second job only while a quarter of the queue is free
+        limits.MAX_QUEUE = 4
+        assert post_json("/api/jobs", body, client="198.51.100.61")[0] == 200
+        assert post_json("/api/jobs", body, client="198.51.100.61")[0] == 200
+        assert post_json("/api/jobs", body, client="198.51.100.62")[0] == 200
+        assert post_json("/api/jobs", body, client="198.51.100.62")[0] == 429       # 3 of 4: kept for newcomers
+        assert post_json("/api/jobs", body, client="198.51.100.63")[0] == 200
+        assert post_json("/api/jobs", body, client="198.51.100.64")[0] == 429       # full
+    finally:
+        limits.JOB_RATE, limits.MAX_QUEUE = saved
+        server._run_job = real
+        server.JOBS.clear()
+
+
+def test_outputs_kept_for_a_while():
+    """Others' jobs can't wipe a model finished a moment ago: beyond the newest KEEP_JOBS, files go
+    only once older than KEEP_JOB_HOURS, or when over OUTPUT_MAX_GB."""
+    import shutil
+    saved = server.KEEP_JOBS, server.KEEP_JOB_HOURS, server.OUTPUT_MAX_GB
+    root = config.OUTPUT_DIR
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True)
+    now = time.time()
+    try:
+        server.KEEP_JOBS, server.KEEP_JOB_HOURS, server.OUTPUT_MAX_GB = 3, 1.0, 5
+        for i in range(8):
+            d = root / f"{i:012x}"
+            d.mkdir()
+            (d / "model.3mf").write_bytes(b"m" * 1000)
+            age = 60 * i if i < 5 else 7200 + i                   # 5 recent, 3 older than an hour
+            os.utime(d, (now - age, now - age))
+        server._prune_outputs(now)
+        assert sorted(p.name for p in root.iterdir()) == [f"{i:012x}" for i in range(5)]
+        server.OUTPUT_MAX_GB = 3500 / 1e9                          # over the size budget: oldest first
+        server._prune_outputs(now)
+        assert sorted(p.name for p in root.iterdir()) == [f"{i:012x}" for i in range(3)]
+    finally:
+        server.KEEP_JOBS, server.KEEP_JOB_HOURS, server.OUTPUT_MAX_GB = saved
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True)
+
+
+# ---------------------------------------------------------------- reviews, device failures, USGS list
+
+def test_review_snapshot_checked_and_trimmed():
+    server.REVIEW_RATE.clear()
+    opts = Options(**AREA).model_dump()
+    jid = "abcabcabcabc"
+    for bad in ({"log": {"a": 1}}, {"log": 5}, {"log": [1, 2]}, {"result": [1]}, {"result": "x"}, {"error": {"x": 1}}):
+        st, _, b = post_json(f"/api/jobs/{jid}/review", {"rating": 3, "snapshot": {"options": opts, **bad}})
+        assert st == 400, (bad, st, b)
+    big = {"stats": {"scale": "1:1000"}, "data": {"sources": [{"label": "NRCan", "share": 1.0}]}, "notes": ["n"],
+           "color_changes": [{"z_mm": i} for i in range(2000)], "tips": ["t" * 1000] * 20,
+           "filaments": [{"slot": 1, "color": "x" * 20_000}]}
+    st, _, _ = post_json(f"/api/jobs/{jid}/review", {"rating": 3, "snapshot": {
+        "state": "done", "options": opts, "result": big, "log": ["l" * 1000] * 100, "error": "e" * 5000}})
+    assert st == 200
+    row = reviews.store().recent(1)[0]
+    res = json.loads(row["result_json"])
+    assert set(res["result"]) == {"stats", "data", "notes"}, set(res["result"])     # filaments too large
+    assert len(row["result_json"]) < server.CLIENT_RESULT_MAX + 16_000
+    assert len(res["log"]) == 40 and all(len(x) <= 300 for x in res["log"]) and len(res["error"]) == 2000
+    # everyone's reviews per hour
+    saved = server.REVIEW_GLOBAL
+    try:
+        server.REVIEW_GLOBAL = limits.RateLimit(1, group_factor=0)
+        ok = {"rating": 3, "snapshot": {"options": opts}}
+        assert post_json("/api/jobs/aaaaaaaaaaa1/review", ok, client="198.51.100.70")[0] == 200
+        assert post_json("/api/jobs/aaaaaaaaaaa2/review", ok, client="198.51.100.71")[0] == 429
+    finally:
+        server.REVIEW_GLOBAL = saved
+    # a full store: refused with 503, nothing deleted
+    keep = reviews.KEEP
+    st_ = reviews.store()
+    st_.forget()
+    n = len(st_.recent(10_000))
+    try:
+        reviews.KEEP = n
+        server.REVIEW_RATE.clear()
+        st, _, _ = post_json("/api/jobs/aaaaaaaaaaa3/review", {"rating": 3, "snapshot": {"options": opts}})
+        assert st == 503 and len(st_.recent(10_000)) == n
+    finally:
+        reviews.KEEP = keep
+        st_.forget()
+
+
+def test_device_failure_env_typed():
+    from maptomesh import device_failures as df
+    df._LIMIT.clear()
+    good = {"memory_mb": 2048, "device_memory_gb": 8, "cores": 8, "phone": False, "secure": True, "seconds": 3.5,
+            "python": {"ready": True, "jspi": True, "native": True, "pyodide": "0.29.0", "extra": "x"},
+            "log": ["a", "b"] * 20 + ["x" * 2000], "unknown": "dropped"}
+    st, _, b = post_json("/api/device-failures", {"kind": "error", "message": "m", "env": good})
+    assert st == 200
+    env = json.loads(df.store().recent(1)[0]["env_json"])
+    assert env["memory_mb"] == 2048 and env["python"]["pyodide"] == "0.29.0"
+    assert "unknown" not in env and "extra" not in env["python"]
+    assert len(env["log"]) == 30 and env["log"][-1] == "x" * 500           # long logs trimmed, not dropped
+    for bad in ({"memory_mb": "\u001b]0;pwned\u0007\u001b[2J"}, {"python": "x"}, {"log": "x"}, {"cores": "\u001b[2J"}):
+        st, _, _ = post_json("/api/device-failures", {"kind": "error", "message": "m", "env": bad})
+        assert st == 200
+        assert json.loads(df.store().recent(1)[0]["env_json"]) == {"invalid": True}, bad
+
+
+def test_usgs_projects_never_wait_on_a_download():
+    from maptomesh import usgs_ept
+    idx = usgs_ept.INDEX
+    saved = idx._projects, idx._loading
+    usgs_ept.OVERLAY_PATH.unlink(missing_ok=True)
+    try:
+        idx._projects, idx._loading = None, True              # another request is downloading the list
+        t0 = time.time()
+        st, h, _ = call("GET", "/api/projects/usgs")
+        assert st == 503 and "retry-after" in h and time.time() - t0 < 2
+    finally:
+        idx._projects, idx._loading = saved
+
+
 TESTS = [test_docs_hidden, test_security_headers, test_body_limit, test_proxy_checks_url_before_body,
          test_coverage_bounds, test_coverage_usgs_bounds, test_tile_query_capped, test_coverage_rate_limit,
          test_job_ids, test_thumbnail_traversal, test_client_key, test_cloudflare_client_ip,
          test_local_requests_unlimited, test_rate_and_slots, test_estimate_fails_fast,
          test_jobs_per_client_and_cancel_token, test_worker_error_classification, test_job_failure_hides_internals,
-         test_value_error_handler, test_reviews_budget, test_review_endpoint, test_shares_and_failures_still_work]
+         test_value_error_handler, test_reviews_budget, test_review_endpoint, test_shares_and_failures_still_work,
+         test_proxy_threads_isolated, test_proxy_navigation_and_rate, test_proxy_route_streams_and_releases,
+         test_group_limits_and_reserve,
+         test_rate_limit_memory, test_job_rate_groups_and_reserve, test_outputs_kept_for_a_while,
+         test_review_snapshot_checked_and_trimmed, test_device_failure_env_typed,
+         test_usgs_projects_never_wait_on_a_download]
 
 
 if __name__ == "__main__":

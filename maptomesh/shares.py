@@ -22,8 +22,13 @@ import time
 from . import config, limits
 
 DB_PATH = config.DATA_DIR / "shares.sqlite"
-KEEP = int(os.environ.get("MAPTOMESH_KEEP_SHARES", "200000"))       # newest-used links kept
+# Links kept: the newest-used KEEP, but a link used (created or opened) within STALE_DAYS is never
+# pruned, so a burst of new links can't push out ones people still open; new links are capped per
+# client and overall (PER_DAY) instead, which bounds how fast the table can grow.
+KEEP = int(os.environ.get("MAPTOMESH_KEEP_SHARES", "200000"))
+STALE_DAYS = float(os.environ.get("MAPTOMESH_SHARES_STALE_DAYS", "30"))
 PER_HOUR = int(os.environ.get("MAPTOMESH_SHARES_PER_HOUR", "60"))   # new links per client address
+PER_DAY = int(os.environ.get("MAPTOMESH_SHARES_PER_DAY", "5000"))   # new links from everyone
 ID_CHARS = "abcdefghijklmnopqrstuvwxyz234567"
 
 
@@ -91,12 +96,13 @@ class ShareStore:
                 con.execute("UPDATE shares SET used = ?, opens = opens + 1 WHERE id = ?", (time.time(), sid))
         return json.loads(row[0])
 
-    def _prune(self, con) -> None:
-        """Forget the least recently used links beyond ``KEEP``."""
+    def _prune(self, con, now: float | None = None) -> None:
+        """Forget the least recently used links beyond ``KEEP``, of those unused for ``STALE_DAYS``."""
+        now = time.time() if now is None else now
         n = con.execute("SELECT COUNT(*) FROM shares").fetchone()[0]
         if n > KEEP:
-            con.execute("DELETE FROM shares WHERE id IN (SELECT id FROM shares ORDER BY used LIMIT ?)",
-                        (n - KEEP,))
+            con.execute("DELETE FROM shares WHERE id IN (SELECT id FROM shares WHERE used < ? ORDER BY used LIMIT ?)",
+                        (now - STALE_DAYS * 86400, n - KEEP))
 
 
 class _Closing:
@@ -115,6 +121,7 @@ class _Closing:
 _STORE: ShareStore | None = None
 _STORE_LOCK = threading.Lock()
 _LIMIT = limits.RateLimit(PER_HOUR)     # new links per client key (limits.client_key), per hour
+_GLOBAL = limits.RateLimit(PER_DAY, window_s=86400, group_factor=0)
 
 
 def store() -> ShareStore:
@@ -126,5 +133,6 @@ def store() -> ShareStore:
 
 
 def rate_limited(addr: str) -> bool:
-    """More than ``PER_HOUR`` new links from this client key in the last hour."""
-    return _LIMIT.hit(addr) > 0
+    """More than ``PER_HOUR`` new links from this client key in the last hour, or ``PER_DAY`` from
+    everyone in the last day."""
+    return _LIMIT.hit(addr) > 0 or (addr != limits.LOCAL and _GLOBAL.hit("all") > 0)

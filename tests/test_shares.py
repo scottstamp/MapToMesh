@@ -6,6 +6,7 @@
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -37,9 +38,16 @@ def test_prune():
     with tempfile.TemporaryDirectory() as d:
         st = shares.ShareStore(os.path.join(d, "s.sqlite"))
         ids = [st.add(_opts(grid_cells=300 + 50 * i)) for i in range(4)]
-        st.get(ids[0])                                            # opened: recently used
+        # all used within STALE_DAYS: over KEEP, yet none is pruned (a burst of new links can't
+        # push out links people still open)
         with st._connect() as con:
             st._prune(con)
+        assert all(st.get(i, opened=False) is not None for i in ids)
+        # later: the least recently used of the stale ones go
+        later = time.time() + (shares.STALE_DAYS + 1) * 86400
+        with st._connect() as con:
+            con.execute("UPDATE shares SET used = ? WHERE id = ?", (later - 10, ids[0]))   # opened lately
+            st._prune(con, now=later)
         assert st.get(ids[0]) is not None and st.get(ids[1], opened=False) is None
         assert all(st.get(i, opened=False) is not None for i in ids[2:])
     shares.KEEP = keep
@@ -50,7 +58,14 @@ def test_rate_limit():
     shares._LIMIT = shares.limits.RateLimit(2)
     assert not shares.rate_limited("1.2.3.4") and not shares.rate_limited("1.2.3.4")
     assert shares.rate_limited("1.2.3.4") and not shares.rate_limited("5.6.7.8")
-    shares._LIMIT = real
+    # many addresses: the daily cap on new links from everyone
+    real_g = shares._GLOBAL
+    shares._GLOBAL = shares.limits.RateLimit(3, window_s=86400, group_factor=0)
+    try:
+        assert [shares.rate_limited(f"198.51.100.{i}") for i in range(5)] == [False, False, False, True, True]
+        assert not shares.rate_limited(shares.limits.LOCAL)
+    finally:
+        shares._LIMIT, shares._GLOBAL = real, real_g
 
 
 if __name__ == "__main__":

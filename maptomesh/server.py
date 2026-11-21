@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hmac
 import json
@@ -19,11 +20,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from dataclasses import dataclass, field
 
+from typing import Annotated
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 from . import __version__, config
 from .geo import AOI, Grid
@@ -223,6 +226,14 @@ class _BodyLimit:
 
 app.add_middleware(_BodyLimit)     # (_Headers wraps the whole stack: _App)
 
+# MAPTOMESH_ALLOWED_HOSTS (comma-separated, e.g. "maptomesh.com,www.maptomesh.com"): requests for any
+# other Host get 400, so an origin reachable from Cloudflare's shared ranges only answers for its
+# own names (README "Deployment behind Cloudflare"). Empty: any Host (local use).
+ALLOWED_HOSTS = [h.strip() for h in os.environ.get("MAPTOMESH_ALLOWED_HOSTS", "").split(",") if h.strip()]
+if ALLOWED_HOSTS:
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+
 
 # ---------------------------------------------------------------- jobs
 
@@ -269,7 +280,11 @@ class Job:
 
 
 JOBS: "OrderedDict[str, Job]" = OrderedDict()     # recent jobs (metadata only; results are files)
-KEEP_JOBS = int(os.environ.get("MAPTOMESH_KEEP_JOBS", "10"))   # finished jobs kept on disk
+# Finished jobs' files: the newest KEEP_JOBS, and any finished within KEEP_JOB_HOURS (so links
+# shared a moment ago keep working however many jobs others run), within OUTPUT_MAX_GB in total.
+KEEP_JOBS = int(os.environ.get("MAPTOMESH_KEEP_JOBS", "10"))
+KEEP_JOB_HOURS = float(os.environ.get("MAPTOMESH_KEEP_JOB_HOURS", "1"))
+OUTPUT_MAX_GB = float(os.environ.get("MAPTOMESH_OUTPUT_MAX_GB", "5"))
 # At most two jobs in flight: one builds (CPU and memory heavy, one at a time) while the next
 # downloads its data (network-bound), so a queue moves up to twice as fast without holding more
 # than two models' data in memory. Servers with less than ~7 GB run one job at a time
@@ -359,17 +374,40 @@ def _persist(job: Job) -> None:
     config.atomic_write(path, json.dumps(d, default=lambda v: v.item() if hasattr(v, "item") else str(v)))
 
 
-def _prune_outputs() -> None:
-    """Keep the files of the ``KEEP_JOBS`` most recent finished jobs; never touch running ones."""
+def _dir_bytes(d: Path) -> int:
+    total = 0
+    for p in d.rglob("*"):
+        try:
+            total += p.stat().st_size if p.is_file() else 0
+        except OSError:
+            pass
+    return total
+
+
+def _prune_outputs(now: float | None = None) -> None:
+    """Delete finished jobs' files beyond the newest ``KEEP_JOBS`` once they are older than
+    ``KEEP_JOB_HOURS``, and beyond ``OUTPUT_MAX_GB`` (oldest first, the newest ``KEEP_JOBS``
+    always kept); never touch running ones."""
     import shutil
+    now = time.time() if now is None else now
     with _CHILDREN_LOCK:
         active = set(_CHILDREN) | {j.id for j in JOBS.values() if j.state in ("queued", "running")}
     try:
-        dirs = [d for d in config.OUTPUT_DIR.iterdir() if d.is_dir() and d.name not in active]
+        dirs = [(d.stat().st_mtime, d) for d in config.OUTPUT_DIR.iterdir() if d.is_dir() and d.name not in active]
     except FileNotFoundError:
         return
-    dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-    for d in dirs[KEEP_JOBS:]:
+    dirs.sort(key=lambda t: t[0], reverse=True)
+    sizes = {d: _dir_bytes(d) for _, d in dirs}
+    total = sum(sizes.values())
+    doomed = [d for i, (mtime, d) in enumerate(dirs) if i >= KEEP_JOBS and now - mtime > KEEP_JOB_HOURS * 3600]
+    total -= sum(sizes[d] for d in doomed)
+    for _, d in reversed(dirs[KEEP_JOBS:]):         # over the size budget: oldest first
+        if total <= OUTPUT_MAX_GB * 1e9:
+            break
+        if d not in doomed:
+            doomed.append(d)
+            total -= sizes[d]
+    for d in doomed:
         shutil.rmtree(d, ignore_errors=True)
         j = JOBS.get(d.name)
         if j is not None and j.state != "running":
@@ -645,7 +683,10 @@ def browser_config():
 def _rate(limit, request: Request, message: str) -> str:
     """Count a request against ``limit`` (``limits.RateLimit``); 429 with Retry-After when over.
     Returns the client key."""
-    key = client_key(request)
+    return _rate_key(limit, client_key(request), message)
+
+
+def _rate_key(limit, key: str, message: str) -> str:
     wait = limit.hit(key)
     if wait:
         raise HTTPException(429, message, headers={"Retry-After": str(int(math.ceil(wait)))})
@@ -691,33 +732,105 @@ def lidar_tiles(request: Request, w: float, s: float, e: float, n: float):
     return {"tiles": [dataclasses.asdict(t) for t in tiles]}
 
 
+# Reading an upstream blocks a thread (requests is synchronous) for as long as the upstream takes.
+# The proxy's threads come from a limiter of its own, not the pool that serves every other route
+# and static file, so slow upstreams can stall the proxy but never the site; one client (and one
+# IPv6 /48) holds only a few of them at a time - its other requests wait without a thread.
+PROXY_THREADS = int(os.environ.get("MAPTOMESH_PROXY_THREADS", "24"))
+PROXY_CLIENT_THREADS = 4
+_PROXY_LIMITER: list = []                   # [anyio.CapacityLimiter], made on first use
+_PROXY_KEYS: dict[str, list] = {}           # key -> [CapacityLimiter, requests using it] (event loop only)
+# a navigation (address bar, link, frame) never needs the proxy: only the build's own fetches do
+_NAVIGATION = {"document", "iframe", "frame", "embed", "object"}
+
+
+@contextlib.asynccontextmanager
+async def _proxy_threads(key: str):
+    """Hold this client's and its /48's share of the proxy threads (``PROXY_CLIENT_THREADS``)."""
+    import anyio
+
+    from . import limits
+    if key == limits.LOCAL:
+        yield
+        return
+    group = limits.group_of(key)
+    shares = [(key, PROXY_CLIENT_THREADS)] + ([(group, int(PROXY_CLIENT_THREADS * limits.GROUP_FACTOR))] if group else [])
+    entries = []
+    for k, n in shares:
+        e = _PROXY_KEYS.get(k)
+        if e is None:
+            e = _PROXY_KEYS[k] = [anyio.CapacityLimiter(n), 0]
+        e[1] += 1
+        entries.append((k, e))
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            for _, e in entries:
+                await stack.enter_async_context(e[0])
+            yield
+    finally:
+        for k, e in entries:
+            e[1] -= 1
+            if e[1] <= 0 and _PROXY_KEYS.get(k) is e:
+                del _PROXY_KEYS[k]
+
+
+async def _proxy_blocking(key: str, fn, *args):
+    """``fn(*args)`` on one of the proxy's threads, within the client's share."""
+    import anyio
+    if not _PROXY_LIMITER:
+        _PROXY_LIMITER.append(anyio.CapacityLimiter(PROXY_THREADS))
+    async with _proxy_threads(key):
+        return await anyio.to_thread.run_sync(fn, *args, limiter=_PROXY_LIMITER[0])
+
+
+def _next_chunk(it):
+    try:
+        return next(it)
+    except StopIteration:
+        return None
+
+
+async def _proxy_body(it, key: str):
+    try:
+        while (chunk := await _proxy_blocking(key, _next_chunk, it)) is not None:
+            yield chunk
+    finally:
+        it.close("dropped")       # no-op once finished; a visitor who left frees the slot at once
+
+
 @app.api_route("/api/proxy", methods=["GET", "HEAD", "POST"])
 async def data_proxy(request: Request, url: str = Query(..., max_length=4000)):
     """Stream a data file from an allowlisted host that has no CORS headers (maptomesh/proxy.py)."""
     from fastapi.responses import StreamingResponse
-    from starlette.concurrency import run_in_threadpool
 
     from . import proxy
-    # refuse before reading anything: only allowlisted data URLs, and the body (POST queries of
-    # catalogue APIs) is capped by _BodyLimit
+    # refuse before reading anything: only the page's own requests for allowlisted data URLs,
+    # within the client's hourly request allowance; the body (POST queries of catalogue APIs) is
+    # capped by _BodyLimit
+    if request.headers.get("sec-fetch-dest", "").lower() in _NAVIGATION:
+        raise HTTPException(403, "The data proxy only answers the page's own requests")
     if not proxy.allowed(url, request.method):
         raise HTTPException(403, "Not a data source this server forwards")
+    client = client_key(request)
+    wait = proxy.rate_wait(client, request.method)
+    if wait:
+        raise HTTPException(429, "Too many requests through the data proxy from here; please try again later",
+                            headers={"Retry-After": str(int(math.ceil(wait)))})
     body = await request.body() if request.method == "POST" else None
     if body is not None and len(body) > BODY_LIMITS.get("/api/proxy", BODY_LIMIT):
         raise HTTPException(413, "Request body too large")
-    client = client_key(request)
     try:
-        status, headers, it = await run_in_threadpool(proxy.open_upstream, url, request.method,
-                                                      dict(request.headers), body, client)
+        status, headers, it = await _proxy_blocking(client, proxy.open_upstream, url, request.method,
+                                                    dict(request.headers), body, client)
     except proxy.Refused as e:
-        raise HTTPException(e.status, str(e)) from None
+        retry = {"Retry-After": str(int(math.ceil(e.retry_after)))} if e.retry_after else None
+        raise HTTPException(e.status, str(e), headers=retry) from None
     except Exception as e:  # noqa: BLE001 - upstream unreachable
         raise HTTPException(502, f"Data source unreachable: {type(e).__name__}") from None
     if request.method == "HEAD":
-        for _ in it:      # no body; running the iterator to its end releases the client's slot
-            pass
+        it.close("done")          # no body: release the client's slot
         return Response(status_code=status, headers=headers)
-    return StreamingResponse(it, status_code=status, headers=headers)
+    return StreamingResponse(_proxy_body(it, client), status_code=status, headers=headers)
 
 
 @app.get("/api/status")
@@ -804,13 +917,17 @@ def _coverage(a) -> dict:
 
 
 @app.get("/api/projects/usgs")
-def projects_usgs():
+def projects_usgs(request: Request):
     """Footprints of every USGS 3DEP project in the AWS Entwine collection (simplified)."""
-    from .usgs_ept import INDEX as EPT_INDEX
+    from . import limits
+    from .usgs_ept import INDEX as EPT_INDEX, Busy
 
+    _rate(limits.COVERAGE_RATE, request, "Too many requests from here; please try again later")
     try:
-        return Response(EPT_INDEX.overlay(), media_type="application/geo+json",
+        return Response(EPT_INDEX.overlay(wait=False), media_type="application/geo+json",
                         headers={"Content-Encoding": "gzip"})
+    except Busy as e:
+        raise HTTPException(503, str(e), headers={"Retry-After": "30"}) from None
     except Exception:  # noqa: BLE001
         eid = _internal_error("USGS 3DEP project list unavailable", traceback.format_exc())
         raise HTTPException(502, f"USGS 3DEP project list unavailable (error id {eid})") from None
@@ -861,19 +978,29 @@ def create_job(o: Options, request: Request):
     except limits.LimitError as e:
         return _refuse(e.kind, e.message, e.advice, e.suggest)
     key = client_key(request)
+    group = limits.group_of(key)
     with _JOBS_LOCK:
         active = [j for j in JOBS.values() if j.state in ("queued", "running")]
         mine = sum(1 for j in active if j.client == key)
+        ours = sum(1 for j in active if group and limits.group_of(j.client) == group)
         if key != limits.LOCAL:            # this machine (tests run in parallel): no queue limits
-            if mine >= limits.JOBS_PER_CLIENT:
-                return _refuse("busy", f"You already have {mine} model{'s' if mine > 1 else ''} queued or being "
-                               "built on the server; wait for one to finish (or cancel it).",
+            if mine >= limits.JOBS_PER_CLIENT or (group and ours >= limits.JOBS_PER_CLIENT * limits.GROUP_FACTOR):
+                return _refuse("busy", f"You already have {max(mine, 1)} model{'s' if mine > 1 else ''} queued or "
+                               "being built on the server; wait for one to finish (or cancel it).",
                                ["Wait for your other model to finish, or cancel it, then try again."], status=429,
                                headers={"Retry-After": "30"})
-            if len(active) >= limits.MAX_QUEUE:
+            # a client with a model in the queue gets a second one only while a quarter of the
+            # queue is free: that quarter stays for people who have none yet
+            if len(active) >= limits.MAX_QUEUE or (mine and len(active) >= limits.MAX_QUEUE - limits.MAX_QUEUE // 4):
                 advice, _ = limits.advice_for("busy", o)
                 return _refuse("busy", f"The server is busy: {len(active)} models are queued or being built.",
                                advice, status=429, headers={"Retry-After": "60"})
+            wait = limits.JOB_RATE.hit(key)
+            if wait:
+                return _refuse("busy", "You have built many models on the server in the last hour; please try "
+                               "again later (or build on this device).",
+                               [f"Try again in about {max(1, round(wait / 60))} minutes."], status=429,
+                               headers={"Retry-After": str(int(math.ceil(wait)))})
         job = Job(uuid.uuid4().hex[:12], o, client=key, cancel_token=secrets.token_urlsafe(18))
         JOBS[job.id] = job
         # keep the newest 50 in memory; never drop one still queued or running
@@ -887,7 +1014,7 @@ def create_job(o: Options, request: Request):
 def _job(jid: str) -> Job:
     j = _lookup(jid) if valid_job_id(jid) else None
     if not j:
-        raise HTTPException(404, "Unknown job (finished models are kept for the last 10 jobs)")
+        raise HTTPException(404, "Unknown job (finished models are kept for a limited time)")
     return j
 
 
@@ -901,7 +1028,7 @@ def _done_file(jid: str, key: str):
         raise HTTPException(404, "No such file for this job")
     path = job_path(jid, name)
     if not path.exists():
-        raise HTTPException(410, "This model's files were removed (only the last 10 jobs are kept); generate it again")
+        raise HTTPException(410, "This model's files were removed (finished models are kept for a limited time); generate it again")
     return path, name
 
 
@@ -983,13 +1110,47 @@ class DeviceFailureIn(BaseModel):
     env: dict = Field(default_factory=dict)
 
 
+class _PythonEnv(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    ready: bool | None = None
+    jspi: bool | None = None
+    native: bool | None = None
+    runtime_cached: bool | None = None
+    pyodide: str | None = Field(None, max_length=40)
+
+
+class DeviceEnv(BaseModel):
+    """The browser facts a device-failure report may carry (web/app.js reportDeviceFailure);
+    anything else is dropped, so what's stored and printed has known types."""
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
+    memory_mb: float | None = None
+    device_memory_gb: float | None = None
+    cores: int | None = Field(None, ge=0, le=4096)
+    phone: bool | None = None
+    secure: bool | None = None
+    seconds: float | None = None
+    python: _PythonEnv = Field(default_factory=_PythonEnv)
+    log: list[Annotated[str, Field(max_length=500)]] = Field(default_factory=list, max_length=30)
+
+    @field_validator("log", mode="before")
+    @classmethod
+    def _trim_log(cls, v):
+        """The last lines, each cut to length (long lines are kept, not the reason to drop the facts)."""
+        if not isinstance(v, list):
+            raise ValueError("log must be a list")
+        return [x[:500] for x in v[-30:] if isinstance(x, str)]
+
+
 @app.post("/api/device-failures")
 def device_failure(f: DeviceFailureIn, request: Request) -> dict:
     """A build that failed in the user's browser (``maptomesh.device_failures``), for review."""
     from . import device_failures as df
     if df.rate_limited(client_key(request)):
         raise HTTPException(429, "Too many reports from here")
-    env = f.env if len(json.dumps(f.env, default=str)) <= 16_000 else {"dropped": "too large"}
+    try:
+        env = DeviceEnv.model_validate(f.env).model_dump()
+    except Exception:  # noqa: BLE001 - keep the report without unusable browser facts
+        env = {"invalid": True}
     try:
         options = Options(**f.options).model_dump() if f.options else None
     except Exception:  # noqa: BLE001 - keep the report without unusable settings
@@ -1035,17 +1196,37 @@ class ReviewIn(BaseModel):
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 REVIEWS_PER_HOUR = 20      # per client (limits.client_key)
+REVIEWS_GLOBAL_PER_HOUR = 200   # from everyone: filling the store (it refuses when full) takes days
 REVIEWS_PER_JOB = 10
-SNAPSHOT_MAX = 200_000     # bytes of the browser's copy of a job (JSON)
+SNAPSHOT_MAX = 200_000     # bytes of the browser's copy of a job (JSON) accepted
+# what is kept of the browser's copy of a job's result: the parts a reviewer reads (stats, data
+# sources, notes), within CLIENT_RESULT_MAX bytes - the largest parts are dropped first
+CLIENT_RESULT_KEYS = ("stats", "data", "notes", "filaments", "file_size", "browser")
+CLIENT_RESULT_MAX = 8_000
 
 
 REVIEW_RATE = RateLimit(REVIEWS_PER_HOUR)
+REVIEW_GLOBAL = RateLimit(REVIEWS_GLOBAL_PER_HOUR, group_factor=0)
 
 
 def _job_snapshot(job: Job) -> tuple[str, dict, dict]:
     result = {"result": job.result, "error": job.error, "log": job.log[-40:],
               "created": job.created, "message": job.message}
     return job.state, job.opts.model_dump(), result
+
+
+def _client_result(res) -> dict | None:
+    if res is None:
+        return None
+    if not isinstance(res, dict):
+        raise HTTPException(400, "Invalid job result in snapshot")
+    out = {k: res[k] for k in CLIENT_RESULT_KEYS if k in res}
+    sizes = {k: len(json.dumps(v, default=str)) for k, v in out.items()}
+    for k in sorted(sizes, key=sizes.get, reverse=True):
+        if sum(sizes.values()) <= CLIENT_RESULT_MAX:
+            break
+        del out[k], sizes[k]
+    return out
 
 
 def _client_snapshot(snap: dict) -> tuple[str, dict, dict]:
@@ -1056,7 +1237,13 @@ def _client_snapshot(snap: dict) -> tuple[str, dict, dict]:
     except Exception:  # noqa: BLE001
         raise HTTPException(400, "Invalid job settings in snapshot") from None
     state = snap.get("state") if snap.get("state") in ("done", "error", "cancelled") else "unknown"
-    result = {"result": snap.get("result"), "error": snap.get("error"), "log": (snap.get("log") or [])[-40:]}
+    log, error = snap.get("log") or [], snap.get("error")
+    if not isinstance(log, list) or not all(isinstance(x, str) for x in log):
+        raise HTTPException(400, "Invalid job log in snapshot")
+    if error is not None and not isinstance(error, str):
+        raise HTTPException(400, "Invalid job error in snapshot")
+    result = {"result": _client_result(snap.get("result")), "error": error[:2000] if error else error,
+              "log": [x[:300] for x in log[-40:]]}
     return state, opts, result
 
 
@@ -1065,10 +1252,13 @@ def job_review(jid: str, rv: ReviewIn, request: Request) -> dict:
     """Store a review of a job with the job's settings and result (see ``maptomesh.reviews``).
 
     A job this server ran is reviewed with the server's own record of it. Any other well-formed
-    id needs the browser's copy of the job (``snapshot``): models built on the device (the default;
-    the page gives them an id in the same format) and server jobs from before a restart. The
-    store keeps a row and size budget (``reviews.KEEP``, ``reviews.MAX_MB``), oldest out first."""
-    from .reviews import PROBLEM_KEYS, store
+    id needs the browser's copy of the job (``snapshot``; only its readable parts are kept): models
+    built on the device (the default; the page gives them an id in the same format) and server
+    jobs from before a restart. The store keeps a row and size budget (``reviews.KEEP``,
+    ``reviews.MAX_MB``) and refuses new reviews when it is full: anonymous posts never delete
+    stored ones."""
+    from . import limits
+    from .reviews import PROBLEM_KEYS, StoreFull, store
 
     if not valid_job_id(jid):
         raise HTTPException(404, "Unknown job")
@@ -1082,7 +1272,9 @@ def job_review(jid: str, rv: ReviewIn, request: Request) -> dict:
         raise HTTPException(400, "Enter an email address so we can follow up (or untick follow-up)")
     if rv.website:   # bot: pretend it worked
         return {"ok": True, "id": 0}
-    _rate(REVIEW_RATE, request, "Too many reviews from here; please try again later")
+    key = _rate(REVIEW_RATE, request, "Too many reviews from here; please try again later")
+    if key != limits.LOCAL:
+        _rate_key(REVIEW_GLOBAL, "all", "Too many reviews are coming in right now; please try again later")
     st = store()
     if st.count_for_job(jid) >= REVIEWS_PER_JOB:
         raise HTTPException(429, "This model has already been reviewed several times")
@@ -1095,10 +1287,14 @@ def job_review(jid: str, rv: ReviewIn, request: Request) -> dict:
         source = "client"
     else:
         raise HTTPException(404, "This job is no longer available; generate it again to review it")
-    rid = st.add(job_id=jid, job_state=state, rating=rv.rating, problems=problems, comment=comment,
-                 wants_followup=rv.followup, contact_name=name or None, contact_email=email or None,
-                 options=options, result=result, snapshot_source=source, app_version=__version__,
-                 user_agent=request.headers.get("user-agent", "")[:300])
+    try:
+        rid = st.add(job_id=jid, job_state=state, rating=rv.rating, problems=problems, comment=comment,
+                     wants_followup=rv.followup, contact_name=name or None, contact_email=email or None,
+                     options=options, result=result, snapshot_source=source, app_version=__version__,
+                     user_agent=request.headers.get("user-agent", "")[:300])
+    except StoreFull:
+        log.warning("review store full (MAPTOMESH_KEEP_REVIEWS / MAPTOMESH_REVIEWS_MAX_MB): new reviews refused")
+        raise HTTPException(503, "Reviews can't be saved right now; please try again later") from None
     return {"ok": True, "id": rid}
 
 
@@ -1168,7 +1364,7 @@ def index(request: Request, job: str | None = None, s: str | None = None):
         if so is not None:
             title = f"{so.get('name', 'MapToMesh')} - MapToMesh"
             desc = (f"3D-printable model of {so['width_m'] / 1000:g} x {so['height_m'] / 1000:g} km around "
-                    f"{so['lat']:.4f}, {so['lon']:.4f}, made with MapToMesh. Opening the link builds it.")
+                    f"{so['lat']:.4f}, {so['lon']:.4f}, made with MapToMesh. Open the link to build it.")
             page = f"{base}/?s={s}"
     esc = lambda v: html.escape(str(v), quote=True)  # noqa: E731 - names are user input
     size_tags = [f'  <meta property="og:image:type" content="{mime}">']

@@ -8,6 +8,8 @@ CACHE_DIR = Path(os.environ.get("MAPTOMESH_CACHE", ROOT / "cache"))
 WEB_DIR = ROOT / "web"
 OUTPUT_DIR = CACHE_DIR / "output"
 ELEV_CACHE_DIR = CACHE_DIR / "elevation"
+# job grids (one file per area, detail and source asked for): least recently written out first
+ELEV_CACHE_BYTES = float(os.environ.get("MAPTOMESH_ELEV_CACHE_GB", "2")) * 1e9
 OSM_CACHE_DIR = CACHE_DIR / "osm"
 # persistent app data (user reviews, incl. optional contact details): not a cache, never committed
 DATA_DIR = Path(os.environ.get("MAPTOMESH_DATA_DIR", ROOT / "data"))
@@ -28,6 +30,33 @@ def atomic_write(path: Path, data: bytes | str) -> None:
         os.replace(tmp, path)
     except PermissionError:   # Windows: the file is open in another thread; theirs is as good
         tmp.unlink(missing_ok=True)
+
+
+def trim_dir(directory: Path, pattern: str, max_bytes: float, max_files: int | None = None) -> None:
+    """Delete the least recently written ``pattern`` files in ``directory`` until at most
+    ``max_files`` files and ``max_bytes`` remain (caches that grow with every new area asked for)."""
+    try:
+        files = []
+        for p in Path(directory).glob(pattern):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            files.append((st.st_mtime, st.st_size, p))
+    except OSError:
+        return
+    files.sort(key=lambda f: f[0])
+    total = sum(f[1] for f in files)
+    n = len(files)
+    for _, size, p in files:
+        if (max_files is None or n <= max(0, max_files)) and total <= max_bytes:
+            break
+        try:
+            p.unlink()
+        except OSError:
+            continue        # in use or already gone
+        n -= 1
+        total -= size
 
 LIDAR_BASE = "https://canelevation-lidar-point-clouds.s3.ca-central-1.amazonaws.com/pointclouds_nuagespoints/"
 PROJECTS_ZIP_URL = LIDAR_BASE + "Index_LiDARprojects_projetslidar.zip"

@@ -80,7 +80,8 @@ Memory matches the server's cost model (`limits.py`). Output differs by ~10 tria
    or it becomes an open proxy that anyone can use to reach arbitrary or internal addresses.
    Rate- and size-limited per client.
 3. Reviews and share links. Share links store the **settings only** (`/api/shares`,
-   `maptomesh/shares.py`); opening one builds the model on the visitor's device. Uploading
+   `maptomesh/shares.py`); opening one sets up the model, built on the visitor's device when they
+   press Generate. Uploading
    finished models was ruled out: the site would then serve 3MF files made by anyone to everyone,
    and slicers have had 3MF parsing vulnerabilities, so a crafted file could reach other users
    under the site's name.

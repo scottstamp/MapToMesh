@@ -23,7 +23,8 @@ from urllib3.response import HTTPResponse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from maptomesh import proxy  # noqa: E402
 
-GH = "https://raw.githubusercontent.com/hobuinc/usgs-lidar/"
+GH = "https://raw.githubusercontent.com/hobuinc/usgs-lidar/master/boundaries/"
+GH_REPO = "https://raw.githubusercontent.com/hobuinc/usgs-lidar/"
 
 
 # --- the allowlist ------------------------------------------------------------------------------
@@ -98,6 +99,19 @@ BYPASSES = [
     "",
     "https://",
     GH + "x" * 5000,
+    # the rest of the repository: commits of forks / pull requests are readable through it by hash,
+    # so anyone could place a file there (a fake job.json, a crafted 3MF)
+    GH_REPO + "0123456789abcdef0123456789abcdef01234567/job.json",
+    GH_REPO + "0123456789abcdef0123456789abcdef01234567/City.3mf",
+    GH_REPO + "refs/pull/1/head/x.3mf",
+    GH_REPO + "master/x.json",
+    # ';' as an escape (a '..;' segment once decoded) and overlong UTF-8 for '.' / '/'
+    GH + "..%3b/..%3b/evil.3mf",
+    GH + "..%3B/evil.3mf",
+    GH + "%c0%ae%c0%ae/%c0%ae%c0%ae/evil.3mf",
+    GH + "%e0%80%ae/evil.3mf",
+    GH + "%c0%af/evil.3mf",
+    GH + "%ff/evil.3mf",
 ]
 
 POST_BYPASSES = [
@@ -111,9 +125,9 @@ POST_BYPASSES = [
 
 ALLOWED = [
     # (given, sent)
-    (GH + "master/boundaries/resources.geojson", None),
-    ("https://RAW.githubusercontent.com/hobuinc/usgs-lidar/x.json", GH + "x.json"),   # host case
-    ("https://raw.githubusercontent.com:443/hobuinc/usgs-lidar/x.json", None),
+    (GH + "resources.geojson", None),
+    ("https://RAW.githubusercontent.com/hobuinc/usgs-lidar/master/boundaries/x.json", GH + "x.json"),   # host case
+    ("https://raw.githubusercontent.com:443/hobuinc/usgs-lidar/master/boundaries/x.json", None),
     ("https://s3-us-west-2.amazonaws.com/usgs-lidar-public/CA_X/ept.json", None),
     ("https://s3-us-west-2.amazonaws.com/usgs-lidar-public/CA_X/ept-data/0-0-0-0.laz", None),
     ("https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N47_00_W053_00_DEM/"
@@ -599,13 +613,91 @@ def test_response_size_cap():
         proxy.MAX_RESPONSE_BYTES = cap
 
 
+def test_stream_lifetime_capped():
+    """However it is read - even a reader keeping just above the minimum rate, or a stream waiting
+    on its upstream - no stream holds its slot past MAX_STREAM_SECONDS."""
+    _reset()
+    t = time.monotonic()
+    proxy.CLIENTS.enter("a")
+    s = proxy._Stream(_FakeR([b"x" * 1000] * 10), "a", now=t)
+    assert s.stale(t + proxy.MAX_STREAM_SECONDS - 1) in (None, "reader idle")
+    s.reading = True                                           # waiting on the upstream
+    assert s.stale(t + proxy.MAX_STREAM_SECONDS - 1) is None
+    assert s.stale(t + proxy.MAX_STREAM_SECONDS + 1) == "open too long"
+    assert proxy.reap(t + proxy.MAX_STREAM_SECONDS + 1) == 1
+    assert s.r.closed and not proxy.CLIENTS.active
+
+
+def test_group_budgets_and_reserve():
+    """An IPv6 /48 (256 /56s, 65,536 /64s) gets GROUP_FACTOR clients' worth, not one budget per
+    /64; and a quarter of the global slots stays free for clients with no download yet."""
+    _reset()
+    saved = (proxy.CLIENT_CONCURRENT, proxy.GLOBAL_CONCURRENT, proxy.GROUP_FACTOR, proxy.CLIENT_BYTES_PER_HOUR)
+    try:
+        proxy.CLIENT_CONCURRENT, proxy.GLOBAL_CONCURRENT, proxy.GROUP_FACTOR = 1, 100, 2
+        cl = proxy._Clients()
+        cl.enter("2001:db8:0:1::/64")
+        cl.enter("2001:db8:0:2::/64")
+        _refused(lambda: cl.enter("2001:db8:0:3::/64"), 429)            # same /48: its share is used
+        cl.enter("2001:db8:1:1::/64")                                     # another /48
+        cl.leave("2001:db8:0:1::/64")
+        cl.enter("2001:db8:0:3::/64")
+        assert cl.active_groups == {"2001:db8::/48": 2, "2001:db8:1::/48": 1}
+        # bytes: the /48's budget is shared by its /64s
+        proxy.CLIENT_BYTES_PER_HOUR = 1000
+        t = 50_000.0
+        assert cl.add("2001:db8:5:1::/64", 900, now=t)
+        assert cl.add("2001:db8:5:2::/64", 900, now=t)
+        assert not cl.add("2001:db8:5:3::/64", 300, now=t)              # 2100 > 2 x 1000 for the /48
+        _refused(lambda: cl.enter("2001:db8:5:4::/64", now=t), 429)
+        cl.enter("198.51.100.1", now=t)                                   # IPv4: no group
+        # reserve: with 4 slots, a client already streaming takes a third only while 2+ are free
+        proxy.CLIENT_CONCURRENT, proxy.GLOBAL_CONCURRENT = 16, 4
+        cl = proxy._Clients()
+        cl.enter("a"); cl.enter("a"); cl.enter("a")                       # noqa: E702 - 3 of 4 in use
+        _refused(lambda: cl.enter("a"), 429)                              # the last one is for newcomers
+        cl.enter("b")
+        _refused(lambda: cl.enter("c"), 503)
+        try:
+            cl.enter("c")
+        except proxy.Refused as e:
+            assert e.retry_after
+    finally:
+        proxy.CLIENT_CONCURRENT, proxy.GLOBAL_CONCURRENT, proxy.GROUP_FACTOR, proxy.CLIENT_BYTES_PER_HOUR = saved
+
+
+def test_request_rate():
+    """Requests per client per hour: any method, and HEAD / POST on a tighter allowance."""
+    saved = proxy.REQUESTS, proxy.HEAD_POST
+    try:
+        proxy.REQUESTS, proxy.HEAD_POST = proxy.RateLimit(5), proxy.RateLimit(2)
+        assert [proxy.rate_wait("203.0.113.1", "HEAD") > 0 for _ in range(3)] == [False, False, True]
+        assert [proxy.rate_wait("203.0.113.1", "GET") > 0 for _ in range(3)] == [False, False, True]
+        assert proxy.rate_wait("203.0.113.2", "POST") == 0
+        assert all(proxy.rate_wait(proxy.LOCAL, "HEAD") == 0 for _ in range(10))
+        # the bytes-per-minute sweep doesn't run on every chunk any more: 20,000 keys stay cheap
+        cl = proxy._Clients()
+        t = 1000.0
+        for i in range(20_000):
+            cl.add(f"10.0.{i >> 8}.{i & 255}", 10, now=t)
+        t0 = time.perf_counter()
+        for _ in range(2000):
+            cl.add("10.9.9.9", 10, now=t + 1)
+        assert time.perf_counter() - t0 < 1.0
+        cl.add("10.9.9.9", 10, now=t + 3700)                              # an hour on: swept
+        assert len(cl.used) == 1
+    finally:
+        proxy.REQUESTS, proxy.HEAD_POST = saved
+
+
 if __name__ == "__main__":
     for fn in (test_bypasses_refused, test_allowed_and_sent_unchanged, test_extra_rules,
                test_sent_target_is_checked_url, test_redirects_rechecked, test_response_headers,
                test_request_headers_and_session, test_client_keys, test_local_unlimited,
                test_slots_per_client_and_global,
                test_budget_counted_while_streaming, test_budget_window, test_slow_readers_reaped,
-               test_reaped_mid_read_is_not_a_complete_file, test_response_size_cap):
+               test_reaped_mid_read_is_not_a_complete_file, test_response_size_cap,
+               test_stream_lifetime_capped, test_group_budgets_and_reserve, test_request_rate):
         fn()
         print(f"{fn.__name__}: ok")
     print("all passed")

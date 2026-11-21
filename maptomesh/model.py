@@ -73,6 +73,7 @@ def get_elevation(opts: Options, progress: ProgressFn, cancel: threading.Event) 
         buf = io.BytesIO()
         np.savez_compressed(buf, info=np.frombuffer(json.dumps(info).encode(), dtype=np.uint8), **arrays)
         config.atomic_write(path, buf.getvalue())
+        config.trim_dir(config.ELEV_CACHE_DIR, "*.npz", config.ELEV_CACHE_BYTES)
         elev = Elevation(opts.source, grid, arrays, info)
     with _MEM_LOCK:
         _MEM[key] = elev

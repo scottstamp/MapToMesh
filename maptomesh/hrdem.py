@@ -29,4 +29,6 @@ def stac_items(bbox: tuple[float, float, float, float], collection: str) -> list
     r.raise_for_status()
     feats = r.json().get("features", [])
     config.atomic_write(cache, json.dumps(feats))
+    from .usgs3dep import STAC_CACHE_FILES, STAC_CACHE_MB    # the same budget as the other searches
+    config.trim_dir(cache.parent, "[0-9a-f]*.json", STAC_CACHE_MB * 1e6, STAC_CACHE_FILES)
     return feats

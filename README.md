@@ -422,7 +422,7 @@ web/ (Leaflet + three.js)  ──HTTP──>  maptomesh/server.py (FastAPI, back
 .venv/Scripts/python tests/test_structures.py                   # offline bridge / OSM building-height checks
 .venv/Scripts/python tests/test_buildings.py                    # offline PLATEAU / Overture building checks
 .venv/Scripts/python tests/probe_sources.py                    # every elevation provider, needs internet
-.venv/Scripts/python run.py --no-browser --port 8765            # in another terminal
+.venv/Scripts/python run.py --no-browser --port 8765 --local-unlimited   # in another terminal
 .venv/Scripts/python tests/integration.py                       # end-to-end, needs internet
 .venv/Scripts/python tests/validate_3mf.py some_model.3mf       # independent 3MF checker
 ```
@@ -452,7 +452,10 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 | `MAPTOMESH_MEMORY_MB` | 80% of the machine's RAM (memory the server and its jobs may use; sets the limits below) |
 | `MAPTOMESH_JOB_TIMEOUT_S` | `300` (a job running longer is stopped; time waiting for another model's build doesn't count) |
 | `MAPTOMESH_MAX_QUEUE` | `8` (jobs queued or running; more are refused as "server busy") |
-| `MAPTOMESH_KEEP_JOBS` | `10` (finished jobs whose files are kept; older ones are deleted) |
+| `MAPTOMESH_KEEP_JOBS` | `10` (finished jobs whose files are always kept) |
+| `MAPTOMESH_KEEP_JOB_HOURS` | `1` (older finished jobs are also kept this long, so others' jobs can't remove a model just built) |
+| `MAPTOMESH_OUTPUT_MAX_GB` | `5` (size budget of finished jobs' files beyond the newest `MAPTOMESH_KEEP_JOBS`; oldest out first) |
+| `MAPTOMESH_ELEV_CACHE_GB` | `2` (size limit of the cached job grids in `cache/elevation`; least recently written out first) |
 | `MAPTOMESH_MAX_LIDAR_TILES` | `400` (CanElevation tiles per job at 1000 cells, fewer at finer detail; over it: elevation models) |
 | `MAPTOMESH_PIPELINE` | `2` with ~7 GB or more for jobs, else `1` (jobs in flight: one building while the next downloads) |
 | `MAPTOMESH_PART_WORKERS` | `2` with ~6 GB or more per job, else `1` (threads meshing a model's parts; more threads, more memory) |
@@ -461,32 +464,55 @@ degenerate triangles and positive volume. Thumbnails land in `cache/integration/
 | `MAPTOMESH_MAPTERHORN_URL` | `https://download.mapterhorn.com/` (or a mirror with the same files) |
 | `MAPTOMESH_PROXY_GB_PER_HOUR` | `4` (data each client may pull through `/api/proxy` per hour, for models built in the browser) |
 | `MAPTOMESH_PROXY_MAX_MB` | `1024` (largest single file the proxy forwards) |
-| `MAPTOMESH_PROXY_CONCURRENT` | `64` (proxied downloads in flight across all clients; 16 per client) |
-| `MAPTOMESH_KEEP_SHARES` | `200000` (share links kept; the least recently used go first) |
+| `MAPTOMESH_PROXY_CONCURRENT` | `256` (proxied downloads open across all clients, a quarter kept for new clients; `MAPTOMESH_PROXY_CLIENT_CONCURRENT` = 16 per client) |
+| `MAPTOMESH_PROXY_THREADS` | `24` (threads waiting on upstreams, apart from the pool serving everything else; 4 per client) |
+| `MAPTOMESH_PROXY_REQUESTS_PER_HOUR` | `3000` (proxied requests per client per hour) |
+| `MAPTOMESH_PROXY_HEAD_POST_PER_HOUR` | `600` (proxied HEAD / POST requests per client per hour) |
+| `MAPTOMESH_PROXY_READ_TIMEOUT_S` | `30` (longest wait for an upstream's next bytes) |
+| `MAPTOMESH_PROXY_MAX_STREAM_S` | `900` (a proxied download open longer is cut off) |
+| `MAPTOMESH_KEEP_SHARES` | `200000` (share links kept; beyond it the least recently used go, but only links unused for `MAPTOMESH_SHARES_STALE_DAYS` = 30) |
 | `MAPTOMESH_SHARES_PER_HOUR` | `60` (new share links per client address per hour) |
+| `MAPTOMESH_SHARES_PER_DAY` | `5000` (new share links from everyone per day) |
 | `MAPTOMESH_ESTIMATES_PER_HOUR` | `120` (download estimates per client address per hour; each reads file headers) |
-| `MAPTOMESH_ESTIMATES_CONCURRENT` | `2` (download estimates computed at once, one per client; more are refused at once with 503 / 429) |
+| `MAPTOMESH_ESTIMATES_CONCURRENT` | `4` (download estimates computed at once, one per client; more are refused at once with 503 / 429) |
 | `MAPTOMESH_COVERAGE_PER_HOUR` | `1200` (coverage checks per client per hour: `/api/coverage`, `/api/coverage/usgs`, `/api/lidar/tiles`) |
-| `MAPTOMESH_COVERAGE_CONCURRENT` | `6` (coverage checks computed at once, two per client) |
-| `MAPTOMESH_JOBS_PER_CLIENT` | `2` (server jobs one client may have queued or running) |
-| `MAPTOMESH_KEEP_REVIEWS` | `20000` (reviews kept; the oldest go first) |
-| `MAPTOMESH_REVIEWS_MAX_MB` | `200` (size budget of the stored reviews; the oldest go first) |
+| `MAPTOMESH_COVERAGE_CONCURRENT` | `12` (coverage checks computed at once, two per client) |
+| `MAPTOMESH_JOBS_PER_CLIENT` | `2` (server jobs one client may have queued or running; the second only while a quarter of the queue is free) |
+| `MAPTOMESH_JOBS_PER_HOUR` | `20` (server jobs one client may submit per hour) |
+| `MAPTOMESH_GROUP_FACTOR` | `4` (an IPv6 /48 may use this many clients' worth of every per-client limit) |
+| `MAPTOMESH_KEEP_REVIEWS` | `20000` (reviews stored; when reached, new reviews are refused - stored ones are never deleted to make room) |
+| `MAPTOMESH_REVIEWS_MAX_MB` | `200` (size budget of the stored reviews; when reached, new reviews are refused) |
 | `MAPTOMESH_TRUSTED_PROXIES` | empty (address ranges besides Cloudflare's and this machine allowed to set `CF-Connecting-IP`; see below) |
-| `MAPTOMESH_LOCAL_UNLIMITED` | `1` (requests from this machine without `CF-Connecting-IP` have no request limits; `0` turns that off) |
+| `MAPTOMESH_LOCAL_UNLIMITED` | `0` (`1` = requests from this machine without `CF-Connecting-IP` have no request limits: development and tests only, never behind a local reverse proxy; `run.py --local-unlimited` sets it) |
+| `MAPTOMESH_ORIGIN_SECRET` | empty (when set, `CF-Connecting-IP` is believed only on requests carrying this value in `X-Origin-Secret`; see below) |
+| `MAPTOMESH_ALLOWED_HOSTS` | empty = any (comma-separated `Host` names the server answers for, e.g. `maptomesh.com,www.maptomesh.com`) |
 
 **Deployment behind Cloudflare.** Per-client limits (jobs, estimates, coverage, shares, reviews,
-the data proxy) count against the visitor's address (IPv6: its /64), taken from the
+the data proxy) count against the visitor's address (IPv6: its /64, and every limit also applies to
+the /48 as a whole at `MAPTOMESH_GROUP_FACTOR` times one client's allowance), taken from the
 `CF-Connecting-IP` header Cloudflare sets on every request. The header is believed only when the
 connection comes from Cloudflare's published address ranges (a proxied origin) or from this
 machine (a cloudflared tunnel); from anywhere else the connecting address counts, so a visitor
 reaching the server directly can't pick their own. `X-Forwarded-For` is ignored (visitors can
 prepend to it), and `run.py` keeps uvicorn's proxy-header rewriting off: started some other way,
-don't pass uvicorn `--proxy-headers`. Requests from this machine without `CF-Connecting-IP` never
-went through Cloudflare: they are local (tests, maintenance) and have no request limits, so test
-suites can run in parallel. Cloudflare's ranges are built in (`maptomesh/limits.py`, from
-cloudflare.com/ips); add others with `MAPTOMESH_TRUSTED_PROXIES`. The API has no public docs or schema
-(`/docs`, `/openapi.json`), request bodies are capped (413), and error responses carry an error id
-instead of internals: the details go to the server log.
+don't pass uvicorn `--proxy-headers`. Cloudflare's ranges are built in (`maptomesh/limits.py`, from
+cloudflare.com/ips); add others with `MAPTOMESH_TRUSTED_PROXIES`.
+
+- **Requests from this machine without the header count against 127.0.0.1** like any visitor's.
+  `MAPTOMESH_LOCAL_UNLIMITED=1` (`run.py --local-unlimited`) exempts them from every limit, for
+  development and the integration tests. Never set it on a server behind a local reverse proxy
+  (nginx, Caddy): whatever the proxy forwarded without the header would be unlimited. A local
+  reverse proxy must itself only accept connections from Cloudflare.
+- **A proxied origin** (no tunnel) is reachable from Cloudflare's ranges, which every Cloudflare
+  customer's zones and Workers share. Add a request header with a long random value in a
+  Cloudflare Transform Rule (`X-Origin-Secret`) and set the same value in `MAPTOMESH_ORIGIN_SECRET`:
+  `CF-Connecting-IP` then counts only on requests carrying it. Also set `MAPTOMESH_ALLOWED_HOSTS`
+  (or use Authenticated Origin Pulls).
+- **A Cloudflare rate-limiting rule** on `/api/*` in front of all this is cheap insurance: it stops
+  floods before they reach the server.
+
+The API has no public docs or schema (`/docs`, `/openapi.json`), request bodies are capped (413),
+and error responses carry an error id instead of internals: the details go to the server log.
 
 **Link previews**: the page carries Open Graph / Twitter-card metadata, so links posted to Discord,
 Slack, X, iMessage etc. show a preview. The server fills in absolute URLs (from
@@ -510,7 +536,8 @@ A public server must survive anyone's largest request. Three safeguards
    its memory budget it is killed, and the user sees why in a dialog with retry advice (and a
    one-click retry at a lower Detail). A job killed by the operating system for lack of memory
    (Linux OOM killer; workers volunteer first) is reported the same way, and the server carries
-   on. Finished jobs live on disk (`cache/output/<job>`, the last `MAPTOMESH_KEEP_JOBS` = 10),
+   on. Finished jobs live on disk (`cache/output/<job>`: the newest `MAPTOMESH_KEEP_JOBS` = 10 and any finished
+   within `MAPTOMESH_KEEP_JOB_HOURS` = 1 h, within `MAPTOMESH_OUTPUT_MAX_GB`),
    not in the server's memory; their links keep working across restarts.
 
 Measured peaks (2026-11-19, St. John's; peak memory ≈ 0.3 GB + per-vertex cost × million
@@ -578,8 +605,8 @@ timings: `/static/browser.html`.
   Not asked again for an area already built there, or after *Don't ask again*.
 - **Share links** (the result's *Share link*): only the model's settings are stored on the server
   (`/api/shares`, `data/shares.sqlite`, `maptomesh/shares.py`), never model files, so nobody can
-  hand others a crafted 3MF through the site. Opening `/?s=<id>` loads the settings and builds the
-  model right away. Server-built results keep their `/?job=<id>` links while their files last.
+  hand others a crafted 3MF through the site. Opening `/?s=<id>` loads the settings (without saving
+  them over the visitor's own) and the model is built when the visitor presses *Generate*. Server-built results keep their `/?job=<id>` links while their files last.
 
 - GeoTIFFs are read by `maptomesh/geotiff.py` (no GDAL in the browser): LZW, Deflate, ZSTD,
   PackBits, predictors 2 / 3, BigTIFF, overviews. LERC isn't supported, so New Zealand comes from

@@ -26,6 +26,7 @@ from . import config, limits
 
 DB_PATH = config.DATA_DIR / "device_failures.sqlite"
 PER_HOUR = 30                 # reports per client address
+GLOBAL_PER_HOUR = 300         # reports from everyone: turning the whole store over takes days
 KEEP = 20_000                 # newest reports kept
 
 _SCHEMA = """
@@ -94,6 +95,7 @@ class FailureStore:
 _STORE: FailureStore | None = None
 _STORE_LOCK = threading.Lock()
 _LIMIT = limits.RateLimit(PER_HOUR)     # reports per client key (limits.client_key), per hour
+_GLOBAL = limits.RateLimit(GLOBAL_PER_HOUR, group_factor=0)
 
 
 def store() -> FailureStore:
@@ -105,7 +107,8 @@ def store() -> FailureStore:
 
 
 def rate_limited(addr: str) -> bool:
-    return _LIMIT.hit(addr) > 0
+    """Over this client's hourly allowance, or over everyone's (``GLOBAL_PER_HOUR``)."""
+    return _LIMIT.hit(addr) > 0 or (addr != limits.LOCAL and _GLOBAL.hit("all") > 0)
 
 
 _CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
@@ -118,6 +121,15 @@ def _safe(s, keep_newlines: bool = False) -> str:
     return _CTRL.sub("\ufffd", s)
 
 
+def _dict(text) -> dict:
+    """A stored JSON object (anything else - a report from an older version - as {})."""
+    try:
+        v = json.loads(text or "{}")
+    except ValueError:
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
 def _main(argv: list[str]) -> None:
     n = int(argv[0]) if argv else 20
     rows = store().recent(n)
@@ -125,16 +137,21 @@ def _main(argv: list[str]) -> None:
         print("No device failures recorded.")
         return
     for r in reversed(rows):
-        o = json.loads(r["options_json"]) if r["options_json"] else {}
-        env = json.loads(r["env_json"] or "{}")
-        where = (f"{o.get('lat', 0):.4f},{o.get('lon', 0):.4f} {o.get('width_m', 0) / 1000:g}x{o.get('height_m', 0) / 1000:g} km "
-                 f"{o.get('grid_cells')} cells {o.get('color_mode')} {o.get('source')}") if o else "-"
-        py = env.get("python") or {}
-        print(f"#{r['id']} {r['created_at']} [{r['kind']}] {_safe(r['message'][:200])}")
-        print(f"    model: {where}")
-        print(f"    device: {'phone' if env.get('phone') else 'desktop'}, {env.get('memory_mb')} MB allowed, "
-              f"{env.get('device_memory_gb')} GB RAM, {env.get('cores')} cores, secure={env.get('secure')}, "
-              f"python ready={py.get('ready')} jspi={py.get('jspi')} native={py.get('native')}")
+        o = _dict(r["options_json"])
+        env = _dict(r["env_json"])
+        try:
+            where = (f"{o.get('lat', 0):.4f},{o.get('lon', 0):.4f} {o.get('width_m', 0) / 1000:g}x"
+                     f"{o.get('height_m', 0) / 1000:g} km {o.get('grid_cells')} cells {o.get('color_mode')} "
+                     f"{o.get('source')}") if o else "-"
+        except (TypeError, ValueError):
+            where = "(unreadable settings)"
+        py = env.get("python") if isinstance(env.get("python"), dict) else {}
+        e = lambda k, d=env: _safe(str(d.get(k)))[:40]  # noqa: E731 - client-supplied values
+        print(f"#{r['id']} {r['created_at']} [{_safe(r['kind'])}] {_safe(r['message'][:200])}")
+        print(f"    model: {_safe(where)}")
+        print(f"    device: {'phone' if env.get('phone') is True else 'desktop'}, {e('memory_mb')} MB allowed, "
+              f"{e('device_memory_gb')} GB RAM, {e('cores')} cores, secure={e('secure')}, "
+              f"python ready={e('ready', py)} jspi={e('jspi', py)} native={e('native', py)}")
         print(f"    stage: {_safe(r['stage'][:160])}")
         print(f"    browser: {_safe(r['user_agent'][:160])}")
         if r["trace"]:
