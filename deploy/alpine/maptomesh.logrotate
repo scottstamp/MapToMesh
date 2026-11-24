@@ -1,0 +1,10 @@
+/var/log/maptomesh/*.log {
+	weekly
+	rotate 8
+	compress
+	delaycompress
+	missingok
+	notifempty
+	# supervise-daemon keeps the file open and doesn't reopen it on a signal
+	copytruncate
+}

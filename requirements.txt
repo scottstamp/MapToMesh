@@ -8,5 +8,6 @@ fastapi>=0.110
 uvicorn>=0.29
 pydantic>=2.6
 psutil>=5.9            # job memory watchdog
-# optional: HRDEM COG source
+# GDAL bindings for the server's elevation-model readers (no musl wheels: on Alpine see
+# docs/deploy-alpine.md)
 rasterio>=1.3

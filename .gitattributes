@@ -1,0 +1,2 @@
+# files installed on Linux servers: LF even in Windows checkouts (a CRLF shebang breaks OpenRC)
+deploy/** text eol=lf

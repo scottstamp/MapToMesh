@@ -31,6 +31,9 @@ python -m venv .venv
 .venv/Scripts/python run.py                       # opens http://127.0.0.1:8000/
 ```
 
+Alpine Linux (musl) server, with an OpenRC service: [docs/deploy-alpine.md](docs/deploy-alpine.md)
+(rasterio builds from source there and needs `gdal-dev`).
+
 On first start the app downloads NRCan's LiDAR tile index (~230 MB, once) and converts it into
 `cache/tile_index.npz` (~22 MB). The status line at the top of the sidebar shows progress.
 

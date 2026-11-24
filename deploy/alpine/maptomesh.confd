@@ -1,0 +1,23 @@
+# /etc/conf.d/maptomesh: settings for /etc/init.d/maptomesh (docs/deploy-alpine.md).
+# Changes take effect on `rc-service maptomesh restart`.
+
+# Code + venv (git clone), the user the server runs as, and its writable state
+# (MAPTOMESH_CACHE and MAPTOMESH_DATA_DIR default to cache/ and data/ under maptomesh_state).
+#maptomesh_dir="/opt/maptomesh"
+#maptomesh_user="maptomesh"
+#maptomesh_state="/var/lib/maptomesh"
+#maptomesh_log="/var/log/maptomesh/maptomesh.log"
+
+# Listen address. 127.0.0.1 for a cloudflared tunnel or a local reverse proxy; 0.0.0.0 only for
+# a proxied Cloudflare origin (README.md, "Deployment behind Cloudflare").
+#maptomesh_host="127.0.0.1"
+#maptomesh_port="8000"
+
+# App settings (README.md, "Configuration"): uncomment and `export` the ones you need.
+# This file is world-readable by default: chmod 600 it if it holds MAPTOMESH_ORIGIN_SECRET.
+#export MAPTOMESH_MEMORY_MB=3300           # set it in LXC / containers: psutil may see the host's RAM
+#export MAPTOMESH_ALLOWED_HOSTS="maptomesh.com,www.maptomesh.com"
+#export MAPTOMESH_ORIGIN_SECRET=""         # proxied origin only (README.md)
+#export MAPTOMESH_PUBLIC_URL="https://maptomesh.com"
+#export MAPTOMESH_DATA_CACHE_GB=10
+# Never set MAPTOMESH_LOCAL_UNLIMITED on a server (it is for development and tests).

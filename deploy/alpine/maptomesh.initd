@@ -1,0 +1,40 @@
+#!/sbin/openrc-run
+# MapToMesh web server for OpenRC (Alpine Linux). Setup: docs/deploy-alpine.md
+# Settings: /etc/conf.d/maptomesh
+
+name="MapToMesh"
+description="MapToMesh 3D-printable terrain model server"
+
+: "${maptomesh_dir:=/opt/maptomesh}"
+: "${maptomesh_user:=maptomesh}"
+: "${maptomesh_state:=/var/lib/maptomesh}"
+: "${maptomesh_host:=127.0.0.1}"
+: "${maptomesh_port:=8000}"
+: "${maptomesh_log:=/var/log/maptomesh/maptomesh.log}"
+
+supervisor="supervise-daemon"
+command="$maptomesh_dir/.venv/bin/python"
+command_args="$maptomesh_dir/run.py --no-browser --host $maptomesh_host --port $maptomesh_port"
+command_user="$maptomesh_user:$maptomesh_user"
+directory="$maptomesh_state"
+output_log="$maptomesh_log"
+error_log="$maptomesh_log"
+respawn_delay=5
+respawn_max=10
+respawn_period=600
+# uvicorn waits for open connections (proxied downloads can run for minutes): cap the wait
+retry="TERM/30/KILL/5"
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	# writable state lives outside the (root-owned, read-only) code directory
+	export MAPTOMESH_CACHE="${MAPTOMESH_CACHE:-$maptomesh_state/cache}"
+	export MAPTOMESH_DATA_DIR="${MAPTOMESH_DATA_DIR:-$maptomesh_state/data}"
+	export PYTHONUNBUFFERED=1
+	checkpath -d -m 0750 -o "$command_user" "$maptomesh_state" "$MAPTOMESH_CACHE" "${maptomesh_log%/*}"
+	checkpath -d -m 0700 -o "$command_user" "$MAPTOMESH_DATA_DIR"
+}
